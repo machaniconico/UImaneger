@@ -22,18 +22,20 @@ import {
   symlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, relative } from "node:path";
 
 export type GitMode = "worktree" | "snapshot" | "none";
 
 export interface BeforeHandle {
-  /** before を配信するディレクトリ(絶対パス) */
+  /** before を配信するディレクトリ(絶対パス。サブディレクトリ対象ならオフセット済) */
   dir: string;
   mode: GitMode;
   /** オリジナルのプロジェクトルート(絶対パス) */
   root: string;
   /** git worktree で作成したか(snapshot/none では false) */
   worktreeAdded: boolean;
+  /** 後始末用: worktree のルート(= git worktree remove 対象)。dir と異なる場合がある。 */
+  worktreeRoot?: string;
 }
 
 /** 巨大/不要ディレクトリ。snapshot コピー & worktree symlink 対象外。 */
@@ -110,12 +112,24 @@ export function prepareBefore(root: string): BeforeHandle {
         "HEAD",
       ]);
       if (r.ok) {
-        linkNodeModules(absRoot, wtDir);
+        // worktree は git ルート全体を checkout する。対象がサブディレクトリの
+        // 場合は before 配信ディレクトリをそのオフセット分ずらす。
+        const top = runGit(absRoot, ["rev-parse", "--show-toplevel"]);
+        const gitRoot = top.ok ? resolve(top.out) : absRoot;
+        const rel = relative(gitRoot, absRoot);
+        const beforeDir =
+          rel && !rel.startsWith("..") ? join(wtDir, rel) : wtDir;
+        // 依存解決のため node_modules を symlink:
+        //  - git ルート側 (モノレポ/hoisted 依存) を worktree ルートへ
+        //  - 対象ディレクトリ固有の node_modules があれば before ディレクトリへ
+        linkNodeModules(gitRoot, wtDir);
+        if (beforeDir !== wtDir) linkNodeModules(absRoot, beforeDir);
         return {
-          dir: wtDir,
+          dir: beforeDir,
           mode: "worktree",
           root: absRoot,
           worktreeAdded: true,
+          worktreeRoot: wtDir,
         };
       }
       // 失敗した中間ディレクトリを掃除
@@ -168,13 +182,14 @@ export function prepareBefore(root: string): BeforeHandle {
 export function cleanupBefore(h: BeforeHandle): void {
   if (!h || h.mode === "none") return;
 
+  const wtRoot = h.worktreeRoot ?? h.dir;
   if (h.mode === "worktree" && h.worktreeAdded) {
-    runGit(h.root, ["worktree", "remove", "--force", h.dir]);
+    runGit(h.root, ["worktree", "remove", "--force", wtRoot]);
     // 念のため prune
     runGit(h.root, ["worktree", "prune"]);
   }
   try {
-    rmSync(h.dir, { recursive: true, force: true });
+    rmSync(wtRoot, { recursive: true, force: true });
   } catch {
     // ベストエフォート
   }
