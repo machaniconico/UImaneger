@@ -1,6 +1,12 @@
 import { useState } from "react";
-import type { DomDescriptor, EditResult } from "../lib/types.ts";
+import type {
+  Candidate,
+  DomDescriptor,
+  EditProposal,
+} from "../lib/types.ts";
 import { api } from "../lib/api.ts";
+import { DiffView } from "./DiffView.tsx";
+import { Candidates } from "./Candidates.tsx";
 
 interface Msg {
   role: "user" | "system";
@@ -17,37 +23,116 @@ export function Chat({ selected, hasKey }: Props) {
   const [instruction, setInstruction] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [busy, setBusy] = useState(false);
+  const [proposal, setProposal] = useState<EditProposal | null>(null);
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [lastInstruction, setLastInstruction] = useState("");
+  const [canUndo, setCanUndo] = useState(false);
+  // 提案/候補を生成した時点の要素を固定保持 (その後 selected が変わっても誤マッチを防ぐ)
+  const [editDescriptor, setEditDescriptor] = useState<DomDescriptor | null>(
+    null
+  );
+
+  function log(m: Msg) {
+    setMsgs((prev) => [...prev, m]);
+  }
+
+  function handleProposal(res: EditProposal) {
+    if (res.ok && res.proposalId && res.diff) {
+      setProposal(res);
+      setCandidates(res.candidates ?? []);
+    } else if (res.candidates && res.candidates.length) {
+      setProposal(null);
+      setCandidates(res.candidates);
+      log({ role: "system", ok: false, text: "候補から選んでください。" });
+    } else {
+      setProposal(null);
+      setCandidates([]);
+      log({
+        role: "system",
+        ok: false,
+        text: "✗ " + (res.error || res.summary || "提案を作成できませんでした"),
+      });
+    }
+  }
 
   async function send() {
     const text = instruction.trim();
     if (!text || !selected || busy) return;
     setInstruction("");
-    setMsgs((m) => [...m, { role: "user", text }]);
+    setLastInstruction(text);
+    setEditDescriptor(selected);
+    setProposal(null);
+    setCandidates([]);
+    log({ role: "user", text });
     setBusy(true);
     try {
-      const res: EditResult = await api.edit(selected, text);
-      if (res.ok) {
-        setMsgs((m) => [
-          ...m,
-          {
-            role: "system",
-            ok: true,
-            text: `✓ ${res.summary} (${res.relFile}${
-              res.line ? ":" + res.line : ""
-            } / 確度:${res.confidence})`,
-          },
-        ]);
-      } else {
-        setMsgs((m) => [
-          ...m,
-          { role: "system", ok: false, text: `✗ ${res.error || res.summary}` },
-        ]);
-      }
+      handleProposal(await api.edit(selected, text));
     } catch (e: any) {
-      setMsgs((m) => [
-        ...m,
-        { role: "system", ok: false, text: "✗ " + String(e.message || e) },
-      ]);
+      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pickCandidate(c: Candidate) {
+    const desc = editDescriptor ?? selected;
+    if (!desc || busy) return;
+    setBusy(true);
+    try {
+      handleProposal(await api.editCandidate(c, desc, lastInstruction));
+    } catch (e: any) {
+      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function apply() {
+    if (!proposal?.proposalId || busy) return;
+    setBusy(true);
+    try {
+      const res = await api.applyEdit(proposal.proposalId);
+      if (res.ok) {
+        log({
+          role: "system",
+          ok: true,
+          text: `✓ ${res.relFile || proposal.relFile} に適用しました`,
+        });
+        setCanUndo(true);
+        window.dispatchEvent(new CustomEvent("uim:applied"));
+      } else {
+        log({ role: "system", ok: false, text: "✗ " + (res.error || "適用失敗") });
+      }
+    } finally {
+      setProposal(null);
+      setCandidates([]);
+      setBusy(false);
+    }
+  }
+
+  async function reject() {
+    if (proposal?.proposalId) await api.rejectEdit(proposal.proposalId).catch(() => {});
+    setProposal(null);
+    setCandidates([]);
+    log({ role: "system", text: "提案を却下しました" });
+  }
+
+  async function undo() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const res = await api.undoEdit();
+      if (res.ok) {
+        log({
+          role: "system",
+          ok: true,
+          text: `↩ ${res.relFile || ""} を元に戻しました`,
+        });
+        window.dispatchEvent(new CustomEvent("uim:applied"));
+        setCanUndo(false);
+      } else {
+        log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
+      }
     } finally {
       setBusy(false);
     }
@@ -55,8 +140,17 @@ export function Chat({ selected, hasKey }: Props) {
 
   return (
     <div className="flex h-full flex-col bg-neutral-950 text-neutral-200">
-      <div className="border-b border-neutral-800 px-3 py-2 text-sm font-semibold">
-        自然言語で編集
+      <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2 text-sm font-semibold">
+        <span>自然言語で編集</span>
+        {canUndo && (
+          <button
+            onClick={undo}
+            disabled={busy}
+            className="rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:opacity-50"
+          >
+            ↩ undo
+          </button>
+        )}
       </div>
 
       {/* 選択中の要素 */}
@@ -79,9 +173,9 @@ export function Chat({ selected, hasKey }: Props) {
             )}
             <div className="text-neutral-600">
               {selected.source
-                ? `層A: ${selected.source.fileName.split("/").slice(-1)}:${
-                    selected.source.lineNumber
-                  }`
+                ? `層A: ${selected.source.fileName
+                    .split(/[\\/]/)
+                    .slice(-1)}:${selected.source.lineNumber}`
                 : "層B: 特徴検索で解決"}
             </div>
           </div>
@@ -92,7 +186,7 @@ export function Chat({ selected, hasKey }: Props) {
         )}
       </div>
 
-      {/* ログ */}
+      {/* ログ + 提案 */}
       <div className="flex-1 space-y-2 overflow-y-auto px-3 py-2 text-sm">
         {msgs.map((m, i) => (
           <div
@@ -100,15 +194,32 @@ export function Chat({ selected, hasKey }: Props) {
             className={
               m.role === "user"
                 ? "rounded bg-neutral-800 px-2 py-1"
-                : m.ok
+                : m.ok === true
                 ? "text-green-400"
-                : "text-red-400"
+                : m.ok === false
+                ? "text-red-400"
+                : "text-neutral-500"
             }
           >
             {m.text}
           </div>
         ))}
-        {busy && <div className="text-neutral-500">編集中…</div>}
+        {busy && <div className="text-neutral-500">処理中…</div>}
+
+        {candidates.length > 0 && (
+          <Candidates candidates={candidates} busy={busy} onPick={pickCandidate} />
+        )}
+
+        {proposal && proposal.diff && (
+          <DiffView
+            diff={proposal.diff}
+            relFile={proposal.relFile}
+            confidence={proposal.confidence}
+            busy={busy}
+            onApply={apply}
+            onReject={reject}
+          />
+        )}
       </div>
 
       {/* 入力 */}
@@ -138,7 +249,7 @@ export function Chat({ selected, hasKey }: Props) {
           disabled={!selected || busy || !instruction.trim()}
           className="mt-1 w-full rounded bg-blue-600 py-1 text-sm font-medium hover:bg-blue-500 disabled:opacity-50"
         >
-          編集 (⌘/Ctrl+Enter)
+          差分を生成 (⌘/Ctrl+Enter)
         </button>
       </div>
     </div>

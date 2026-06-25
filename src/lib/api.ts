@@ -1,4 +1,9 @@
-import type { DomDescriptor, EditResult, ProjectInfo } from "./types.ts";
+import type {
+  Candidate,
+  DomDescriptor,
+  EditProposal,
+  ProjectInfo,
+} from "./types.ts";
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -29,6 +34,33 @@ export const api = {
     }),
   start: () => post<{ info?: ProjectInfo; error?: string }>("/api/project/start", {}),
   stop: () => post<{ info: ProjectInfo | null }>("/api/project/stop", {}),
+
+  /** 指示 → 提案(差分)を取得。まだ適用しない。 */
   edit: (descriptor: DomDescriptor, instruction: string) =>
-    post<EditResult>("/api/edit", { descriptor, instruction }),
+    post<EditProposal>("/api/edit", { descriptor, instruction }),
+  /** 候補ファイルを指定して提案を作る。 */
+  editCandidate: (
+    candidate: Candidate,
+    descriptor: DomDescriptor,
+    instruction: string
+  ) =>
+    post<EditProposal>("/api/edit/candidate", {
+      file: candidate.file,
+      line: candidate.line,
+      descriptor,
+      instruction,
+    }),
+  /** 提案を適用(実書き込み)。 */
+  applyEdit: (proposalId: string) =>
+    post<{ ok: boolean; file?: string; relFile?: string; error?: string }>(
+      "/api/edit/apply",
+      { proposalId }
+    ),
+  rejectEdit: (proposalId: string) =>
+    post<{ ok: boolean; error?: string }>("/api/edit/reject", { proposalId }),
+  undoEdit: () =>
+    post<{ ok: boolean; relFile?: string; error?: string }>(
+      "/api/edit/undo",
+      {}
+    ),
 };

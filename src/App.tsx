@@ -5,6 +5,7 @@ import { ProjectBar } from "./components/ProjectBar.tsx";
 import { BeforePreview } from "./components/BeforePreview.tsx";
 import { AfterPreview } from "./components/AfterPreview.tsx";
 import { Chat } from "./components/Chat.tsx";
+import { StatusPanel } from "./components/StatusPanel.tsx";
 
 export function App() {
   const [info, setInfo] = useState<ProjectInfo | null>(null);
@@ -56,6 +57,7 @@ export function App() {
         <div className="min-h-0 flex-1">
           <Chat selected={selected} hasKey={hasKey} />
         </div>
+        <StatusPanel />
       </aside>
 
       {/* 中央: 編集前 */}
