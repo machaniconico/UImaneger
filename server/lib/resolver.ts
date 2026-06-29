@@ -652,7 +652,11 @@ ${list}
 
   try {
     const ans = stripCodeFence(
-      await complete(prompt, { model: "claude-haiku-4-5", maxTokens: 16 })
+      await complete(prompt, {
+        model: "claude-haiku-4-5",
+        maxTokens: 16,
+        allowTruncated: true,
+      })
     );
     const idx = parseInt(ans.match(/-?\d+/)?.[0] || "", 10);
     if (Number.isInteger(idx) && idx >= 0 && idx < candidates.length) {

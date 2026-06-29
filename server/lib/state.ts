@@ -70,7 +70,9 @@ function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
       resolve(ok);
     };
     const onExit = () => done(true);
-    const onError = () => done(true);
+    const onError = () => {
+      if (hasExited(proc)) done(true);
+    };
     const timer = setTimeout(() => done(false), timeoutMs);
     proc.once("exit", onExit);
     proc.once("error", onError);

@@ -335,13 +335,13 @@ export const PORT_PATTERNS: readonly RegExp[] = [
   // "Local:   http://host:PORT" (Vite/Next/Nuxt 等) — 上の URL パターンでも拾えるが明示的に
   /\bLocal:\s+https?:\/\/[^\s/:]+:(\d{2,5})\b/,
   // "Listening on host:PORT" / "listening on :PORT" / "listening on PORT" (Angular/Puma/Go)
-  /[Ll]istening\s+on\s+(?:[^\s:]+)?:?(\d{2,5})\b/,
+  /[Ll]istening\s+on\s+(?:[^\s:]*:)?(\d{2,5})\b/,
   // "Listening on port PORT"
   /[Ll]istening\s+on\s+port\s+(\d{2,5})\b/,
   // "Server running at host:PORT" / "Server running on port PORT"
-  /Server\s+running\s+(?:at\s+(?:[^\s:]+)?:?|on\s+port\s+)(\d{2,5})\b/,
+  /Server\s+running\s+(?:at\s+(?:[^\s:]*:)?|on\s+port\s+)(\d{2,5})\b/,
   // "started on host:PORT" / "started on PORT"
-  /[Ss]tarted\s+on\s+(?:[^\s:]+)?:?(\d{2,5})\b/,
+  /[Ss]tarted\s+on\s+(?:[^\s:]*:)?(\d{2,5})\b/,
   // "started on 7000" / "listening on 7000" など scheme 無し裸ポート
   /\b(?:started|listening)\s+on\s+(\d{2,5})\b/,
   // "ready on http://host:PORT" (Next.js) は URL パターンでカバー済み
@@ -461,11 +461,8 @@ function portFreeOn(host: string, port: number): Promise<boolean> {
     const srv = net.createServer();
     srv.unref();
     srv.once("error", (err: NodeJS.ErrnoException) => {
-      if (
-        host === "::1" &&
-        (err.code === "EADDRNOTAVAIL" || err.code === "EAFNOSUPPORT")
-      ) {
-        resolve(true);
+      if (host === "::1") {
+        resolve(err.code !== "EADDRINUSE");
         return;
       }
       resolve(false);
@@ -478,6 +475,9 @@ function portFreeOn(host: string, port: number): Promise<boolean> {
 
 /** 空きポートを探す(IPv4/IPv6 両スタックで確認)。 */
 export async function findFreePort(start: number): Promise<number> {
+  if (start > 65_535) {
+    throw new Error("no free port found");
+  }
   const free4 = await portFreeOn("127.0.0.1", start);
   const free6 = await portFreeOn("::1", start);
   if (!free4 || !free6) {

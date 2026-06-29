@@ -77,6 +77,7 @@ export function startProxy(
       }
       delete headers["content-length"];
       delete headers["content-encoding"];
+      delete headers["transfer-encoding"];
       headers["content-length"] = String(Buffer.byteLength(body));
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(body);

@@ -45,9 +45,15 @@ export function ProjectBar({
 
   async function stop() {
     setBusy(true);
-    const res = await api.stop();
-    onInfo(res.info);
-    setBusy(false);
+    onError("");
+    try {
+      const res = await api.stop();
+      onInfo(res.info);
+    } catch (e: any) {
+      onError(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (

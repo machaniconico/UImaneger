@@ -410,6 +410,11 @@ portEq(
 );
 // Go: "listening on :8080"
 portEq("Go listening colon line", "listening on :8080", 8080);
+portEq("bare listening on line", "listening on 12345", 12345);
+portEq("app listening on line", "App listening on 8080", 8080);
+portEq("started bare port line", "started on 54321", 54321);
+portEq("host colon line", "listening on host:3000", 3000);
+portEq("colon bare line", "listening on :4000", 4000);
 // Go: "listening on port 3000"
 portEq("Go listening port line", "listening on port 3000", 3000);
 // Go: "Server running on port 8080"

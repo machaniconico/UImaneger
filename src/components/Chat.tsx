@@ -138,6 +138,8 @@ export function Chat({ selected, hasKey }: Props) {
       } else {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
       }
+    } catch (e: any) {
+      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setBusy(false);
     }

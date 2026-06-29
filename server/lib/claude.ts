@@ -21,6 +21,7 @@ interface CompleteOpts {
   model?: string;
   system?: string;
   maxTokens?: number;
+  allowTruncated?: boolean;
 }
 
 /**
@@ -46,23 +47,27 @@ export async function complete(
     system: opts.system,
     messages: [{ role: "user", content: prompt }],
   });
-  if (res.stop_reason === "max_tokens") {
+  const block = res.content.find((b) => b.type === "text");
+  const text = block && block.type === "text" ? block.text : "";
+  if (res.stop_reason === "max_tokens" && !opts.allowTruncated) {
     throw new TruncatedError(
       "max_tokens に到達したため応答が切り詰められました。ファイルが大きすぎる可能性があります。"
     );
   }
-  const block = res.content.find((b) => b.type === "text");
-  return block && block.type === "text" ? block.text : "";
+  return text;
 }
 
 /**
  * ```lang ... ``` で囲まれたコードブロックがあれば中身だけ取り出す。
  * 前置きテキストがあっても最初のコードブロックを抽出し、
- * 閉じフェンスの前に末尾改行が無くても認識する。
+ * 閉じフェンスは行頭の ``` のみ認識する。
  * フェンスが無ければ入力を trim して返す(既存挙動)。
  */
 export function stripCodeFence(text: string): string {
-  const m = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)```/);
+  const m = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)^```/m);
   if (!m) return text.trim();
-  return m[1].replace(/\r?\n$/, "");
+  const extracted = m[1].replace(/\r?\n$/, "");
+  const deviation = text.length - extracted.length;
+  if (deviation > 200 && extracted.length < text.length * 0.5) return text;
+  return extracted;
 }
