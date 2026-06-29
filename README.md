@@ -43,9 +43,23 @@ npm run dev            # エディタUI(:5173) + サーバ(:5174)
 「この見出しを大きく赤く」などと入力すると、差分プレビュー → 承認で右側に即反映されます。
 (編集機能には `.env` の `ANTHROPIC_API_KEY` が必要です)
 
+## セキュリティ
+
+ローカル単一ユーザー向けツールとして、安全側の既定で動作します。
+
+- コントロールAPI(ファイル読み書き等)は **`127.0.0.1` のみにバインド**(プレビュープロキシと同様)。
+- `/api/*` は **Origin/Host allowlist** で保護し、`localhost` / `127.0.0.1` / `::1` / `*.localhost` 以外からのリクエストを 403 で拒否(LAN・CSRF・DNS-rebind 対策)。
+- LANからアクセスしたい場合のみ `UIM_HOST=0.0.0.0 npm run dev` で明示的にバインド先を変更できます(自己責任。信頼できるネットワークでのみ)。
+
 ## 開発
 
 ```bash
-npm run typecheck
-node scripts/runner-selftest.mjs   # FW検出ロジックの自己テスト
+npm run typecheck   # 型チェック
+npm test            # selftest(runner/resolver) + vitest(ユニット/統合)
+npm run build       # 本番ビルド
 ```
+
+- テスト: `scripts/*-selftest.mjs`(FW検出/ソース解決の純関数)+ `server/**/*.test.ts`・`src/**/*.test.tsx`(vitest)。編集パイプライン(`/api/edit`→apply/undo)は Claude 呼び出しを mock した統合テストで検証。
+- CI: `.github/workflows/ci.yml` が push/PR で `npm ci → typecheck → test → build` を実行(job 名 `test`)。Node 24 固定(`.ts` 直接 import の型除去が Node 22.6+ 前提)。
+
+> 実APIキーを使ったエンドツーエンドの編集確認(ブラウザで要素選択→指示→反映)は、`.env` に `ANTHROPIC_API_KEY` を設定して手元で行ってください(CIでは mock のため未検証)。
