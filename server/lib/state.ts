@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { type ChildProcess } from "node:child_process";
 import {
   startTarget,
   findFreePort,
@@ -35,6 +36,55 @@ interface Session {
 }
 
 let session: Session | null = null;
+
+function signalGroup(
+  proc: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM"
+): void {
+  if (typeof proc.pid === "number" && proc.pid > 0) {
+    try {
+      process.kill(-proc.pid, signal);
+      return;
+    } catch {
+      // プロセスグループ kill に失敗したらフォールバック
+    }
+  }
+  try {
+    proc.kill(signal);
+  } catch {
+    // 既に終了済みなら無視
+  }
+}
+
+function hasExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null;
+}
+
+function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (hasExited(proc)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      proc.off("exit", onExit);
+      proc.off("error", onError);
+      resolve(ok);
+    };
+    const onExit = () => done(true);
+    const onError = () => done(true);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    proc.once("exit", onExit);
+    proc.once("error", onError);
+    if (hasExited(proc)) done(true);
+  });
+}
+
+async function killGroup(proc: ChildProcess): Promise<void> {
+  signalGroup(proc, "SIGTERM");
+  const exited = await waitForExit(proc, 3_000);
+  if (exited) return;
+  signalGroup(proc, "SIGKILL");
+  await waitForExit(proc, 1_000);
+}
 
 export function getInfo(): ProjectInfo | null {
   if (!session) return null;
@@ -86,6 +136,7 @@ export async function startProject(): Promise<ProjectInfo> {
   if (!session) throw new Error("プロジェクトが開かれていません。");
   if (session.targetAfter && session.proxyAfter) return getInfo()!;
 
+  try {
   // before 配信ディレクトリ準備 (worktree/snapshot/none)
   // 例外は投げない想定だが、万が一落ちたら none へ。
   let before: BeforeHandle;
@@ -158,6 +209,10 @@ export async function startProject(): Promise<ProjectInfo> {
   }
 
   return getInfo()!;
+  } catch (e) {
+    await stopProject().catch(() => {});
+    throw e;
+  }
 }
 
 export async function stopProject(): Promise<void> {
@@ -176,16 +231,20 @@ export async function stopProject(): Promise<void> {
   }
 
   // before ターゲット停止 (none モード時は after と同一オブジェクトなので after 側で停止)
+  const killTasks: Promise<void>[] = [];
+  const sharedTarget = session.targetBefore === session.targetAfter;
   if (session.targetBefore && session.targetBefore !== session.targetAfter) {
-    session.targetBefore.proc.kill("SIGTERM");
+    killTasks.push(killGroup(session.targetBefore.proc));
     session.targetBefore = null;
   }
   // after ターゲット停止
   if (session.targetAfter) {
-    session.targetAfter.proc.kill("SIGTERM");
+    killTasks.push(killGroup(session.targetAfter.proc));
     session.targetAfter = null;
     session.target = null;
+    if (sharedTarget) session.targetBefore = null;
   }
+  await Promise.all(killTasks);
 
   // worktree / snapshot 後始末
   if (session.before) {

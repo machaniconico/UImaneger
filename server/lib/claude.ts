@@ -23,7 +23,18 @@ interface CompleteOpts {
   maxTokens?: number;
 }
 
-/** 単純なテキスト補完。最初の text ブロックを返す。 */
+/**
+ * max_tokens に到達し応答が切り詰められた場合に投げる例外。
+ * complete の戻り値型(Promise<string>)を維持しつつ、呼び出し側へ切り詰めを伝える。
+ */
+export class TruncatedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TruncatedError";
+  }
+}
+
+/** 単純なテキスト補完。最初の text ブロックを返す。切り詰め時は TruncatedError を投げる。 */
 export async function complete(
   prompt: string,
   opts: CompleteOpts = {}
@@ -35,12 +46,23 @@ export async function complete(
     system: opts.system,
     messages: [{ role: "user", content: prompt }],
   });
+  if (res.stop_reason === "max_tokens") {
+    throw new TruncatedError(
+      "max_tokens に到達したため応答が切り詰められました。ファイルが大きすぎる可能性があります。"
+    );
+  }
   const block = res.content.find((b) => b.type === "text");
   return block && block.type === "text" ? block.text : "";
 }
 
-/** ```lang ... ``` で囲まれたコードブロックがあれば中身だけ取り出す。無ければそのまま。 */
+/**
+ * ```lang ... ``` で囲まれたコードブロックがあれば中身だけ取り出す。
+ * 前置きテキストがあっても最初のコードブロックを抽出し、
+ * 閉じフェンスの前に末尾改行が無くても認識する。
+ * フェンスが無ければ入力を trim して返す(既存挙動)。
+ */
 export function stripCodeFence(text: string): string {
-  const m = text.match(/^\s*```[a-zA-Z0-9_-]*\n([\s\S]*?)\n```\s*$/);
-  return m ? m[1] : text.trim();
+  const m = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)```/);
+  if (!m) return text.trim();
+  return m[1].replace(/\r?\n$/, "");
 }

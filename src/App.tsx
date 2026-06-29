@@ -17,10 +17,15 @@ export function App() {
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    api.status().then((s) => {
-      setInfo(s.info);
-      setHasKey(s.hasKey);
-    });
+    api
+      .status()
+      .then((s) => {
+        setInfo(s.info);
+        setHasKey(s.hasKey);
+      })
+      .catch((e: any) => {
+        setError(String(e?.message || e));
+      });
   }, []);
 
   // 編集適用時に右(After)を更新するための合図 (US-005 が dispatch)

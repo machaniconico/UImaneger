@@ -2,14 +2,29 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 // 依存を増やさない軽量 .env ローダ
+function stripComment(value: string): string {
+  let quote: string | null = null;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if ((ch === '"' || ch === "'") && value[i - 1] !== "\\") {
+      quote = quote === ch ? null : quote || ch;
+      continue;
+    }
+    if (ch === "#" && !quote && (i === 0 || /\s/.test(value[i - 1] || ""))) {
+      return value.slice(0, i);
+    }
+  }
+  return value;
+}
+
 function loadDotEnv() {
   try {
     const raw = readFileSync(resolve(process.cwd(), ".env"), "utf8");
     for (const line of raw.split("\n")) {
-      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/i);
+      const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*(.*)$/i);
       if (!m) continue;
       const key = m[1];
-      let val = m[2];
+      let val = stripComment(m[2]).trim();
       if (
         (val.startsWith('"') && val.endsWith('"')) ||
         (val.startsWith("'") && val.endsWith("'"))
