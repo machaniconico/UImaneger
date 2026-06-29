@@ -22,19 +22,31 @@ describe("stripCodeFence", () => {
     ).toBe("export function App() {}");
   });
 
-  it("falls back to the original text when an inner fence would truncate most content", () => {
-    const nested = [
-      "```tsx",
+  it("extracts inner code (preserving nested fences) without leaking the outer fence markers", () => {
+    const inner = [
       "const markdown = `",
       "```",
       "this fence is part of the generated code, not the answer terminator",
       "```",
       "`;",
       `const retained = "${"x".repeat(260)}";`,
-      "```",
     ].join("\n");
+    const nested = ["```tsx", inner, "```"].join("\n");
 
-    expect(stripCodeFence(nested)).toBe(nested);
+    const out = stripCodeFence(nested);
+    // 入れ子フェンスを内包した中身を返し、外側フェンス記号は決して残さない
+    expect(out).toBe(inner);
+    expect(out.startsWith("```")).toBe(false);
+  });
+
+  it("returns clean code (never fence markers) for a long preamble + short code block", () => {
+    const input =
+      "Sure! ".repeat(45) +
+      "\n```tsx\nexport const A = () => <div>hi</div>;\n```";
+    const out = stripCodeFence(input);
+    expect(out).toBe("export const A = () => <div>hi</div>;");
+    expect(out.startsWith("```")).toBe(false);
+    expect(out.includes("Sure!")).toBe(false);
   });
 
   it("handles a closing fence without a trailing newline", () => {

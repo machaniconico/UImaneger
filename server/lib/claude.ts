@@ -68,6 +68,12 @@ export function stripCodeFence(text: string): string {
   if (!m) return text.trim();
   const extracted = m[1].replace(/\r?\n$/, "");
   const deviation = text.length - extracted.length;
-  if (deviation > 200 && extracted.length < text.length * 0.5) return text;
+  if (deviation > 200 && extracted.length < text.length * 0.5) {
+    // 早期クローズの疑い(入れ子フェンスで lazy 抽出が途中で止まった等)。
+    // 生テキスト(フェンス記号や前置きを含む)をそのまま返すとディスクに書き込まれて壊れるため、
+    // 最後の行頭フェンスまで貪欲に再抽出し、外側フェンスのみ除いた中身を返す。
+    const greedy = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*)^```/m);
+    if (greedy) return greedy[1].replace(/\r?\n$/, "");
+  }
   return extracted;
 }

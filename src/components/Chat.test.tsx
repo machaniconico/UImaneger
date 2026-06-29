@@ -153,4 +153,40 @@ describe("Chat", () => {
     expect(api.undoEdit).toHaveBeenCalled();
     expect(await screen.findByText(/元に戻しました/)).not.toBeNull();
   });
+
+  // undo 失敗の回帰テスト(R4で catch を追加。apply 側と対称にカバー)
+  it("api.undoEdit が ok:false を返したときエラー表示し undo ボタンが再び押せる", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.edit).mockResolvedValue(goodProposal());
+    vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
+    vi.mocked(api.undoEdit).mockResolvedValue({ ok: false, error: "undo失敗" });
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByText("承認して適用");
+    await user.click(screen.getByRole("button", { name: "承認して適用" }));
+    const undoBtn = (await screen.findByRole("button", { name: /undo/ })) as HTMLButtonElement;
+    await user.click(undoBtn);
+
+    expect(await screen.findByText(/undo失敗/)).not.toBeNull();
+    await waitFor(() => expect(undoBtn.disabled).toBe(false));
+    expect(screen.queryByText("処理中…")).toBeNull();
+  });
+
+  it("api.undoEdit が例外を投げたときエラー表示し busy 解除される", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.edit).mockResolvedValue(goodProposal());
+    vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
+    vi.mocked(api.undoEdit).mockRejectedValue(new Error("network down"));
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByText("承認して適用");
+    await user.click(screen.getByRole("button", { name: "承認して適用" }));
+    const undoBtn = (await screen.findByRole("button", { name: /undo/ })) as HTMLButtonElement;
+    await user.click(undoBtn);
+
+    expect(await screen.findByText(/network down/)).not.toBeNull();
+    await waitFor(() => expect(undoBtn.disabled).toBe(false));
+  });
 });
