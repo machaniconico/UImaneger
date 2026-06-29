@@ -32,8 +32,25 @@ function listenOnFreePort(server: http.Server, host?: string): Promise<number> {
 
 function closeServer(server: http.Server): Promise<void> {
   return new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
     server.close(() => resolve());
   });
+}
+
+async function canBindLoopback(): Promise<boolean> {
+  const server = http.createServer();
+  try {
+    await listenOnFreePort(server, "127.0.0.1");
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EPERM") return false;
+    throw err;
+  } finally {
+    await closeServer(server).catch(() => {});
+  }
 }
 
 /** fn() が false を返すまでポーリング。timeout 内に false になれば true。 */
@@ -51,7 +68,9 @@ async function waitUntilFalse(
 
 // --- isListening ---
 
-describe("isListening", () => {
+const describeIfLoopback = (await canBindLoopback()) ? describe : describe.skip;
+
+describeIfLoopback("isListening", () => {
   it("detects a listening IPv4 (127.0.0.1) port and returns false after close", async () => {
     const server = http.createServer((_req, res) => res.end("ok"));
     const port = await listenOnFreePort(server, "127.0.0.1");
@@ -82,7 +101,8 @@ describe("isListening", () => {
       const err = e as NodeJS.ErrnoException;
       if (
         err.code === "EADDRNOTAVAIL" ||
-        err.code === "EAFNOSUPPORT"
+        err.code === "EAFNOSUPPORT" ||
+        err.code === "EPERM"
       ) {
         // silent pass にしない: スキップ理由をログ出力
         console.log(
@@ -106,7 +126,7 @@ describe("isListening", () => {
 
 // --- findFreePort ---
 
-describe("findFreePort", () => {
+describeIfLoopback("findFreePort", () => {
   it("returns a free integer port at or after the start value", async () => {
     const port = await findFreePort(50_000);
     expect(Number.isInteger(port)).toBe(true);

@@ -384,6 +384,17 @@
     });
   }
 
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      parentOrigin: parentOrigin,
+      safeProps: safeProps,
+      cssPath: cssPath,
+      getClasses: getClasses,
+      minimalDescriptor: minimalDescriptor,
+      describe: describe,
+    };
+  }
+
   window.addEventListener("mousemove", onMove, true);
   window.addEventListener("click", onClick, true);
   window.addEventListener("scroll", scheduleOverlayFollow, true);
