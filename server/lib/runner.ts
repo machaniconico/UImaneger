@@ -58,7 +58,10 @@ export function detectRunnerFromFacts(
     const devScript = facts.devScript || facts.startScript || "";
 
     // --- Node.js 系 FW (依存パッケージを最優先) ---
-    if (deps.next || /\bnext\b(?:\s+dev|\b)/.test(devScript)) {
+    if (
+      deps.next ||
+      /(?<![\w-])next(?![\w-])(?:\s+dev)?/.test(devScript)
+    ) {
       return {
         framework: "Next.js",
         command: "npx",
@@ -66,7 +69,11 @@ export function detectRunnerFromFacts(
         knownPort: true,
       };
     }
-    if (deps.nuxt || facts.hasNuxtConfig || /\bnuxt\b/.test(devScript)) {
+    if (
+      deps.nuxt ||
+      facts.hasNuxtConfig ||
+      /(?<![\w-])nuxt(?![\w-])/.test(devScript)
+    ) {
       return {
         framework: "Nuxt",
         command: "npx",
@@ -100,7 +107,7 @@ export function detectRunnerFromFacts(
         knownPort: true,
       };
     }
-    if (deps.vite || /\bvite\b/.test(devScript)) {
+    if (deps.vite || /(?<![\w-])vite(?![\w-])/.test(devScript)) {
       return {
         framework: "Vite",
         command: "npx",
@@ -292,6 +299,31 @@ export interface RunningTarget {
   logs: string[];
 }
 
+function signalProcessGroup(
+  proc: ChildProcess,
+  signal: NodeJS.Signals = "SIGTERM"
+): void {
+  if (typeof proc.pid === "number" && proc.pid > 0) {
+    try {
+      process.kill(-proc.pid, signal);
+      return;
+    } catch {
+      // Fall back to the direct child when process-group signalling is unavailable.
+    }
+  }
+  try {
+    proc.kill(signal);
+  } catch {
+    // Best effort cleanup only.
+  }
+}
+
+function terminateProcessGroup(proc: ChildProcess): void {
+  signalProcessGroup(proc, "SIGTERM");
+  const timer = setTimeout(() => signalProcessGroup(proc, "SIGKILL"), 2_000);
+  timer.unref?.();
+}
+
 /**
  * stdout 1行から待受ポートを抽出するための正規表現群。
  * 未知FWでも "Local:" / "localhost:PORT" / "listening on" / "Server running" 等
@@ -303,13 +335,15 @@ export const PORT_PATTERNS: readonly RegExp[] = [
   // "Local:   http://host:PORT" (Vite/Next/Nuxt 等) — 上の URL パターンでも拾えるが明示的に
   /\bLocal:\s+https?:\/\/[^\s/:]+:(\d{2,5})\b/,
   // "Listening on host:PORT" / "listening on :PORT" / "listening on PORT" (Angular/Puma/Go)
-  /[Ll]istening\s+on\s+(?:[^\s:]+)?:(\d{2,5})\b/,
+  /[Ll]istening\s+on\s+(?:[^\s:]*:)?(\d{2,5})\b/,
   // "Listening on port PORT"
   /[Ll]istening\s+on\s+port\s+(\d{2,5})\b/,
   // "Server running at host:PORT" / "Server running on port PORT"
-  /Server\s+running\s+(?:at\s+(?:[^\s:]+)?:?|on\s+port\s+)(\d{2,5})\b/,
+  /Server\s+running\s+(?:at\s+(?:[^\s:]*:)?|on\s+port\s+)(\d{2,5})\b/,
   // "started on host:PORT" / "started on PORT"
-  /[Ss]tarted\s+on\s+(?:[^\s:]+)?:?(\d{2,5})\b/,
+  /[Ss]tarted\s+on\s+(?:[^\s:]*:)?(\d{2,5})\b/,
+  // "started on 7000" / "listening on 7000" など scheme 無し裸ポート
+  /\b(?:started|listening)\s+on\s+(\d{2,5})\b/,
   // "ready on http://host:PORT" (Next.js) は URL パターンでカバー済み
 ];
 
@@ -339,6 +373,14 @@ export async function startTarget(
     cwd: root,
     env: { ...process.env, ...plan.env, FORCE_COLOR: "0" },
     shell: false,
+    detached: true,
+  });
+
+  let spawnFailed = false;
+  let spawnErrorMessage = "";
+  proc.on("error", (e) => {
+    spawnFailed = true;
+    spawnErrorMessage = e.message;
   });
 
   let detectedPort = plan.knownPort ? port : 0;
@@ -361,6 +403,12 @@ export async function startTarget(
   // ポート確定 & listen 待ち
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
+    if (spawnFailed) {
+      terminateProcessGroup(proc);
+      throw new Error(
+        `${plan.command} を起動できません: ${spawnErrorMessage}`
+      );
+    }
     if (proc.exitCode !== null) {
       throw new Error(
         `対象の起動に失敗しました (exit ${proc.exitCode}).\n` +
@@ -372,46 +420,68 @@ export async function startTarget(
     }
     await sleep(300);
   }
-  proc.kill();
+  terminateProcessGroup(proc);
   throw new Error(
     "対象 dev server が時間内に起動しませんでした。\n" + logs.slice(-15).join("\n")
   );
 }
 
-function isListening(port: number): Promise<boolean> {
-  return new Promise((res) => {
-    const sock = net.connect({ host: "127.0.0.1", port }, () => {
+function probeHost(host: string, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host, port }, () => {
       sock.destroy();
-      res(true);
+      resolve();
     });
     sock.on("error", () => {
       sock.destroy();
-      res(false);
+      reject();
     });
     sock.setTimeout(800, () => {
       sock.destroy();
-      res(false);
+      reject();
     });
   });
+}
+
+export function isListening(port: number): Promise<boolean> {
+  return Promise.any([
+    probeHost("127.0.0.1", port),
+    probeHost("::1", port),
+  ])
+    .then(() => true)
+    .catch(() => false);
 }
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** 空きポートを探す。 */
-export function findFreePort(start: number): Promise<number> {
-  return new Promise((resolve, reject) => {
+function portFreeOn(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
     const srv = net.createServer();
     srv.unref();
-    srv.on("error", () => {
-      // 使用中 → 次を試す
-      resolve(findFreePort(start + 1));
+    srv.once("error", (err: NodeJS.ErrnoException) => {
+      if (host === "::1") {
+        resolve(err.code !== "EADDRINUSE");
+        return;
+      }
+      resolve(false);
     });
-    srv.listen(start, "127.0.0.1", () => {
-      const addr = srv.address();
-      const port = typeof addr === "object" && addr ? addr.port : start;
-      srv.close(() => resolve(port));
+    srv.listen(port, host, () => {
+      srv.close(() => resolve(true));
     });
   });
+}
+
+/** 空きポートを探す(IPv4/IPv6 両スタックで確認)。 */
+export async function findFreePort(start: number): Promise<number> {
+  if (start > 65_535) {
+    throw new Error("no free port found");
+  }
+  const free4 = await portFreeOn("127.0.0.1", start);
+  const free6 = await portFreeOn("::1", start);
+  if (!free4 || !free6) {
+    return findFreePort(start + 1);
+  }
+  return start;
 }

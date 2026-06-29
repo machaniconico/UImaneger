@@ -26,7 +26,19 @@ export function usePreviewBridge({
 
   useEffect(() => {
     if (!acceptSelect) return;
+    // プレビュー iframe の期待 origin(before/after プロキシの origin) を算出
+    let expectedOrigin: string | null = null;
+    try {
+      expectedOrigin = url ? new URL(url, window.location.origin).origin : null;
+    } catch {
+      expectedOrigin = null;
+    }
     function handler(e: MessageEvent) {
+      // origin 不一致(および origin 不明)のメッセージは無視
+      if (!expectedOrigin || e.origin !== expectedOrigin) return;
+      // さらに source が期待 iframe と一致するか検証 (iframe 未マウント時は origin のみで判定)
+      const iframe = iframeRef.current;
+      if (iframe && e.source && e.source !== iframe.contentWindow) return;
       const d = e.data || {};
       if (d.type === "uim:select" && d.payload) {
         onSelect?.(d.payload as DomDescriptor);
@@ -34,13 +46,19 @@ export function usePreviewBridge({
     }
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [acceptSelect, onSelect]);
+  }, [acceptSelect, onSelect, url]);
 
   useEffect(() => {
+    let targetOrigin = "*";
+    try {
+      targetOrigin = url ? new URL(url, window.location.origin).origin : "*";
+    } catch {
+      targetOrigin = "*";
+    }
     const send = () =>
       iframeRef.current?.contentWindow?.postMessage(
         { type: "uim:setEnabled", value: selectMode },
-        "*"
+        targetOrigin
       );
     send();
     const t = setInterval(send, 1000);

@@ -38,13 +38,26 @@ const IGNORE_DIRS = new Set([
 const TEXT_EXT =
   /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|html?|css|scss|sass|less|md|mdx|json|ya?ml|php|rb|erb|py|go|java|kt|rs|c|h|cpp|cs|swift|ex|exs|txt|hbs|ejs|pug|twig|blade\.php)$/i;
 
+/** タームが CJK 文字を含むか (短い CJK 熟語も検索対象にするため)。
+ *  U+3000〜U+9FFF: CJK 記号/ひらがな/カタカナ/CJK 統合漢字 等
+ *  U+F900〜U+FAFF: CJK 互換漢字 */
+function hasCJK(s: string): boolean {
+  return /[\u3000-\u9fff\uf900-\ufaff]/.test(s);
+}
+
+/** 検索層が扱う最小長。ASCII は従来通り 3 文字以上、CJK 含みは 1 文字以上。 */
+function isSearchableTerm(term: string): boolean {
+  if (!term) return false;
+  return hasCJK(term) || term.length >= 3;
+}
+
 /** rg 非依存の Node 実装 grep (固定文字列, 行マッチ)。rg が無い環境のフォールバック。 */
 async function nodeGrep(
   root: string,
   term: string,
   max = Infinity
 ): Promise<{ file: string; line: number; preview: string }[]> {
-  if (!term || term.length < 3) return [];
+  if (!isSearchableTerm(term)) return [];
   const out: { file: string; line: number; preview: string }[] = [];
   let filesScanned = 0;
   const FILE_CAP = 6000; // 暴走防止
@@ -351,7 +364,7 @@ async function rgSearch(
   term: string,
   max = 20
 ): Promise<{ file: string; line: number; preview: string }[]> {
-  if (!term || term.length < 3) return [];
+  if (!isSearchableTerm(term)) return [];
   if (!(await isRgUsable())) return nodeGrep(root, term, max);
   const parse = (stdout: string) => {
     const out: { file: string; line: number; preview: string }[] = [];
@@ -405,7 +418,7 @@ async function rgSearch(
  * 上限なしのカウント専用クエリ(--count-matches)を使う。
  */
 async function rgCount(root: string, term: string): Promise<number> {
-  if (!term || term.length < 3) return 0;
+  if (!isSearchableTerm(term)) return 0;
   if (!(await isRgUsable())) return (await nodeGrep(root, term)).length;
   const parse = (stdout: string) => {
     let total = 0;
@@ -639,7 +652,11 @@ ${list}
 
   try {
     const ans = stripCodeFence(
-      await complete(prompt, { model: "claude-haiku-4-5", maxTokens: 16 })
+      await complete(prompt, {
+        model: "claude-haiku-4-5",
+        maxTokens: 16,
+        allowTruncated: true,
+      })
     );
     const idx = parseInt(ans.match(/-?\d+/)?.[0] || "", 10);
     if (Number.isInteger(idx) && idx >= 0 && idx < candidates.length) {

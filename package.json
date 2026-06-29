@@ -10,7 +10,8 @@
     "dev:client": "vite",
     "build": "vite build",
     "start": "tsx server/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/runner-selftest.mjs && node scripts/resolver-selftest.mjs && vitest run"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "latest",
@@ -20,17 +21,22 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "latest",
+    "@testing-library/dom": "latest",
+    "@testing-library/react": "latest",
+    "@testing-library/user-event": "latest",
     "@types/http-proxy": "^1.17.17",
     "@types/node": "latest",
     "@types/react": "latest",
     "@types/react-dom": "latest",
     "@vitejs/plugin-react": "latest",
     "concurrently": "latest",
+    "jsdom": "latest",
     "react": "latest",
     "react-dom": "latest",
     "tailwindcss": "latest",
     "tsx": "latest",
     "typescript": "latest",
-    "vite": "latest"
+    "vite": "latest",
+    "vitest": "latest"
   }
 }

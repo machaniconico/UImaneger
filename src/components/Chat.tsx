@@ -100,17 +100,22 @@ export function Chat({ selected, hasKey }: Props) {
         });
         setCanUndo(true);
         window.dispatchEvent(new CustomEvent("uim:applied"));
+        setProposal(null);
+        setCandidates([]);
       } else {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "適用失敗") });
+        // proposal を保持したまま → 再試行可能
       }
+    } catch (e: any) {
+      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+      // proposal を保持したまま → 再試行可能
     } finally {
-      setProposal(null);
-      setCandidates([]);
       setBusy(false);
     }
   }
 
   async function reject() {
+    if (busy) return; // apply とのレースを防ぐ
     if (proposal?.proposalId) await api.rejectEdit(proposal.proposalId).catch(() => {});
     setProposal(null);
     setCandidates([]);
@@ -133,6 +138,8 @@ export function Chat({ selected, hasKey }: Props) {
       } else {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
       }
+    } catch (e: any) {
+      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setBusy(false);
     }

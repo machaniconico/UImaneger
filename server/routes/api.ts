@@ -3,10 +3,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { resolve, join, relative, isAbsolute, basename } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
 import { env } from "../lib/env.ts";
-import { hasKey, complete, stripCodeFence } from "../lib/claude.ts";
+import { hasKey, complete, stripCodeFence, TruncatedError } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
 import {
@@ -32,6 +32,7 @@ interface ProposalEntry {
   relFile: string;
   line?: number;
   confidence: Confidence;
+  createdAt: number;
 }
 
 interface UndoEntry {
@@ -42,14 +43,123 @@ interface UndoEntry {
   proposalId: string;
 }
 
+const PROPOSAL_TTL_MS = 30 * 60 * 1000;
+const PROPOSAL_MAX = 100;
+const UNDO_MAX = 50;
+
 const proposalStore = new Map<string, ProposalEntry>();
 const undoStack: UndoEntry[] = [];
 // テスト/検証用途にストアを公開 (本番はプロセス内メモリ)
 export const __stores = { proposalStore, undoStack };
 
+/** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
+const inFlight = new Set<string>();
+
+/** 期限切れ・過剰件数の提案を破棄(TTL 30分 / 上限 PROPOSAL_MAX)。 */
+function pruneProposals(): void {
+  const now = Date.now();
+  for (const [id, entry] of proposalStore) {
+    if (now - entry.createdAt > PROPOSAL_TTL_MS) proposalStore.delete(id);
+  }
+  if (proposalStore.size > PROPOSAL_MAX) {
+    const sorted = [...proposalStore.entries()].sort(
+      (a, b) => a[1].createdAt - b[1].createdAt
+    );
+    const removeCount = proposalStore.size - PROPOSAL_MAX;
+    for (let k = 0; k < removeCount; k++) proposalStore.delete(sorted[k][0]);
+  }
+}
+
+/** undo スタックへ積みつつ件数上限(UNDO_MAX)を維持。古いものから破棄。 */
+function pushUndo(entry: UndoEntry): void {
+  undoStack.push(entry);
+  while (undoStack.length > UNDO_MAX) undoStack.shift();
+}
+
+/**
+ * root 配下かを realpath で判定(シンボリックリンク経由のトラバーサルを防止)。
+ * ファイルが未存在の場合は親ディレクトリを realpath して判定する。
+ */
 function inRoot(root: string, file: string): boolean {
-  const rel = relative(root, resolve(file));
-  return !rel.startsWith("..") && !isAbsolute(rel);
+  if (typeof root !== "string" || typeof file !== "string") return false;
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch {
+    return false;
+  }
+  const abs = resolve(file);
+  let realFile: string;
+  try {
+    realFile = realpathSync(abs);
+  } catch {
+    try {
+      const realParent = realpathSync(dirname(abs));
+      realFile = join(realParent, basename(abs));
+    } catch {
+      return false;
+    }
+  }
+  const rel = relative(realRoot, realFile);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+/**
+ * descriptor の形を検証。必須フィールドを欠落や型違いで 400 にするためのエラー文を返す。
+ * classes は任意扱い(未指定可)。
+ */
+function validateDescriptor(d: unknown): string | null {
+  if (!d || typeof d !== "object") return "descriptor が必要です。";
+  const o = d as Record<string, unknown>;
+  if (typeof o.tag !== "string") return "descriptor.tag は文字列である必要があります。";
+  if (o.id !== undefined && typeof o.id !== "string")
+    return "descriptor.id は文字列である必要があります。";
+  if (o.classes !== undefined && !Array.isArray(o.classes))
+    return "descriptor.classes は配列である必要があります。";
+  if (
+    Array.isArray(o.classes) &&
+    !o.classes.every((c) => typeof c === "string")
+  )
+    return "descriptor.classes は文字列配列である必要があります。";
+  if (
+    o.attrs !== undefined &&
+    (typeof o.attrs !== "object" || o.attrs === null || Array.isArray(o.attrs))
+  )
+    return "descriptor.attrs はオブジェクトである必要があります。";
+  if (o.textSnippet !== undefined && typeof o.textSnippet !== "string")
+    return "descriptor.textSnippet は文字列である必要があります。";
+  if (o.domPath !== undefined && typeof o.domPath !== "string")
+    return "descriptor.domPath は文字列である必要があります。";
+  if (o.source !== undefined) {
+    if (
+      typeof o.source !== "object" ||
+      o.source === null ||
+      Array.isArray(o.source)
+    )
+      return "descriptor.source はオブジェクトである必要があります。";
+    const s = o.source as Record<string, unknown>;
+    if (s.fileName !== undefined && typeof s.fileName !== "string")
+      return "descriptor.source.fileName は文字列である必要があります。";
+    if (s.lineNumber !== undefined && typeof s.lineNumber !== "number")
+      return "descriptor.source.lineNumber は数値である必要があります。";
+    if (s.columnNumber !== undefined && typeof s.columnNumber !== "number")
+      return "descriptor.source.columnNumber は数値である必要があります。";
+  }
+  return null;
+}
+
+/** 検証済み descriptor の任意フィールド(classes/attrs/domPath)を安全な既定値で補充する。 */
+function normalizeDescriptor(d: DomDescriptor): DomDescriptor {
+  return {
+    ...d,
+    classes: Array.isArray(d.classes) ? d.classes : [],
+    attrs:
+      d.attrs && typeof d.attrs === "object" && !Array.isArray(d.attrs)
+        ? d.attrs
+        : {},
+    domPath: typeof d.domPath === "string" ? d.domPath : "",
+    tag: typeof d.tag === "string" ? d.tag : "",
+  };
 }
 
 api.get("/status", (c) =>
@@ -90,9 +200,10 @@ api.post("/project/clone", async (c) => {
     }
     // 依存があれば install (node プロジェクト)
     if (existsSync(join(dest, "package.json")) && !existsSync(join(dest, "node_modules"))) {
-      await pExecFile("npm", ["install"], { cwd: dest, maxBuffer: 32 * 1024 * 1024 }).catch(
-        () => {}
-      );
+      await pExecFile("npm", ["install", "--ignore-scripts"], {
+        cwd: dest,
+        maxBuffer: 32 * 1024 * 1024,
+      }).catch(() => {});
     }
     await openProject(dest, { command: runCommand });
     const info = await startProject();
@@ -132,6 +243,8 @@ api.post("/files/write", async (c) => {
   const root = getRoot();
   const { path, content } = await c.req.json<{ path: string; content: string }>();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+  if (typeof path !== "string" || typeof content !== "string")
+    return c.json({ error: "path と content は文字列である必要があります。" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
   try {
     await writeFile(resolve(path), content, "utf8");
@@ -150,12 +263,15 @@ api.post("/edit", async (c) => {
       400
     );
 
-  const { descriptor, instruction } = await c.req.json<{
+  const { descriptor: rawDescriptor, instruction } = await c.req.json<{
     descriptor: DomDescriptor;
     instruction: string;
   }>();
   if (!instruction?.trim())
     return c.json({ error: "指示が空です" }, 400);
+  const descErr = validateDescriptor(rawDescriptor);
+  if (descErr) return c.json({ error: descErr }, 400);
+  const descriptor = normalizeDescriptor(rawDescriptor);
 
   try {
     // 1. ソース解決 (層A/B)
@@ -231,7 +347,23 @@ async function buildProposalForFile(
   const relFile = relative(root, file);
   const original = await readFile(file, "utf8");
   const prompt = buildEditPrompt(relFile, original, descriptor, line, instruction);
-  const raw = await complete(prompt, { maxTokens: 16000 });
+  let raw: string;
+  try {
+    raw = await complete(prompt, { maxTokens: 16000 });
+  } catch (e) {
+    if (e instanceof TruncatedError) {
+      return {
+        ok: false,
+        file,
+        relFile,
+        line,
+        confidence,
+        summary:
+          "ファイルが大きすぎて完全な編集を生成できませんでした。ファイルを分割するか対象箇所を絞ってください。",
+      };
+    }
+    throw e;
+  }
   const edited = stripCodeFence(raw);
 
   if (!edited || edited.trim() === original.trim()) {
@@ -247,6 +379,7 @@ async function buildProposalForFile(
 
   const diff = createUnifiedDiff(original, edited, relFile);
   const proposalId = randomUUID();
+  pruneProposals();
   proposalStore.set(proposalId, {
     file,
     original,
@@ -254,7 +387,9 @@ async function buildProposalForFile(
     relFile,
     line,
     confidence,
+    createdAt: Date.now(),
   });
+  pruneProposals();
 
   return {
     ok: true,
@@ -273,15 +408,20 @@ api.post("/edit/candidate", async (c) => {
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
 
-  const { file, line, descriptor, instruction } = await c.req.json<{
+  const { file, line, descriptor: rawDescriptor, instruction } = await c.req.json<{
     file: string;
     line?: number;
     descriptor?: DomDescriptor;
     instruction: string;
   }>();
-  if (!file) return c.json({ error: "file が必要です" }, 400);
+  if (typeof file !== "string" || !file)
+    return c.json({ error: "file が必要です" }, 400);
   if (!instruction?.trim())
     return c.json({ error: "指示が空です" }, 400);
+  if (rawDescriptor !== undefined) {
+    const descErr = validateDescriptor(rawDescriptor);
+    if (descErr) return c.json({ error: descErr }, 400);
+  }
   if (!inRoot(root, file))
     return c.json({ error: "範囲外のパス" }, 403);
 
@@ -295,12 +435,9 @@ api.post("/edit/candidate", async (c) => {
       400
     );
 
-  const desc: DomDescriptor = descriptor ?? {
-    tag: "",
-    classes: [],
-    attrs: {},
-    domPath: "",
-  };
+  const desc: DomDescriptor = rawDescriptor
+    ? normalizeDescriptor(rawDescriptor)
+    : { tag: "", classes: [], attrs: {}, domPath: "" };
 
   try {
     const result = await buildProposalForFile(
@@ -325,6 +462,8 @@ api.post("/edit/apply", async (c) => {
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
 
+  pruneProposals();
+
   const p = proposalStore.get(proposalId);
   if (!p)
     return c.json(
@@ -334,10 +473,21 @@ api.post("/edit/apply", async (c) => {
   if (!inRoot(root, p.file))
     return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
 
+  // 同一 proposalId の並行 apply を拒否(二重書き込み/undo 二重 push 防止)
+  if (inFlight.has(proposalId))
+    return c.json({ error: "この提案は現在処理中です。" }, 409);
+  inFlight.add(proposalId);
+
   try {
     const before = await readFile(p.file, "utf8");
+    if (before !== p.original) {
+      return c.json(
+        { error: "ファイルが変更されています。再提案してください。" },
+        409
+      );
+    }
     await writeFile(p.file, p.proposed, "utf8");
-    undoStack.push({
+    pushUndo({
       file: p.file,
       relFile: p.relFile,
       previousContent: before,
@@ -353,6 +503,8 @@ api.post("/edit/apply", async (c) => {
     });
   } catch (e: any) {
     return c.json({ error: String(e.message || e) }, 500);
+  } finally {
+    inFlight.delete(proposalId);
   }
 });
 
@@ -361,6 +513,9 @@ api.post("/edit/reject", async (c) => {
   const { proposalId } = await c.req.json<{ proposalId: string }>();
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
+  if (inFlight.has(proposalId))
+    return c.json({ error: "この提案は現在処理中です。" }, 409);
+  pruneProposals();
   if (!proposalStore.delete(proposalId))
     return c.json({ error: "提案が見つかりません。" }, 404);
   return c.json({ ok: true });
@@ -373,8 +528,15 @@ api.post("/edit/undo", async (c) => {
   const entry = undoStack.pop();
   if (!entry)
     return c.json({ error: "元に戻せる適用がありません。" }, 404);
+  // 同一 proposalId の並行 undo/apply を拒否(二重書き込み防止)
+  if (inFlight.has(entry.proposalId)) {
+    undoStack.push(entry);
+    return c.json({ error: "この提案は現在処理中です。" }, 409);
+  }
+  inFlight.add(entry.proposalId);
   if (!inRoot(root, entry.file)) {
     undoStack.push(entry);
+    inFlight.delete(entry.proposalId);
     return c.json({ error: "対象がプロジェクト範囲外" }, 403);
   }
   try {
@@ -388,6 +550,8 @@ api.post("/edit/undo", async (c) => {
   } catch (e: any) {
     undoStack.push(entry);
     return c.json({ error: String(e.message || e) }, 500);
+  } finally {
+    inFlight.delete(entry.proposalId);
   }
 });
 

@@ -1,4 +1,5 @@
 import http from "node:http";
+import type { Duplex } from "node:stream";
 import httpProxy from "http-proxy";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -7,9 +8,17 @@ import { dirname, join } from "node:path";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INSPECTOR_PATH = join(__dirname, "..", "inspector-client.js");
 
+let inspectorScript: string | null | undefined;
 function inspectorTag(): string {
-  const js = readFileSync(INSPECTOR_PATH, "utf8");
-  return `\n<script data-uim-inspector>${js}</script>\n`;
+  if (inspectorScript === undefined) {
+    try {
+      inspectorScript = readFileSync(INSPECTOR_PATH, "utf8");
+    } catch {
+      inspectorScript = null;
+    }
+  }
+  if (!inspectorScript) return "";
+  return `\n<script data-uim-inspector>${inspectorScript}</script>\n`;
 }
 
 export interface ProxyHandle {
@@ -59,12 +68,16 @@ export function startProxy(
     proxyRes.on("end", () => {
       let body = Buffer.concat(chunks).toString("utf8");
       const tag = inspectorTag();
-      if (body.includes("</body>")) {
-        body = body.replace("</body>", tag + "</body>");
-      } else {
-        body += tag;
+      if (tag) {
+        if (body.includes("</body>")) {
+          body = body.replace("</body>", tag + "</body>");
+        } else {
+          body += tag;
+        }
       }
       delete headers["content-length"];
+      delete headers["content-encoding"];
+      delete headers["transfer-encoding"];
       headers["content-length"] = String(Buffer.byteLength(body));
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(body);
@@ -83,7 +96,14 @@ export function startProxy(
   const server = http.createServer((req, res) => {
     proxy.web(req, res);
   });
+  const sockets = new Set<Duplex>();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
   server.on("upgrade", (req, socket, head) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
     proxy.ws(req, socket, head);
   });
 
@@ -94,9 +114,25 @@ export function startProxy(
         server,
         port: proxyPort,
         close: () =>
-          new Promise((r) => {
+          new Promise<void>((resolve) => {
+            let settled = false;
+            const done = () => {
+              if (settled) return;
+              settled = true;
+              resolve();
+            };
+            const timer = setTimeout(done, 4_000);
             proxy.close();
-            server.close(() => r());
+            server.close(() => {
+              clearTimeout(timer);
+              done();
+            });
+            if (typeof server.closeAllConnections === "function") {
+              server.closeAllConnections();
+            }
+            for (const s of sockets) {
+              if (!s.destroyed) s.destroy();
+            }
           }),
       });
     });

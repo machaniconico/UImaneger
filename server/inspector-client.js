@@ -16,6 +16,24 @@
   var styleEl = null;
   var currentEl = null;
   var rafPending = false;
+  var resizeObs = null;
+  var cachedParentOrigin;
+
+  function parentOrigin() {
+    if (cachedParentOrigin !== undefined) return cachedParentOrigin;
+    try {
+      cachedParentOrigin = document.referrer
+        ? new URL(document.referrer).origin
+        : "";
+    } catch (e) {
+      cachedParentOrigin = "";
+    }
+    return cachedParentOrigin;
+  }
+
+  function postToParent(message) {
+    window.parent.postMessage(message, parentOrigin() || "*");
+  }
 
   function ensureOverlay() {
     if (overlay) return overlay;
@@ -194,60 +212,145 @@
     return parts.join(" > ");
   }
 
-  function describe(el) {
-    var attrs = {};
-    for (var i = 0; i < el.attributes.length; i++) {
-      var a = el.attributes[i];
-      if (a.name === "style") continue;
-      attrs[a.name] = a.value;
+  // className が文字列でない(SVGAnimatedString 等)場合もクラス列を取り出す。
+  // SVG 要素は className.baseVal、それ以外は classList からフォールバック。
+  function getClasses(el) {
+    try {
+      var cn = el.className;
+      if (cn == null) return [];
+      if (typeof cn === "object" && cn.baseVal != null) cn = cn.baseVal;
+      if (typeof cn !== "string") {
+        if (el.classList && el.classList.length) {
+          return Array.prototype.slice.call(el.classList);
+        }
+        return [];
+      }
+      return cn.split(/\s+/).filter(Boolean);
+    } catch (e) {
+      return [];
     }
-    var r = el.getBoundingClientRect();
-    var text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120);
-    var vue = getVueInfo(el);
-    var svelte = getSvelteInfo(el);
-    var hints = getHints(el);
-    var d = {
-      tag: el.nodeName.toLowerCase(),
-      id: el.id || undefined,
-      classes: el.className && typeof el.className === "string"
-        ? el.className.split(/\s+/).filter(Boolean)
-        : [],
-      attrs: attrs,
-      textSnippet: text || undefined,
-      domPath: cssPath(el),
-      rect: { x: r.left, y: r.top, width: r.width, height: r.height },
-      // 層A: React を最優先、無ければ Svelte の source を昇格 (resolver は d.source を見る)
-      source: getReactSource(el) || (svelte && svelte.source) || undefined,
-    };
-    if (vue) d.vue = vue;
-    if (svelte) d.svelte = svelte;
-    if (hints) d.hints = hints;
-    return d;
+  }
+
+  // 層A含め全て失敗した時の DOM のみ最小 descriptor (payload 互換性を維持)
+  function minimalDescriptor(el) {
+    try {
+      var r = el.getBoundingClientRect();
+      var text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120);
+      return {
+        tag: el.nodeName.toLowerCase(),
+        id: el.id || undefined,
+        classes: getClasses(el),
+        attrs: {},
+        textSnippet: text || undefined,
+        domPath: cssPath(el),
+        rect: { x: r.left, y: r.top, width: r.width, height: r.height },
+        source: undefined,
+      };
+    } catch (e2) {
+      return {
+        tag: el && el.nodeName ? el.nodeName.toLowerCase() : "unknown",
+        id: undefined,
+        classes: [],
+        attrs: {},
+        textSnippet: undefined,
+        domPath: "",
+        source: undefined,
+      };
+    }
+  }
+
+  function describe(el) {
+    try {
+      var attrs = {};
+      for (var i = 0; i < el.attributes.length; i++) {
+        var a = el.attributes[i];
+        if (a.name === "style") continue;
+        attrs[a.name] = a.value;
+      }
+      var r = el.getBoundingClientRect();
+      var text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120);
+      // 層A取得は個別に try/catch — 1つ失敗しても DOM 情報は生かす
+      var vue, svelte, hints, source;
+      try { vue = getVueInfo(el); } catch (e) {}
+      try { svelte = getSvelteInfo(el); } catch (e) {}
+      try { hints = getHints(el); } catch (e) {}
+      try {
+        source = getReactSource(el) || (svelte && svelte.source) || undefined;
+      } catch (e) {
+        source = undefined;
+      }
+      var d = {
+        tag: el.nodeName.toLowerCase(),
+        id: el.id || undefined,
+        classes: getClasses(el),
+        attrs: attrs,
+        textSnippet: text || undefined,
+        domPath: cssPath(el),
+        rect: { x: r.left, y: r.top, width: r.width, height: r.height },
+        // 層A: React を最優先、無ければ Svelte の source を昇格 (resolver は d.source を見る)
+        source: source,
+      };
+      if (vue) d.vue = vue;
+      if (svelte) d.svelte = svelte;
+      if (hints) d.hints = hints;
+      return d;
+    } catch (e) {
+      // 層A含め全て失敗 → DOM 情報だけで最小 descriptor を返す
+      return minimalDescriptor(el);
+    }
+  }
+
+  // 選択中要素のサイズ変化を ResizeObserver で追従 (previewCss 注入等のレイアウト変化)
+  function observeCurrent(el) {
+    if (resizeObs) {
+      try { resizeObs.disconnect(); } catch (e) {}
+      resizeObs = null;
+    }
+    if (!el || typeof ResizeObserver === "undefined") return;
+    try {
+      resizeObs = new ResizeObserver(function () { scheduleOverlayFollow(); });
+      resizeObs.observe(el);
+    } catch (e) {}
+  }
+
+  function setCurrentEl(el) {
+    if (currentEl === el) return;
+    currentEl = el;
+    observeCurrent(el);
   }
 
   function onMove(e) {
     if (!enabled) return;
     var el = e.target;
     if (!el || el === overlay) return;
-    currentEl = el;
-    moveOverlay(el);
+    setCurrentEl(el);
+    // rAF スロットル: mousemove 毎の getBoundingClientRect(強制レイアウト)を防ぐ
+    scheduleOverlayFollow();
   }
 
   function onClick(e) {
     if (!enabled) return;
     e.preventDefault();
     e.stopPropagation();
-    var el = e.target;
-    if (!el || el === overlay) return;
-    var payload = describe(el);
-    window.parent.postMessage({ type: "uim:select", payload: payload }, "*");
+    try {
+      var el = e.target;
+      if (!el || el === overlay) return false;
+      var payload = describe(el);
+      postToParent({ type: "uim:select", payload: payload });
+    } catch (e2) {
+      // describe/postMessage が投げても選択イベントごと失われないよう握る
+    }
     return false;
   }
 
   function setEnabled(v) {
     enabled = v;
     document.documentElement.style.cursor = v ? "crosshair" : "";
-    if (!v) hideOverlay();
+    if (!v) {
+      hideOverlay();
+      observeCurrent(null);
+      currentEl = null;
+    }
   }
 
   // 層C: 親から渡された CSS を即時注入してプレビュー
@@ -258,6 +361,12 @@
       document.head.appendChild(styleEl);
     }
     styleEl.textContent = css || "";
+    // CSS 注入でレイアウトが変わるとオーバーレイ位置がずれるため
+    // レイアウト反映後に再位置決め (二段 rAF)
+    scheduleOverlayFollow();
+    requestAnimationFrame(function () {
+      scheduleOverlayFollow();
+    });
   }
 
   // スクロール/リサイズ時にオーバーレイが要素へ追従するよう再位置決め
@@ -266,12 +375,24 @@
     rafPending = true;
     requestAnimationFrame(function () {
       rafPending = false;
-      if (!enabled || !currentEl || !document.body.contains(currentEl)) {
+      if (!enabled || !currentEl || !currentEl.isConnected) {
         hideOverlay();
+        observeCurrent(null);
         return;
       }
       moveOverlay(currentEl);
     });
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      parentOrigin: parentOrigin,
+      safeProps: safeProps,
+      cssPath: cssPath,
+      getClasses: getClasses,
+      minimalDescriptor: minimalDescriptor,
+      describe: describe,
+    };
   }
 
   window.addEventListener("mousemove", onMove, true);
@@ -280,13 +401,14 @@
   window.addEventListener("resize", scheduleOverlayFollow);
 
   window.addEventListener("message", function (e) {
+    if (e.source !== window.parent) return;
     var d = e.data || {};
     if (d.type === "uim:setEnabled") setEnabled(!!d.value);
     else if (d.type === "uim:previewCss") applyPreviewCss(d.css);
     else if (d.type === "uim:ping")
-      window.parent.postMessage({ type: "uim:pong" }, "*");
+      postToParent({ type: "uim:pong" });
   });
 
   // 起動通知
-  window.parent.postMessage({ type: "uim:ready" }, "*");
+  postToParent({ type: "uim:ready" });
 })();
