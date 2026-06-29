@@ -443,7 +443,7 @@ function probeHost(host: string, port: number): Promise<void> {
   });
 }
 
-function isListening(port: number): Promise<boolean> {
+export function isListening(port: number): Promise<boolean> {
   return Promise.any([
     probeHost("127.0.0.1", port),
     probeHost("::1", port),
