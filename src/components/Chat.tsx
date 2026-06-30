@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   Candidate,
   DomDescriptor,
@@ -17,26 +17,63 @@ interface Msg {
 interface Props {
   selected: DomDescriptor | null;
   hasKey: boolean;
+  initialUndoDepth?: number;
 }
 
-export function Chat({ selected, hasKey }: Props) {
+function descriptorLabel(d: DomDescriptor) {
+  return `<${d.tag}${d.id ? ` #${d.id}` : ""}>${
+    d.textSnippet ? ` "${d.textSnippet}"` : ""
+  }`;
+}
+
+function sameDescriptor(a: DomDescriptor, b: DomDescriptor) {
+  return (
+    a.domPath === b.domPath &&
+    a.tag === b.tag &&
+    (a.id ?? "") === (b.id ?? "")
+  );
+}
+
+export function Chat({ selected, hasKey, initialUndoDepth }: Props) {
   const [instruction, setInstruction] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [busy, setBusy] = useState(false);
   const [proposal, setProposal] = useState<EditProposal | null>(null);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [lastInstruction, setLastInstruction] = useState("");
-  const [canUndo, setCanUndo] = useState(false);
+  const [undoDepth, setUndoDepth] = useState(initialUndoDepth ?? 0);
+  const undoDepthSeededRef = useRef(initialUndoDepth != null);
+  const logRef = useRef<HTMLDivElement>(null);
   // 提案/候補を生成した時点の要素を固定保持 (その後 selected が変わっても誤マッチを防ぐ)
   const [editDescriptor, setEditDescriptor] = useState<DomDescriptor | null>(
     null
   );
+  const hasPendingSuggestion =
+    candidates.length > 0 || Boolean(proposal && proposal.diff);
+  const descriptorMismatch = Boolean(
+    hasPendingSuggestion &&
+      editDescriptor &&
+      selected &&
+      !sameDescriptor(editDescriptor, selected)
+  );
+
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [msgs, busy, proposal, candidates]);
+
+  useEffect(() => {
+    if (!undoDepthSeededRef.current && initialUndoDepth != null) {
+      setUndoDepth(initialUndoDepth);
+      undoDepthSeededRef.current = true;
+    }
+  }, [initialUndoDepth]);
 
   function log(m: Msg) {
     setMsgs((prev) => [...prev, m]);
   }
 
-  function handleProposal(res: EditProposal) {
+  function handleProposal(res: EditProposal, originalText?: string) {
     if (res.ok && res.proposalId && res.diff) {
       setProposal(res);
       setCandidates(res.candidates ?? []);
@@ -47,6 +84,7 @@ export function Chat({ selected, hasKey }: Props) {
     } else {
       setProposal(null);
       setCandidates([]);
+      if (originalText) setInstruction(originalText);
       log({
         role: "system",
         ok: false,
@@ -66,8 +104,9 @@ export function Chat({ selected, hasKey }: Props) {
     log({ role: "user", text });
     setBusy(true);
     try {
-      handleProposal(await api.edit(selected, text));
+      handleProposal(await api.edit(selected, text), text);
     } catch (e: any) {
+      setInstruction(text);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setBusy(false);
@@ -79,7 +118,10 @@ export function Chat({ selected, hasKey }: Props) {
     if (!desc || busy) return;
     setBusy(true);
     try {
-      handleProposal(await api.editCandidate(c, desc, lastInstruction));
+      handleProposal(
+        await api.editCandidate(c, desc, lastInstruction),
+        lastInstruction
+      );
     } catch (e: any) {
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
@@ -98,7 +140,7 @@ export function Chat({ selected, hasKey }: Props) {
           ok: true,
           text: `✓ ${res.relFile || proposal.relFile} に適用しました`,
         });
-        setCanUndo(true);
+        setUndoDepth((depth) => res.undoDepth ?? depth + 1);
         window.dispatchEvent(new CustomEvent("uim:applied"));
         setProposal(null);
         setCandidates([]);
@@ -123,7 +165,7 @@ export function Chat({ selected, hasKey }: Props) {
   }
 
   async function undo() {
-    if (busy) return;
+    if (busy || undoDepth <= 0) return;
     setBusy(true);
     try {
       const res = await api.undoEdit();
@@ -134,11 +176,13 @@ export function Chat({ selected, hasKey }: Props) {
           text: `↩ ${res.relFile || ""} を元に戻しました`,
         });
         window.dispatchEvent(new CustomEvent("uim:applied"));
-        setCanUndo(false);
+        setUndoDepth(res.undoDepth ?? 0);
       } else {
+        setUndoDepth(res.undoDepth ?? 0);
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
       }
     } catch (e: any) {
+      if (String(e?.message || e).startsWith("HTTP 404:")) setUndoDepth(0);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setBusy(false);
@@ -149,13 +193,14 @@ export function Chat({ selected, hasKey }: Props) {
     <div className="flex h-full flex-col bg-neutral-950 text-neutral-200">
       <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2 text-sm font-semibold">
         <span>自然言語で編集</span>
-        {canUndo && (
+        {undoDepth > 0 && (
           <button
+            type="button"
             onClick={undo}
             disabled={busy}
             className="rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:opacity-50"
           >
-            ↩ undo
+            ↩ undo ({undoDepth})
           </button>
         )}
       </div>
@@ -194,24 +239,49 @@ export function Chat({ selected, hasKey }: Props) {
       </div>
 
       {/* ログ + 提案 */}
-      <div className="flex-1 space-y-2 overflow-y-auto px-3 py-2 text-sm">
-        {msgs.map((m, i) => (
-          <div
-            key={i}
-            className={
-              m.role === "user"
-                ? "rounded bg-neutral-800 px-2 py-1"
-                : m.ok === true
-                ? "text-green-400"
-                : m.ok === false
-                ? "text-red-400"
-                : "text-neutral-500"
-            }
-          >
-            {m.text}
+      <div
+        ref={logRef}
+        className="flex-1 space-y-2 overflow-y-auto px-3 py-2 text-sm"
+      >
+        <div
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions"
+          className="space-y-2"
+        >
+          {msgs.map((m, i) => (
+            <div
+              key={i}
+              className={
+                m.role === "user"
+                  ? "rounded bg-neutral-800 px-2 py-1"
+                  : m.ok === true
+                  ? "text-green-400"
+                  : m.ok === false
+                  ? "text-red-400"
+                  : "text-neutral-500"
+              }
+            >
+              {m.text}
+            </div>
+          ))}
+        </div>
+        {busy && (
+          <div role="status" className="text-neutral-500">
+            処理中…
           </div>
-        ))}
-        {busy && <div className="text-neutral-500">処理中…</div>}
+        )}
+
+        {hasPendingSuggestion && editDescriptor && (
+          <div className="rounded border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-400">
+            <div>提案対象: {descriptorLabel(editDescriptor)}</div>
+            {descriptorMismatch && (
+              <div className="mt-1 text-amber-300">
+                この差分は別の選択要素のものです
+              </div>
+            )}
+          </div>
+        )}
 
         {candidates.length > 0 && (
           <Candidates candidates={candidates} busy={busy} onPick={pickCandidate} />
@@ -242,6 +312,7 @@ export function Chat({ selected, hasKey }: Props) {
           onKeyDown={(e) => {
             if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
           }}
+          aria-label="編集指示"
           placeholder={
             selected
               ? "例: この見出しを大きく赤くして / 余白を広げて / 角を丸く"

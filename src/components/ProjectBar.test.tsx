@@ -43,6 +43,14 @@ describe("ProjectBar.stop()", () => {
   beforeEach(() => vi.clearAllMocks());
   afterEach(cleanup);
 
+  it("パス入力にアクセシブル名を持つ", () => {
+    setup();
+
+    expect(
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitHub URL" })
+    ).not.toBeNull();
+  });
+
   it("停止成功時: onInfo が呼ばれ onError がクリアされ busy が解除される", async () => {
     const user = userEvent.setup();
     vi.mocked(api.stop).mockResolvedValue({ info: null });

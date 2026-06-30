@@ -21,7 +21,10 @@ function findLine(container: HTMLElement, text: string): HTMLElement | undefined
 }
 
 describe("DiffView", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
 
   it("追加行(+)と削除行(-)が区別して描画される", () => {
     const { container } = render(
@@ -80,5 +83,20 @@ describe("DiffView", () => {
     expect(
       (screen.getByRole("button", { name: "却下" }) as HTMLButtonElement).disabled
     ).toBe(true);
+  });
+
+  it("コピーボタンで diff をマーカー込みのまま clipboard に渡す", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    render(<DiffView diff={SAMPLE_DIFF} onApply={() => {}} onReject={() => {}} />);
+
+    await user.click(screen.getByRole("button", { name: "diff をコピー" }));
+
+    expect(writeText).toHaveBeenCalledWith(SAMPLE_DIFF);
+    expect(await screen.findByText("コピー済")).not.toBeNull();
   });
 });

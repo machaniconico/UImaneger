@@ -25,6 +25,15 @@ const descriptor: DomDescriptor = {
   domPath: "html>body>button",
 };
 
+const otherDescriptor: DomDescriptor = {
+  tag: "a",
+  id: "link",
+  classes: ["secondary"],
+  attrs: {},
+  textSnippet: "Other",
+  domPath: "html>body>a",
+};
+
 function goodProposal(overrides: Partial<EditProposal> = {}): EditProposal {
   return {
     ok: true,
@@ -47,6 +56,15 @@ describe("Chat", () => {
   });
   afterEach(cleanup);
 
+  it("ログ領域と入力欄にアクセシブル名/ライブリージョンを持つ", () => {
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    expect(screen.getByRole("textbox", { name: "編集指示" })).not.toBeNull();
+    const log = screen.getByRole("log");
+    expect(log.getAttribute("aria-live")).toBe("polite");
+    expect(log.getAttribute("aria-relevant")).toBe("additions");
+  });
+
   it("指示送信 → api.edit が EditProposal を返し DiffView に差分表示(まだ applyEdit は呼ばれない)", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
@@ -64,7 +82,11 @@ describe("Chat", () => {
   it("承認クリックで api.applyEdit が呼ばれ、成功メッセージが出る", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
-    vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
+    vi.mocked(api.applyEdit).mockResolvedValue({
+      ok: true,
+      relFile: "src/App.tsx",
+      undoDepth: 2,
+    });
     render(<Chat selected={descriptor} hasKey={true} />);
 
     await sendInstruction(user, "赤くして");
@@ -73,6 +95,9 @@ describe("Chat", () => {
 
     expect(api.applyEdit).toHaveBeenCalledWith("p1");
     expect(await screen.findByText(/適用しました/)).not.toBeNull();
+    expect(
+      await screen.findByRole("button", { name: /undo \(2\)/ })
+    ).not.toBeNull();
   });
 
   // ★最重要: apply 失敗時の回帰テスト(Codex確認済みの修正)
@@ -139,26 +164,39 @@ describe("Chat", () => {
   it("undo ボタンで api.undoEdit が呼ばれる", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
-    vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
-    vi.mocked(api.undoEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
+    vi.mocked(api.applyEdit).mockResolvedValue({
+      ok: true,
+      relFile: "src/App.tsx",
+      undoDepth: 2,
+    });
+    vi.mocked(api.undoEdit).mockResolvedValue({
+      ok: true,
+      relFile: "src/App.tsx",
+      undoDepth: 1,
+    });
     render(<Chat selected={descriptor} hasKey={true} />);
 
     await sendInstruction(user, "赤くして");
     await screen.findByText("承認して適用");
     await user.click(screen.getByRole("button", { name: "承認して適用" }));
-    // 適用成功 → canUndo=true → undo ボタン表示
-    const undoBtn = await screen.findByRole("button", { name: /undo/ });
+    // 適用成功 → undoDepth>0 → undo ボタン表示
+    const undoBtn = await screen.findByRole("button", { name: /undo \(2\)/ });
     await user.click(undoBtn);
 
     expect(api.undoEdit).toHaveBeenCalled();
     expect(await screen.findByText(/元に戻しました/)).not.toBeNull();
+    expect(await screen.findByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
   });
 
   // undo 失敗の回帰テスト(R4で catch を追加。apply 側と対称にカバー)
-  it("api.undoEdit が ok:false を返したときエラー表示し undo ボタンが再び押せる", async () => {
+  it("api.undoEdit が ok:false を返したときエラー表示し undoDepth を 0 にする", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
-    vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
+    vi.mocked(api.applyEdit).mockResolvedValue({
+      ok: true,
+      relFile: "src/App.tsx",
+      undoDepth: 1,
+    });
     vi.mocked(api.undoEdit).mockResolvedValue({ ok: false, error: "undo失敗" });
     render(<Chat selected={descriptor} hasKey={true} />);
 
@@ -169,7 +207,9 @@ describe("Chat", () => {
     await user.click(undoBtn);
 
     expect(await screen.findByText(/undo失敗/)).not.toBeNull();
-    await waitFor(() => expect(undoBtn.disabled).toBe(false));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /undo/ })).toBeNull()
+    );
     expect(screen.queryByText("処理中…")).toBeNull();
   });
 
@@ -188,5 +228,47 @@ describe("Chat", () => {
 
     expect(await screen.findByText(/network down/)).not.toBeNull();
     await waitFor(() => expect(undoBtn.disabled).toBe(false));
+  });
+
+  it("初期 undoDepth があると undo ボタンを表示する", () => {
+    render(<Chat selected={descriptor} hasKey={true} initialUndoDepth={3} />);
+
+    expect(screen.getByRole("button", { name: /undo \(3\)/ })).not.toBeNull();
+  });
+
+  it("提案生成の hard failure では入力した指示文を復元する", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.edit).mockResolvedValue({
+      ok: false,
+      error: "boom",
+    });
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "この文を保持");
+
+    expect(await screen.findByText(/boom/)).not.toBeNull();
+    expect(
+      (screen.getByRole("textbox", { name: "編集指示" }) as HTMLTextAreaElement)
+        .value
+    ).toBe("この文を保持");
+  });
+
+  it("選択要素が変わっても保留中提案は生成時 descriptor を参照し、不一致ヒントを表示する", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.edit).mockResolvedValue(goodProposal());
+    const { rerender } = render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+
+    expect(
+      await screen.findByText("提案対象: <button #btn> \"Click me\"")
+    ).not.toBeNull();
+    rerender(<Chat selected={otherDescriptor} hasKey={true} />);
+
+    expect(
+      screen.getByText("提案対象: <button #btn> \"Click me\"")
+    ).not.toBeNull();
+    expect(screen.getByText("この差分は別の選択要素のものです")).not.toBeNull();
+    expect(screen.getByText("+added line")).not.toBeNull();
   });
 });

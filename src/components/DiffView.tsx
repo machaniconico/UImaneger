@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from "react";
+
 interface Props {
   diff: string;
   relFile?: string;
@@ -27,14 +29,52 @@ export function DiffView({
   onApply,
   onReject,
 }: Props) {
+  const [copied, setCopied] = useState(false);
+  const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lines = diff.split("\n");
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
+    };
+  }, []);
+
+  function copyDiff() {
+    const writeText =
+      typeof navigator !== "undefined" ? navigator.clipboard?.writeText : null;
+    if (!writeText) return;
+    writeText
+      .call(navigator.clipboard, diff)
+      .then(() => {
+        setCopied(true);
+        if (copiedTimeoutRef.current) clearTimeout(copiedTimeoutRef.current);
+        copiedTimeoutRef.current = setTimeout(() => {
+          setCopied(false);
+          copiedTimeoutRef.current = null;
+        }, 1500);
+      })
+      .catch(() => {});
+  }
+
   return (
     <div className="flex flex-col gap-2 rounded border border-neutral-700 bg-neutral-900 p-2">
       <div className="flex items-center justify-between text-xs">
         <span className="truncate text-neutral-300">{relFile}</span>
-        {confidence && (
-          <span className={confColor[confidence]}>{confLabel[confidence]}</span>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          {confidence && (
+            <span className={confColor[confidence]}>
+              {confLabel[confidence]}
+            </span>
+          )}
+          <button
+            type="button"
+            aria-label="diff をコピー"
+            onClick={copyDiff}
+            className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700"
+          >
+            {copied ? "コピー済" : "コピー"}
+          </button>
+        </div>
       </div>
 
       <pre className="max-h-64 overflow-auto rounded bg-neutral-950 p-2 text-[11px] leading-relaxed">
