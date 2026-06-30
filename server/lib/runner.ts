@@ -299,7 +299,10 @@ export interface RunningTarget {
   logs: string[];
 }
 
-function signalProcessGroup(
+// --- プロセスグループ kill の単一実装 (runner.ts がプロセスの所有者) ---
+// state.ts を含む全利用側は killGroup を import して使う。
+
+export function signalGroup(
   proc: ChildProcess,
   signal: NodeJS.Signals = "SIGTERM"
 ): void {
@@ -308,20 +311,56 @@ function signalProcessGroup(
       process.kill(-proc.pid, signal);
       return;
     } catch {
-      // Fall back to the direct child when process-group signalling is unavailable.
+      // プロセスグループ kill に失敗したら直接子へフォールバック
     }
   }
   try {
     proc.kill(signal);
   } catch {
-    // Best effort cleanup only.
+    // 既に終了済みなら無視
   }
 }
 
-function terminateProcessGroup(proc: ChildProcess): void {
-  signalProcessGroup(proc, "SIGTERM");
-  const timer = setTimeout(() => signalProcessGroup(proc, "SIGKILL"), 2_000);
-  timer.unref?.();
+export function hasExited(proc: ChildProcess): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null;
+}
+
+export function waitForExit(
+  proc: ChildProcess,
+  timeoutMs: number
+): Promise<boolean> {
+  if (hasExited(proc)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const done = (ok: boolean) => {
+      clearTimeout(timer);
+      proc.off("exit", onExit);
+      proc.off("error", onError);
+      resolve(ok);
+    };
+    const onExit = () => done(true);
+    const onError = () => {
+      if (hasExited(proc)) done(true);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    proc.once("exit", onExit);
+    proc.once("error", onError);
+    if (hasExited(proc)) done(true);
+  });
+}
+
+/**
+ * プロセスグループへ SIGTERM → (graceMs 内に終了しなければ) SIGKILL で確実に停止。
+ * プロセスの所有者である runner.ts でのみ定義し、export して全利用側で共有する。
+ */
+export async function killGroup(
+  proc: ChildProcess,
+  opts?: { graceMs?: number }
+): Promise<void> {
+  signalGroup(proc, "SIGTERM");
+  const exited = await waitForExit(proc, opts?.graceMs ?? 3_000);
+  if (exited) return;
+  signalGroup(proc, "SIGKILL");
+  await waitForExit(proc, 1_000);
 }
 
 /**
@@ -404,7 +443,10 @@ export async function startTarget(
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (spawnFailed) {
-      terminateProcessGroup(proc);
+      // spawn 直後の失敗: pid が無ければプロセスグループ kill は意味を持たず、
+      // 発火しない exit イベントを待ってブロックすると即 reject すべきテストが
+      // 壊れるため、best-effort/非ブロッキングで抜ける。
+      if (proc.pid) signalGroup(proc, "SIGTERM");
       throw new Error(
         `${plan.command} を起動できません: ${spawnErrorMessage}`
       );
@@ -420,7 +462,8 @@ export async function startTarget(
     }
     await sleep(300);
   }
-  terminateProcessGroup(proc);
+  // deadline 超過: プロセスグループを確実に停止してから reject。
+  await killGroup(proc);
   throw new Error(
     "対象 dev server が時間内に起動しませんでした。\n" + logs.slice(-15).join("\n")
   );

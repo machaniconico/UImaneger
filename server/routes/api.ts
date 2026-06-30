@@ -13,7 +13,7 @@ import {
   getInfo,
   getRoot,
   getLogs,
-  openProject,
+  openAndStart,
   startProject,
   stopProject,
 } from "../lib/state.ts";
@@ -174,8 +174,7 @@ api.post("/project/open", async (c) => {
   if (!path || !existsSync(path))
     return c.json({ error: `パスが存在しません: ${path}` }, 400);
   try {
-    await openProject(resolve(path), { command: runCommand });
-    const info = await startProject();
+    const info = await openAndStart(resolve(path), { command: runCommand });
     return c.json({ info });
   } catch (e: any) {
     return c.json({ error: String(e.message || e) }, 500);
@@ -205,8 +204,7 @@ api.post("/project/clone", async (c) => {
         maxBuffer: 32 * 1024 * 1024,
       }).catch(() => {});
     }
-    await openProject(dest, { command: runCommand });
-    const info = await startProject();
+    const info = await openAndStart(dest, { command: runCommand });
     return c.json({ info });
   } catch (e: any) {
     return c.json({ error: String(e.message || e) }, 500);
