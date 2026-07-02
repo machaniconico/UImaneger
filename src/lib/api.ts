@@ -44,6 +44,7 @@ export interface StatusResp {
   info: ProjectInfo | null;
   hasKey: boolean;
   logs: string[];
+  undoDepth?: number;
 }
 
 export const api = {
@@ -79,14 +80,17 @@ export const api = {
     }),
   /** 提案を適用(実書き込み)。 */
   applyEdit: (proposalId: string) =>
-    post<{ ok: boolean; file?: string; relFile?: string; error?: string }>(
-      "/api/edit/apply",
-      { proposalId }
-    ),
+    post<{
+      ok: boolean;
+      file?: string;
+      relFile?: string;
+      error?: string;
+      undoDepth?: number;
+    }>("/api/edit/apply", { proposalId }),
   rejectEdit: (proposalId: string) =>
     post<{ ok: boolean; error?: string }>("/api/edit/reject", { proposalId }),
   undoEdit: () =>
-    post<{ ok: boolean; relFile?: string; error?: string }>(
+    post<{ ok: boolean; relFile?: string; error?: string; undoDepth?: number }>(
       "/api/edit/undo",
       {}
     ),

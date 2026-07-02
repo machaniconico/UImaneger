@@ -1,5 +1,6 @@
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
+import { logger } from "hono/logger";
 import { env } from "./lib/env.ts";
 import { api } from "./routes/api.ts";
 import { stopProject } from "./lib/state.ts";
@@ -8,6 +9,7 @@ import { securityMiddleware } from "./middleware/security.ts";
 const app = new Hono();
 
 app.get("/health", (c) => c.text("ok"));
+app.use("/api/*", logger());
 app.use("/api/*", securityMiddleware);
 app.route("/api", api);
 
@@ -24,11 +26,67 @@ const server = serve(
   }
 );
 
-async function shutdown() {
-  console.log("\n[UImaneger] shutting down...");
-  await stopProject().catch(() => {});
-  server.close();
-  process.exit(0);
+// S5: ポート使用中(EADDRINUSE)は生スタックでなく一行の対処メッセージで終了。
+// vite.config.ts は触らない(別プロセス)。サーバ起動時点で弾けば十分。
+server.on("error", (e: NodeJS.ErrnoException) => {
+  if (e.code === "EADDRINUSE") {
+    console.error(
+      `[UImaneger] ポート ${env.serverPort} は使用中です。別のプロセスが起動していないか確認し、必要なら UIM_SERVER_PORT を変更してください。`
+    );
+    process.exit(1);
+  }
+  throw e;
+});
+
+// --- S4: クラッシュ安全シャットダウン ---
+// 再入可能な gracefulExit。SIGINT/SIGTERM は code=0、uncaught/unhandled は code=1。
+let shuttingDown = false;
+
+function safeErrorLog(label: string, value?: unknown): void {
+  try {
+    if (value === undefined) console.error(label);
+    else console.error(label, value);
+  } catch {
+    // ログ出力自体の失敗で crash handler を再帰させない。
+  }
 }
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+
+async function gracefulExit(code: number): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // ハードキル: どれだけ後始末が詰まっても 6s 後には確実に落とす(unref で保持しない)
+  const hardKill = setTimeout(() => process.exit(code), 6_000);
+  hardKill.unref();
+  try {
+    console.log("\n[UImaneger] shutting down...");
+    await stopProject().catch((err) => {
+      safeErrorLog("[UImaneger] stopProject during shutdown failed:", err);
+    });
+    try {
+      server.close();
+    } catch (err) {
+      safeErrorLog("[UImaneger] server close during shutdown failed:", err);
+    }
+  } catch (err) {
+    safeErrorLog("[UImaneger] shutdown failed:", err);
+  } finally {
+    clearTimeout(hardKill);
+    process.exit(code);
+  }
+}
+
+process.on("SIGINT", () => {
+  void gracefulExit(0);
+});
+process.on("SIGTERM", () => {
+  void gracefulExit(0);
+});
+process.on("uncaughtException", (err) => {
+  // クラッシュを隠さず非ゼロで抜ける
+  safeErrorLog("[UImaneger] uncaughtException:", err);
+  void gracefulExit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  safeErrorLog("[UImaneger] unhandledRejection:", reason);
+  void gracefulExit(1);
+});

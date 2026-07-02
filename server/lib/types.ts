@@ -41,4 +41,6 @@ export interface ProjectInfo {
   targetPortBefore: number | null; // before dev server 実ポート
   targetPortAfter: number | null; // after dev server 実ポート
   gitMode: GitMode | null; // before の配信モード
+  /** before プレビュー起動失敗時のメッセージ(成功時は null)。未使用時は undefined。 */
+  beforeError?: string | null;
 }

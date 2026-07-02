@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
@@ -13,7 +14,7 @@ import {
   getInfo,
   getRoot,
   getLogs,
-  openProject,
+  openAndStart,
   startProject,
   stopProject,
 } from "../lib/state.ts";
@@ -54,6 +55,10 @@ export const __stores = { proposalStore, undoStack };
 
 /** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
 const inFlight = new Set<string>();
+
+function serverError(c: Context, e: unknown) {
+  return c.json({ error: String((e as Error)?.message ?? e) }, 500);
+}
 
 /** 期限切れ・過剰件数の提案を破棄(TTL 30分 / 上限 PROPOSAL_MAX)。 */
 function pruneProposals(): void {
@@ -163,7 +168,12 @@ function normalizeDescriptor(d: DomDescriptor): DomDescriptor {
 }
 
 api.get("/status", (c) =>
-  c.json({ info: getInfo(), hasKey: hasKey(), logs: getLogs().slice(-50) })
+  c.json({
+    info: getInfo(),
+    hasKey: hasKey(),
+    logs: getLogs().slice(-50),
+    undoDepth: undoStack.length,
+  })
 );
 
 api.post("/project/open", async (c) => {
@@ -174,11 +184,10 @@ api.post("/project/open", async (c) => {
   if (!path || !existsSync(path))
     return c.json({ error: `パスが存在しません: ${path}` }, 400);
   try {
-    await openProject(resolve(path), { command: runCommand });
-    const info = await startProject();
+    const info = await openAndStart(resolve(path), { command: runCommand });
     return c.json({ info });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -188,6 +197,7 @@ api.post("/project/clone", async (c) => {
     runCommand?: string;
   }>();
   if (!repo) return c.json({ error: "repo URL が必要です" }, 400);
+  let installError: string | null = null;
   try {
     const wsDir = resolve(env.workspacesDir);
     await mkdir(wsDir, { recursive: true });
@@ -203,21 +213,35 @@ api.post("/project/clone", async (c) => {
       await pExecFile("npm", ["install", "--ignore-scripts"], {
         cwd: dest,
         maxBuffer: 32 * 1024 * 1024,
-      }).catch(() => {});
+      }).catch((e: any) => {
+        installError = String(e?.stderr || e?.message || e)
+          .split("\n")
+          .slice(-8)
+          .join("\n");
+      });
     }
-    await openProject(dest, { command: runCommand });
-    const info = await startProject();
+    const info = await openAndStart(dest, { command: runCommand });
     return c.json({ info });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    if (installError) {
+      return c.json(
+        {
+          error: `依存関係のインストールに失敗した可能性があります:\n${installError}\n---\n起動エラー: ${String(
+            (e as Error)?.message ?? e
+          )}`,
+        },
+        500
+      );
+    }
+    return serverError(c, e);
   }
 });
 
 api.post("/project/start", async (c) => {
   try {
     return c.json({ info: await startProject() });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -234,8 +258,8 @@ api.get("/files/read", async (c) => {
   try {
     const content = await readFile(resolve(path), "utf8");
     return c.json({ path: resolve(path), content });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -249,8 +273,8 @@ api.post("/files/write", async (c) => {
   try {
     await writeFile(resolve(path), content, "utf8");
     return c.json({ ok: true });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -307,8 +331,8 @@ api.post("/edit", async (c) => {
         ? { ...result, candidates: resolved.candidates }
         : result
     );
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -341,7 +365,7 @@ async function buildProposalForFile(
       relFile: string;
       line?: number;
       confidence: Confidence;
-      summary: string;
+      error: string;
     }
 > {
   const relFile = relative(root, file);
@@ -358,7 +382,7 @@ async function buildProposalForFile(
         relFile,
         line,
         confidence,
-        summary:
+        error:
           "ファイルが大きすぎて完全な編集を生成できませんでした。ファイルを分割するか対象箇所を絞ってください。",
       };
     }
@@ -373,7 +397,7 @@ async function buildProposalForFile(
       relFile,
       line,
       confidence,
-      summary: "変更が生成されませんでした。指示をより具体的にしてください。",
+      error: "変更が生成されませんでした。指示をより具体的にしてください。",
     };
   }
 
@@ -449,8 +473,8 @@ api.post("/edit/candidate", async (c) => {
       "medium"
     );
     return c.json(result);
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -500,9 +524,10 @@ api.post("/edit/apply", async (c) => {
       relFile: p.relFile,
       line: p.line,
       summary: `${p.relFile} を適用しました。`,
+      undoDepth: undoStack.length,
     });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   } finally {
     inFlight.delete(proposalId);
   }
@@ -546,10 +571,11 @@ api.post("/edit/undo", async (c) => {
       file: entry.file,
       relFile: entry.relFile,
       summary: `${entry.relFile} の適用を取り消しました。`,
+      undoDepth: undoStack.length,
     });
-  } catch (e: any) {
+  } catch (e) {
     undoStack.push(entry);
-    return c.json({ error: String(e.message || e) }, 500);
+    return serverError(c, e);
   } finally {
     inFlight.delete(entry.proposalId);
   }
@@ -596,8 +622,8 @@ api.get("/git/status", async (c) => {
       cwd: root,
     });
     return c.json({ changes: stdout.split("\n").filter(Boolean) });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });
 
@@ -611,7 +637,7 @@ api.post("/git/commit", async (c) => {
       cwd: root,
     });
     return c.json({ ok: true });
-  } catch (e: any) {
-    return c.json({ error: String(e.message || e) }, 500);
+  } catch (e) {
+    return serverError(c, e);
   }
 });

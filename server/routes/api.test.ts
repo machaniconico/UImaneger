@@ -115,6 +115,16 @@ async function postJson<T = Record<string, unknown>>(
   };
 }
 
+async function getJson<T = Record<string, unknown>>(
+  path: string
+): Promise<JsonResponse<T>> {
+  const res = await app.request(path);
+  return {
+    res,
+    body: (await res.json()) as T,
+  };
+}
+
 async function requestProposal(proposed = editedContent): Promise<ProposalBody> {
   claudeMock.complete.mockResolvedValueOnce(proposed);
   const { res, body } = await postJson<ProposalBody>("/api/edit", {
@@ -178,6 +188,32 @@ describe("edit proposal API", () => {
     expect(readFileSync(filePath, "utf8")).toBe(editedContent);
   });
 
+  it("reports undoDepth through apply, status, and undo", async () => {
+    const proposal = await requestProposal();
+
+    const applied = await postJson<{ ok: true; undoDepth: number }>(
+      "/api/edit/apply",
+      { proposalId: proposal.proposalId }
+    );
+    expect(applied.res.status).toBe(200);
+    expect(applied.body.undoDepth).toBe(1);
+
+    const status = await getJson<{ undoDepth: number }>("/api/status");
+    expect(status.res.status).toBe(200);
+    expect(status.body.undoDepth).toBe(1);
+
+    const undone = await postJson<{ ok: true; undoDepth: number }>(
+      "/api/edit/undo",
+      {}
+    );
+    expect(undone.res.status).toBe(200);
+    expect(undone.body.undoDepth).toBe(0);
+
+    const statusAfterUndo = await getJson<{ undoDepth: number }>("/api/status");
+    expect(statusAfterUndo.res.status).toBe(200);
+    expect(statusAfterUndo.body.undoDepth).toBe(0);
+  });
+
   it("undoes the last applied proposal", async () => {
     const proposal = await requestProposal();
     await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
@@ -231,17 +267,23 @@ describe("edit proposal API", () => {
       new claudeMock.TruncatedError("truncated")
     );
 
-    const proposal = await postJson<{ ok: false; proposalId?: string }>(
-      "/api/edit",
-      {
-        descriptor: descriptorFor(filePath),
-        instruction: "Change the button label.",
-      }
-    );
+    const proposal = await postJson<{
+      ok: false;
+      proposalId?: string;
+      error?: string;
+      summary?: string;
+    }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
 
     expect(proposal.res.status).toBe(200);
     expect(proposal.body.ok).toBe(false);
     expect(proposal.body.proposalId).toBeUndefined();
+    expect(proposal.body.error).toBe(
+      "ファイルが大きすぎて完全な編集を生成できませんでした。ファイルを分割するか対象箇所を絞ってください。"
+    );
+    expect("summary" in proposal.body).toBe(false);
     expect(__stores.proposalStore.size).toBe(0);
 
     const apply = await postJson<{ error: string }>("/api/edit/apply", {
@@ -249,5 +291,28 @@ describe("edit proposal API", () => {
     });
     expect(apply.res.status).toBe(404);
     expect(apply.body.error).toMatch(/提案が見つかりません|not found/i);
+  });
+
+  it("returns an error field when no edit is generated", async () => {
+    claudeMock.complete.mockResolvedValueOnce(originalContent);
+
+    const proposal = await postJson<{
+      ok: false;
+      proposalId?: string;
+      error?: string;
+      summary?: string;
+    }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+
+    expect(proposal.res.status).toBe(200);
+    expect(proposal.body.ok).toBe(false);
+    expect(proposal.body.proposalId).toBeUndefined();
+    expect(proposal.body.error).toBe(
+      "変更が生成されませんでした。指示をより具体的にしてください。"
+    );
+    expect("summary" in proposal.body).toBe(false);
+    expect(__stores.proposalStore.size).toBe(0);
   });
 });

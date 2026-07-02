@@ -1,9 +1,9 @@
 import { basename } from "node:path";
-import { type ChildProcess } from "node:child_process";
 import {
   startTarget,
   findFreePort,
   detectRunner,
+  killGroup,
   type RunningTarget,
 } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
@@ -30,6 +30,8 @@ interface Session {
   /** after 配信プロキシ */
   proxyAfter: ProxyHandle | null;
   gitMode: GitMode | null;
+  /** before プレビュー起動失敗時のメッセージ(成功時は null) */
+  beforeError: string | null;
   // --- legacy aliases (= after 側) 下位互換 ---
   target: RunningTarget | null;
   proxy: ProxyHandle | null;
@@ -37,86 +39,32 @@ interface Session {
 
 let session: Session | null = null;
 
-function signalGroup(
-  proc: ChildProcess,
-  signal: NodeJS.Signals = "SIGTERM"
-): void {
-  if (typeof proc.pid === "number" && proc.pid > 0) {
-    try {
-      process.kill(-proc.pid, signal);
-      return;
-    } catch {
-      // プロセスグループ kill に失敗したらフォールバック
-    }
-  }
-  try {
-    proc.kill(signal);
-  } catch {
-    // 既に終了済みなら無視
-  }
+// --- S3: セッションライフサイクルを直列化する promise-chain mutex ---
+// openProject/startProject/stopProject はこのロック経由で1本ずつ実行される。
+// 世代カウンタ/kill-on-supersede は使わず、単純な直列化で競合を排除する。
+let lifecycle: Promise<unknown> = Promise.resolve();
+
+function withLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = lifecycle.then(fn, fn);
+  // チェーンは成功/失敗どちらでも消化して次を詰まらせない
+  lifecycle = run.then(
+    () => {},
+    () => {}
+  );
+  return run as Promise<T>;
 }
 
-function hasExited(proc: ChildProcess): boolean {
-  return proc.exitCode !== null || proc.signalCode !== null;
-}
+// =========================================================================
+// 内部(アンロック)実装: ロック内からのみ呼ぶ。catch 内の後始末は
+// ロック済コンテキストで動くため、ネストロックを避けて _stopProject を直接呼ぶ。
+// =========================================================================
 
-function waitForExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
-  if (hasExited(proc)) return Promise.resolve(true);
-  return new Promise((resolve) => {
-    const done = (ok: boolean) => {
-      clearTimeout(timer);
-      proc.off("exit", onExit);
-      proc.off("error", onError);
-      resolve(ok);
-    };
-    const onExit = () => done(true);
-    const onError = () => {
-      if (hasExited(proc)) done(true);
-    };
-    const timer = setTimeout(() => done(false), timeoutMs);
-    proc.once("exit", onExit);
-    proc.once("error", onError);
-    if (hasExited(proc)) done(true);
-  });
-}
-
-async function killGroup(proc: ChildProcess): Promise<void> {
-  signalGroup(proc, "SIGTERM");
-  const exited = await waitForExit(proc, 3_000);
-  if (exited) return;
-  signalGroup(proc, "SIGKILL");
-  await waitForExit(proc, 1_000);
-}
-
-export function getInfo(): ProjectInfo | null {
-  if (!session) return null;
-  return {
-    root: session.root,
-    name: basename(session.root),
-    framework: session.framework,
-    runCommand: session.runCommand,
-    // legacy (after 側)
-    targetPort: session.targetAfter?.port ?? null,
-    proxyPort: session.proxyAfter?.port ?? null,
-    running: Boolean(session.targetAfter && session.proxyAfter),
-    // sharedContract (before/after 二重配信)
-    beforeProxyPort: session.proxyBefore?.port ?? null,
-    afterProxyPort: session.proxyAfter?.port ?? null,
-    targetPortBefore: session.targetBefore?.port ?? null,
-    targetPortAfter: session.targetAfter?.port ?? null,
-    gitMode: session.gitMode,
-  };
-}
-
-export function getRoot(): string | null {
-  return session?.root ?? null;
-}
-
-export async function openProject(
+async function _openProject(
   root: string,
   override?: { command?: string; framework?: string }
 ): Promise<ProjectInfo> {
-  await stopProject();
+  // 既存セッションがあればアンロック版で後始末(ネストロック禁止)
+  await _stopProject();
   const plan = detectRunner(root, 0, override);
   session = {
     root,
@@ -128,14 +76,16 @@ export async function openProject(
     proxyBefore: null,
     proxyAfter: null,
     gitMode: null,
+    beforeError: null,
     target: null,
     proxy: null,
   };
   return getInfo()!;
 }
 
-export async function startProject(): Promise<ProjectInfo> {
+async function _startProject(): Promise<ProjectInfo> {
   if (!session) throw new Error("プロジェクトが開かれていません。");
+  // 2本目の並行 start はここで短絡する(直列化されているので最初の start 完了後)
   if (session.targetAfter && session.proxyAfter) return getInfo()!;
 
   try {
@@ -156,6 +106,9 @@ export async function startProject(): Promise<ProjectInfo> {
   session.gitMode = before.mode;
   const beforeDir = before.dir;
   const sameDirAsAfter = beforeDir === session.root;
+
+  // before 起動失敗可視化: 成功時は null にリセット
+  session.beforeError = null;
 
   // --- after (実作業ツリー) 起動 ---
   const afterPort = await findFreePort(5180);
@@ -185,6 +138,9 @@ export async function startProject(): Promise<ProjectInfo> {
     } catch (e) {
       // before 起動失敗時は after を維持し、proxy も before 側は出さない。
       console.warn("[UImaneger] before target 起動失敗:", e);
+      session.beforeError = `編集前プレビュー起動失敗: ${String(
+        (e as any)?.message ?? e
+      )}`;
       session.targetBefore = null;
     }
   }
@@ -206,18 +162,22 @@ export async function startProject(): Promise<ProjectInfo> {
       );
     } catch (e) {
       console.warn("[UImaneger] before proxy 起動失敗:", e);
+      session.beforeError = `編集前プレビュー起動失敗: ${String(
+        (e as any)?.message ?? e
+      )}`;
       session.proxyBefore = null;
     }
   }
 
   return getInfo()!;
   } catch (e) {
-    await stopProject().catch(() => {});
+    // catch 内はアンロック版を呼ぶ(ネストロック禁止)
+    await _stopProject().catch(() => {});
     throw e;
   }
 }
 
-export async function stopProject(): Promise<void> {
+async function _stopProject(): Promise<void> {
   if (!session) return;
 
   // before プロキシ停止 (after と別物のみ)
@@ -254,6 +214,65 @@ export async function stopProject(): Promise<void> {
     session.before = null;
   }
   session.gitMode = null;
+  session.beforeError = null;
+}
+
+// =========================================================================
+// 公開 API: 全て withLock で直列化する。
+// =========================================================================
+
+export function getInfo(): ProjectInfo | null {
+  if (!session) return null;
+  return {
+    root: session.root,
+    name: basename(session.root),
+    framework: session.framework,
+    runCommand: session.runCommand,
+    // legacy (after 側)
+    targetPort: session.targetAfter?.port ?? null,
+    proxyPort: session.proxyAfter?.port ?? null,
+    running: Boolean(session.targetAfter && session.proxyAfter),
+    // shared_contract (before/after 二重配信)
+    beforeProxyPort: session.proxyBefore?.port ?? null,
+    afterProxyPort: session.proxyAfter?.port ?? null,
+    targetPortBefore: session.targetBefore?.port ?? null,
+    targetPortAfter: session.targetAfter?.port ?? null,
+    gitMode: session.gitMode,
+    beforeError: session.beforeError,
+  };
+}
+
+export function getRoot(): string | null {
+  return session?.root ?? null;
+}
+
+export function openProject(
+  root: string,
+  override?: { command?: string; framework?: string }
+): Promise<ProjectInfo> {
+  return withLock(() => _openProject(root, override));
+}
+
+export function startProject(): Promise<ProjectInfo> {
+  return withLock(() => _startProject());
+}
+
+export function stopProject(): Promise<void> {
+  return withLock(() => _stopProject());
+}
+
+/**
+ * openProject → startProject を1つのロック区間で連続実行する。
+ * これにより open と start の間に別のライフサイクル操作が割り込むのを防ぐ。
+ */
+export function openAndStart(
+  root: string,
+  override?: { command?: string; framework?: string }
+): Promise<ProjectInfo> {
+  return withLock(async () => {
+    await _openProject(root, override);
+    return _startProject();
+  });
 }
 
 export function getLogs(): string[] {

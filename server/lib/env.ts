@@ -38,12 +38,33 @@ function loadDotEnv() {
   }
 }
 
+/**
+ * ポート設定値を検証する。空/undefined なら fallback、それ以外は
+ * 1〜65535 の整数でなければ日本語メッセージで throw する(起動時に即時失敗)。
+ */
+export function parsePort(
+  raw: string | undefined,
+  fallback: number,
+  name: string
+): number {
+  if (raw === undefined) return fallback;
+  const value = raw.trim();
+  if (value === "") return fallback;
+  const n = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(
+      `${name} に無効なポートが指定されました: ${raw} (1〜65535 の整数で指定してください)`
+    );
+  }
+  return n;
+}
+
 loadDotEnv();
 
 export const env = {
   anthropicKey: process.env.ANTHROPIC_API_KEY || "",
   editModel: process.env.UIM_EDIT_MODEL || "claude-opus-4-8",
-  serverPort: Number(process.env.UIM_SERVER_PORT || "5174"),
-  clientPort: Number(process.env.UIM_CLIENT_PORT || "5173"),
+  serverPort: parsePort(process.env.UIM_SERVER_PORT, 5174, "UIM_SERVER_PORT"),
+  clientPort: parsePort(process.env.UIM_CLIENT_PORT, 5173, "UIM_CLIENT_PORT"),
   workspacesDir: process.env.UIM_WORKSPACES_DIR || "./workspaces",
 };

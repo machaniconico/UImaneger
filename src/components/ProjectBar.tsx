@@ -73,6 +73,7 @@ export function ProjectBar({
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => e.key === "Enter" && openOrClone()}
+        aria-label="ローカルパスまたはGitHub URL"
         placeholder="ローカルパス または GitHub URL"
         className="w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 outline-none focus:border-blue-500"
       />

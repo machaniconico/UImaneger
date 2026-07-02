@@ -57,6 +57,38 @@ export function startProxy(
     delete headers["x-frame-options"];
     delete headers["content-security-policy"];
 
+    // ターゲット dev server が応答中にリセットしても unhandled "error" に
+    // 昇格しないように、分岐前に error ハンドラを取り付ける(HTML / pipe 両パス共通)。
+    let upstreamErrored = false;
+    proxyRes.on("error", (err) => {
+      upstreamErrored = true;
+      console.error(
+        `[UImaneger] proxy upstream error (target :${targetPort}):`,
+        err.message
+      );
+      if (!res.headersSent) {
+        try {
+          res.writeHead(502, { "content-type": "text/plain; charset=utf-8" });
+          res.end("UImaneger proxy upstream error: " + err.message);
+        } catch {
+          try {
+            res.end();
+          } catch {
+            // 既に閉じているなら無視
+          }
+        }
+      } else if (!res.writableEnded) {
+        res.destroy(err);
+      }
+    });
+    res.on("error", (err) => {
+      // クライアント側ソケットが去った場合の unhandled error 抑制
+      console.error(
+        `[UImaneger] proxy client response error (target :${targetPort}):`,
+        err.message
+      );
+    });
+
     if (!isHtml) {
       res.writeHead(proxyRes.statusCode || 200, headers);
       proxyRes.pipe(res);
@@ -66,6 +98,7 @@ export function startProxy(
     const chunks: Buffer[] = [];
     proxyRes.on("data", (c) => chunks.push(Buffer.from(c)));
     proxyRes.on("end", () => {
+      if (upstreamErrored || res.destroyed || res.writableEnded) return;
       let body = Buffer.concat(chunks).toString("utf8");
       const tag = inspectorTag();
       if (tag) {
@@ -85,6 +118,11 @@ export function startProxy(
   });
 
   proxy.on("error", (err, _req, res) => {
+    // 死んだターゲット等の proxy error を端末にトレース出力(S15)
+    console.error(
+      `[UImaneger] proxy error (target :${targetPort}):`,
+      err.message
+    );
     if (res && "writeHead" in res && !res.headersSent) {
       (res as http.ServerResponse).writeHead(502, {
         "content-type": "text/plain; charset=utf-8",

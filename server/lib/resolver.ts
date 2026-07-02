@@ -8,6 +8,9 @@ import { complete, hasKey, stripCodeFence } from "./claude.ts";
 
 const pExecFile = promisify(execFile);
 
+// S15: 軽量トレース。UIM_DEBUG が設定されている時のみ1行出力。秘密は出さない。
+const DEBUG = !!process.env.UIM_DEBUG;
+
 // rg バイナリが spawn 可能かを一度だけ判定 (シェル関数や未導入環境では false → Node grep)
 let rgUsable: boolean | null = null;
 async function isRgUsable(): Promise<boolean> {
@@ -568,6 +571,14 @@ export async function resolveSource(
   if (d.source?.fileName) {
     const f = resolve(d.source.fileName);
     if (existsSync(f) && withinRoot(root, f)) {
+      if (DEBUG) {
+        console.log(
+          `[UImaneger] resolve 層A high ${relative(
+            root,
+            f
+          )}:${d.source.lineNumber ?? "?"}`
+        );
+      }
       return {
         file: f,
         line: d.source.lineNumber,
@@ -612,9 +623,26 @@ export async function resolveSource(
       best.score - (candidates[1]?.score ?? 0) >= 30);
   if (!hasClearLead && hasKey()) {
     const picked = await pickWithLLM(root, d, candidates, previewList);
-    if (picked) return picked;
+    if (picked) {
+      if (DEBUG) {
+        console.log(
+          `[UImaneger] resolve 層B(llm) ${picked.confidence} ${
+            picked.line ? `${relative(root, picked.file)}:${picked.line}` : relative(root, picked.file)
+          }`
+        );
+      }
+      return picked;
+    }
   }
 
+  if (DEBUG) {
+    console.log(
+      `[UImaneger] resolve 層B ${confidence} ${relative(
+        root,
+        best.file
+      )}:${best.line}`
+    );
+  }
   return {
     file: best.file,
     line: best.line,

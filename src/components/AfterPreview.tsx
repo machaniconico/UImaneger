@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ProjectInfo } from "../lib/types.ts";
+import { PreviewOverlay } from "./PreviewOverlay.tsx";
 import { usePreviewBridge } from "./usePreviewBridge.ts";
 
 interface Props {
@@ -11,15 +12,21 @@ interface Props {
 /** 右ペイン: 変更後(作業ツリー)。閲覧専用のライブプレビュー。 */
 export function AfterPreview({ info, reloadKey = 0 }: Props) {
   const [manualReload, setManualReload] = useState(0);
+  const [loaded, setLoaded] = useState(false);
   const url =
     info?.afterProxyPort != null
       ? `http://localhost:${info.afterProxyPort}/`
       : "";
+  const connectionError = info?.running === false;
   const { iframeRef } = usePreviewBridge({
     url,
     selectMode: false,
     acceptSelect: false,
   });
+
+  useEffect(() => {
+    setLoaded(false);
+  }, [url, reloadKey, manualReload]);
 
   return (
     <div className="relative flex h-full w-full flex-col bg-white">
@@ -27,20 +34,24 @@ export function AfterPreview({ info, reloadKey = 0 }: Props) {
         <span>変更後 (ライブ)</span>
         {url && (
           <button
-            onClick={() => setManualReload((n) => n + 1)}
+            onClick={() => {
+              setLoaded(false);
+              setManualReload((n) => n + 1);
+            }}
             className="rounded px-2 py-0.5 text-neutral-500 hover:bg-neutral-200"
           >
             再読込
           </button>
         )}
       </div>
-      <div className="min-h-0 flex-1">
+      <div className="relative min-h-0 flex-1">
         {url ? (
           <iframe
             key={`${reloadKey}-${manualReload}`}
             ref={iframeRef}
             src={url}
             title="after"
+            onLoad={() => setLoaded(true)}
             className="h-full w-full border-0"
           />
         ) : (
@@ -48,6 +59,14 @@ export function AfterPreview({ info, reloadKey = 0 }: Props) {
             変更後のプレビュー
           </div>
         )}
+        {connectionError ? (
+          <PreviewOverlay
+            tone="error"
+            message="対象アプリに接続できません — 起動ログを確認してください"
+          />
+        ) : url && !loaded ? (
+          <PreviewOverlay tone="loading" message="起動中..." />
+        ) : null}
       </div>
     </div>
   );

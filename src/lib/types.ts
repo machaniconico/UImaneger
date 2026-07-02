@@ -24,6 +24,7 @@ export interface ProjectInfo {
   targetPortBefore?: number | null;
   targetPortAfter?: number | null;
   gitMode?: GitMode;
+  beforeError?: string | null;
 }
 
 export interface Candidate {
