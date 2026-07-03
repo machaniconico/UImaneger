@@ -169,6 +169,19 @@ describe("createUnifiedDiff", () => {
     expect(out).toContain("-b\n+b\n\\ No newline at end of file");
   });
 
+  it("emits a final-line remove/add pair when only its trailing newline status changes in a mixed diff", () => {
+    const out = createUnifiedDiff("x\nlast\n", "y\nlast", "f.txt");
+    const lines = out.split("\n");
+    const removedLast = lines.indexOf("-last");
+    const addedLast = lines.indexOf("+last");
+    const marker = lines.indexOf("\\ No newline at end of file");
+
+    expect(out).toContain("@@ -1,2 +1,2 @@");
+    expect(removedLast).toBeGreaterThan(-1);
+    expect(addedLast).toBe(removedLast + 1);
+    expect(marker).toBe(addedLast + 1);
+  });
+
   it("starts old range at 1 for a change in the first line", () => {
     const out = createUnifiedDiff("hello", "world", "f.txt");
     const hunkLine = out.split("\n").find((l) => l.startsWith("@@")) ?? "";

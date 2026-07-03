@@ -14,6 +14,7 @@ import {
   getInfo,
   getRoot,
   getLogs,
+  getBefore,
   openAndStart,
   startProject,
   stopProject,
@@ -28,12 +29,14 @@ type Confidence = "high" | "medium" | "low";
 
 interface ProposalEntry {
   file: string;
+  originalBytes: Buffer;
   original: string;
   proposed: string;
   relFile: string;
   line?: number;
   confidence: Confidence;
   createdAt: number;
+  hadBom: boolean;
 }
 
 interface UndoEntry {
@@ -41,6 +44,8 @@ interface UndoEntry {
   relFile: string;
   /** 適用直前のディスク内容 */
   previousContent: string;
+  /** 適用後にディスク上へ書いた内容 */
+  appliedContent: string;
   proposalId: string;
 }
 
@@ -55,9 +60,83 @@ export const __stores = { proposalStore, undoStack };
 
 /** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
 const inFlight = new Set<string>();
+let storesRoot: string | null = null;
 
-function serverError(c: Context, e: unknown) {
-  return c.json({ error: String((e as Error)?.message ?? e) }, 500);
+function sanitizeForLog(value: unknown): string {
+  let s = String(value ?? "");
+  for (const secret of [env.anthropicKey, process.env.ANTHROPIC_API_KEY]) {
+    if (secret) s = s.split(secret).join("[REDACTED]");
+  }
+  return s.replace(/sk-ant-[A-Za-z0-9_-]+/g, "[REDACTED]");
+}
+
+function serverError(c: Context, e: unknown, relFile?: string) {
+  const err = e as { name?: string; message?: string; status?: unknown };
+  console.error(
+    JSON.stringify({
+      level: "error",
+      method: c.req.method,
+      route: c.req.path,
+      relFile,
+      name: sanitizeForLog(err?.name || "Error"),
+      message: sanitizeForLog(err?.message ?? e),
+      status: err?.status,
+    })
+  );
+  return c.json({ error: sanitizeForLog((e as Error)?.message ?? e) }, 500);
+}
+
+function ensureStoresForCurrentRoot(): void {
+  const root = getRoot();
+  if (root === storesRoot) return;
+  proposalStore.clear();
+  undoStack.splice(0);
+  inFlight.clear();
+  storesRoot = root;
+}
+
+function isWithinPath(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function remapBeforeSource(root: string, d: DomDescriptor): DomDescriptor {
+  const source = d.source;
+  const fileName = source?.fileName;
+  if (!fileName || !isAbsolute(fileName)) return d;
+  const before = getBefore();
+  if (!before?.dir || !isWithinPath(before.dir, fileName)) return d;
+  return {
+    ...d,
+    source: {
+      fileName: join(root, relative(resolve(before.dir), resolve(fileName))),
+      lineNumber: source.lineNumber,
+      columnNumber: source.columnNumber,
+    },
+  };
+}
+
+function decodeEditableUtf8(buf: Buffer):
+  | { ok: true; text: string; hadBom: boolean }
+  | { ok: false; error: string } {
+  const decoded = buf.toString("utf8");
+  if (Buffer.compare(Buffer.from(decoded, "utf8"), buf) !== 0) {
+    return {
+      ok: false,
+      error: "このファイルはUTF-8ではないため安全に編集できません。",
+    };
+  }
+  const hadBom = decoded.startsWith("\uFEFF");
+  return {
+    ok: true,
+    text: hadBom ? decoded.slice(1) : decoded,
+    hadBom,
+  };
+}
+
+function withBom(content: string, hadBom: boolean): string {
+  const withoutBom = content.startsWith("\uFEFF") ? content.slice(1) : content;
+  return hadBom ? `\uFEFF${withoutBom}` : withoutBom;
 }
 
 /** 期限切れ・過剰件数の提案を破棄(TTL 30分 / 上限 PROPOSAL_MAX)。 */
@@ -167,14 +246,15 @@ function normalizeDescriptor(d: DomDescriptor): DomDescriptor {
   };
 }
 
-api.get("/status", (c) =>
-  c.json({
+api.get("/status", (c) => {
+  ensureStoresForCurrentRoot();
+  return c.json({
     info: getInfo(),
     hasKey: hasKey(),
     logs: getLogs().slice(-50),
     undoDepth: undoStack.length,
-  })
-);
+  });
+});
 
 api.post("/project/open", async (c) => {
   const { path, runCommand } = await c.req.json<{
@@ -279,6 +359,7 @@ api.post("/files/write", async (c) => {
 });
 
 api.post("/edit", async (c) => {
+  ensureStoresForCurrentRoot();
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   if (!hasKey())
@@ -295,7 +376,7 @@ api.post("/edit", async (c) => {
     return c.json({ error: "指示が空です" }, 400);
   const descErr = validateDescriptor(rawDescriptor);
   if (descErr) return c.json({ error: descErr }, 400);
-  const descriptor = normalizeDescriptor(rawDescriptor);
+  const descriptor = remapBeforeSource(root, normalizeDescriptor(rawDescriptor));
 
   try {
     // 1. ソース解決 (層A/B)
@@ -369,7 +450,19 @@ async function buildProposalForFile(
     }
 > {
   const relFile = relative(root, file);
-  const original = await readFile(file, "utf8");
+  const originalBytes = await readFile(file);
+  const decoded = decodeEditableUtf8(originalBytes);
+  if (!decoded.ok) {
+    return {
+      ok: false,
+      file,
+      relFile,
+      line,
+      confidence,
+      error: decoded.error,
+    };
+  }
+  const original = decoded.text;
   const prompt = buildEditPrompt(relFile, original, descriptor, line, instruction);
   let raw: string;
   try {
@@ -388,7 +481,7 @@ async function buildProposalForFile(
     }
     throw e;
   }
-  const edited = stripCodeFence(raw);
+  const edited = withBom(stripCodeFence(raw), false);
 
   if (!edited || edited.trim() === original.trim()) {
     return {
@@ -406,12 +499,14 @@ async function buildProposalForFile(
   pruneProposals();
   proposalStore.set(proposalId, {
     file,
+    originalBytes,
     original,
     proposed: edited,
     relFile,
     line,
     confidence,
     createdAt: Date.now(),
+    hadBom: decoded.hadBom,
   });
   pruneProposals();
 
@@ -429,6 +524,7 @@ async function buildProposalForFile(
 
 /** 候補選択時: 指定ファイルで提案を作る。 */
 api.post("/edit/candidate", async (c) => {
+  ensureStoresForCurrentRoot();
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
 
@@ -480,6 +576,7 @@ api.post("/edit/candidate", async (c) => {
 
 /** 提案を適用: ここで初めてファイルを書き、直前内容を undo スタックへ。 */
 api.post("/edit/apply", async (c) => {
+  ensureStoresForCurrentRoot();
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   const { proposalId } = await c.req.json<{ proposalId: string }>();
@@ -503,18 +600,21 @@ api.post("/edit/apply", async (c) => {
   inFlight.add(proposalId);
 
   try {
-    const before = await readFile(p.file, "utf8");
-    if (before !== p.original) {
+    const beforeBytes = await readFile(p.file);
+    if (Buffer.compare(beforeBytes, p.originalBytes) !== 0) {
       return c.json(
         { error: "ファイルが変更されています。再提案してください。" },
         409
       );
     }
-    await writeFile(p.file, p.proposed, "utf8");
+    const before = beforeBytes.toString("utf8");
+    const appliedContent = withBom(p.proposed, p.hadBom);
+    await writeFile(p.file, appliedContent, "utf8");
     pushUndo({
       file: p.file,
       relFile: p.relFile,
       previousContent: before,
+      appliedContent,
       proposalId,
     });
     proposalStore.delete(proposalId);
@@ -527,7 +627,7 @@ api.post("/edit/apply", async (c) => {
       undoDepth: undoStack.length,
     });
   } catch (e) {
-    return serverError(c, e);
+    return serverError(c, e, p.relFile);
   } finally {
     inFlight.delete(proposalId);
   }
@@ -535,6 +635,7 @@ api.post("/edit/apply", async (c) => {
 
 /** 提案を破棄。 */
 api.post("/edit/reject", async (c) => {
+  ensureStoresForCurrentRoot();
   const { proposalId } = await c.req.json<{ proposalId: string }>();
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
@@ -548,6 +649,7 @@ api.post("/edit/reject", async (c) => {
 
 /** 最後の適用を取り消す。 */
 api.post("/edit/undo", async (c) => {
+  ensureStoresForCurrentRoot();
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   const entry = undoStack.pop();
@@ -565,6 +667,17 @@ api.post("/edit/undo", async (c) => {
     return c.json({ error: "対象がプロジェクト範囲外" }, 403);
   }
   try {
+    const currentBytes = await readFile(entry.file);
+    if (
+      Buffer.compare(currentBytes, Buffer.from(entry.appliedContent, "utf8")) !==
+      0
+    ) {
+      undoStack.push(entry);
+      return c.json(
+        { error: "適用後にファイルが変更されているため取り消せません。" },
+        409
+      );
+    }
     await writeFile(entry.file, entry.previousContent, "utf8");
     return c.json({
       ok: true,
@@ -575,7 +688,7 @@ api.post("/edit/undo", async (c) => {
     });
   } catch (e) {
     undoStack.push(entry);
-    return serverError(c, e);
+    return serverError(c, e, entry.relFile);
   } finally {
     inFlight.delete(entry.proposalId);
   }

@@ -271,4 +271,24 @@ describe("Chat", () => {
     expect(screen.getByText("この差分は別の選択要素のものです")).not.toBeNull();
     expect(screen.getByText("+added line")).not.toBeNull();
   });
+
+  it("project key が変わると保留中の提案 state が remount で消える", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.edit).mockResolvedValue(goodProposal());
+    const { rerender } = render(
+      <Chat key="/demo" selected={descriptor} hasKey={true} />
+    );
+
+    await sendInstruction(user, "赤くして");
+    expect(await screen.findByText("+added line")).not.toBeNull();
+    expect(
+      screen.getByText("提案対象: <button #btn> \"Click me\"")
+    ).not.toBeNull();
+
+    rerender(<Chat key="/other" selected={otherDescriptor} hasKey={true} />);
+
+    expect(screen.queryByText("+added line")).toBeNull();
+    expect(screen.queryByText("提案対象: <button #btn> \"Click me\"")).toBeNull();
+    expect(screen.queryByRole("button", { name: "承認して適用" })).toBeNull();
+  });
 });

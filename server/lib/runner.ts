@@ -299,6 +299,36 @@ export interface RunningTarget {
   logs: string[];
 }
 
+const liveChildren = new Set<ChildProcess>();
+
+function registerChild(proc: ChildProcess): void {
+  liveChildren.add(proc);
+  const unregister = () => {
+    liveChildren.delete(proc);
+  };
+  proc.once("exit", unregister);
+  proc.once("close", unregister);
+}
+
+export function killAllChildrenSync(): void {
+  for (const proc of Array.from(liveChildren)) {
+    liveChildren.delete(proc);
+    if (typeof proc.pid === "number" && proc.pid > 0) {
+      try {
+        process.kill(-proc.pid, "SIGKILL");
+        continue;
+      } catch {
+        // プロセスグループ kill に失敗したら直接子へフォールバック
+      }
+    }
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      // 既に終了済みなら無視
+    }
+  }
+}
+
 // --- プロセスグループ kill の単一実装 (runner.ts がプロセスの所有者) ---
 // state.ts を含む全利用側は killGroup を import して使う。
 
@@ -414,6 +444,7 @@ export async function startTarget(
     shell: false,
     detached: true,
   });
+  registerChild(proc);
 
   let spawnFailed = false;
   let spawnErrorMessage = "";

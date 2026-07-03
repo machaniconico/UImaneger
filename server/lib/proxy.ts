@@ -21,6 +21,63 @@ function inspectorTag(): string {
   return `\n<script data-uim-inspector>${inspectorScript}</script>\n`;
 }
 
+function mediaType(contentType: string): string {
+  return contentType.split(";", 1)[0].trim().toLowerCase();
+}
+
+function htmlContentType(contentType: string): boolean {
+  const type = mediaType(contentType);
+  return type === "text/html" || type === "application/xhtml+xml";
+}
+
+function charsetFromContentType(contentType: string): string | null {
+  for (const part of contentType.split(";").slice(1)) {
+    const [name, ...valueParts] = part.split("=");
+    if (name?.trim().toLowerCase() !== "charset") continue;
+    const value = valueParts.join("=").trim();
+    if (!value) return null;
+    return value.replace(/^["']|["']$/g, "").toLowerCase();
+  }
+  return null;
+}
+
+function injectableCharset(contentType: string): boolean {
+  const charset = charsetFromContentType(contentType);
+  return (
+    !charset ||
+    charset === "utf-8" ||
+    charset === "utf8" ||
+    charset === "us-ascii"
+  );
+}
+
+function sniffHtmlBody(body: Buffer): boolean {
+  const leading = body
+    .subarray(0, 512)
+    .toString("utf8")
+    .replace(/^\uFEFF/, "")
+    .trimStart()
+    .toLowerCase();
+  return leading.startsWith("<!doctype html") || leading.startsWith("<html");
+}
+
+function rewriteLocationValue(
+  value: string | undefined,
+  targetHost: string,
+  proxyPort: number
+): string | undefined {
+  if (!value) return value;
+
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return value;
+  }
+  if (url.host !== targetHost) return value;
+  return `http://127.0.0.1:${proxyPort}${url.pathname}${url.search}${url.hash}`;
+}
+
 export interface ProxyHandle {
   server: http.Server;
   port: number;
@@ -36,6 +93,7 @@ export function startProxy(
   proxyPort: number
 ): Promise<ProxyHandle> {
   const target = `http://127.0.0.1:${targetPort}`;
+  const targetHost = `127.0.0.1:${targetPort}`;
   const proxy = httpProxy.createProxyServer({
     target,
     ws: true,
@@ -50,12 +108,22 @@ export function startProxy(
 
   proxy.on("proxyRes", (proxyRes, req, res) => {
     const ct = String(proxyRes.headers["content-type"] || "");
-    const isHtml = ct.includes("text/html");
+    const declaredHtml = htmlContentType(ct);
+    const mustSniff = ct.trim() === "";
 
     const headers = { ...proxyRes.headers };
     // フレーム埋め込みを許可
     delete headers["x-frame-options"];
     delete headers["content-security-policy"];
+    // location は存在する時だけ書き換える。非リダイレクト応答(location 無し)で
+    // undefined を代入すると res.writeHead が ERR_HTTP_INVALID_HEADER_VALUE を投げる。
+    if (headers.location !== undefined) {
+      headers.location = rewriteLocationValue(
+        headers.location,
+        targetHost,
+        proxyPort
+      );
+    }
 
     // ターゲット dev server が応答中にリセットしても unhandled "error" に
     // 昇格しないように、分岐前に error ハンドラを取り付ける(HTML / pipe 両パス共通)。
@@ -89,7 +157,7 @@ export function startProxy(
       );
     });
 
-    if (!isHtml) {
+    if (!declaredHtml && !mustSniff) {
       res.writeHead(proxyRes.statusCode || 200, headers);
       proxyRes.pipe(res);
       return;
@@ -99,7 +167,15 @@ export function startProxy(
     proxyRes.on("data", (c) => chunks.push(Buffer.from(c)));
     proxyRes.on("end", () => {
       if (upstreamErrored || res.destroyed || res.writableEnded) return;
-      let body = Buffer.concat(chunks).toString("utf8");
+      const rawBody = Buffer.concat(chunks);
+      const isHtml = declaredHtml || (mustSniff && sniffHtmlBody(rawBody));
+      if (!isHtml || !injectableCharset(ct)) {
+        res.writeHead(proxyRes.statusCode || 200, headers);
+        res.end(rawBody);
+        return;
+      }
+
+      let body = rawBody.toString("utf8");
       const tag = inspectorTag();
       if (tag) {
         if (body.includes("</body>")) {

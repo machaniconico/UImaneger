@@ -28,37 +28,45 @@ describe("BeforePreview", () => {
     expect(screen.queryByText("起動中...")).toBeNull();
   });
 
-  it("running=false なら接続エラー overlay を表示する", () => {
-    render(
-      <BeforePreview
-        info={{ ...runningInfo, running: false }}
-        selectMode={false}
-        onSelect={() => {}}
-      />
-    );
-
-    expect(screen.getByRole("alert").textContent).toContain(
-      "対象アプリに接続できません"
-    );
-  });
-
-  it("beforeProxyPort がなく beforeError がある場合は起動失敗理由を表示する", () => {
+  it("running=false の通常停止なら neutral overlay を表示する", () => {
     render(
       <BeforePreview
         info={{
           ...runningInfo,
+          running: false,
           beforeProxyPort: null,
-          beforeError: "port unavailable",
+          beforeError: null,
         }}
         selectMode={false}
         onSelect={() => {}}
       />
     );
 
-    expect(
-      screen.getByText(
-        "編集前プレビューを起動できませんでした: port unavailable"
-      )
-    ).not.toBeNull();
+    expect(screen.getByRole("status").textContent).toContain(
+      "停止中です。「開く」で再表示します。"
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
   });
+
+  it("beforeError がある場合は error tone でサーバー文字列をそのまま表示する", () => {
+    const beforeError = "編集前プレビュー起動失敗: npm run dev failed";
+
+    render(
+      <BeforePreview
+        info={{
+          ...runningInfo,
+          beforeProxyPort: null,
+          beforeError,
+        }}
+        selectMode={false}
+        onSelect={() => {}}
+      />
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe(beforeError);
+    expect(
+      screen.queryByText(/編集前プレビューを起動できませんでした/)
+    ).toBeNull();
+  });
+
 });

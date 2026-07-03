@@ -18,6 +18,7 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   rmSync,
   symlinkSync,
 } from "node:fs";
@@ -50,6 +51,13 @@ const SKIP_DIRS = new Set([
   ".turbo",
   "coverage",
 ]);
+
+const liveBeforeHandles = new Set<BeforeHandle>();
+
+function trackBefore(h: BeforeHandle): BeforeHandle {
+  liveBeforeHandles.add(h);
+  return h;
+}
 
 function runGit(
   root: string,
@@ -124,13 +132,13 @@ export function prepareBefore(root: string): BeforeHandle {
         //  - 対象ディレクトリ固有の node_modules があれば before ディレクトリへ
         linkNodeModules(gitRoot, wtDir);
         if (beforeDir !== wtDir) linkNodeModules(absRoot, beforeDir);
-        return {
+        return trackBefore({
           dir: beforeDir,
           mode: "worktree",
           root: absRoot,
           worktreeAdded: true,
           worktreeRoot: wtDir,
-        };
+        });
       }
       // 失敗した中間ディレクトリを掃除
       runGit(absRoot, ["worktree", "remove", "--force", wtDir]);
@@ -157,13 +165,18 @@ export function prepareBefore(root: string): BeforeHandle {
       },
     });
     linkNodeModules(absRoot, snapDir);
-    return {
+    return trackBefore({
       dir: snapDir,
       mode: "snapshot",
       root: absRoot,
       worktreeAdded: false,
-    };
+    });
   } catch {
+    try {
+      rmSync(snapDir, { recursive: true, force: true });
+    } catch {
+      // ベストエフォート
+    }
     // 最終手段: before = after 同じディレクトリ
     return {
       dir: absRoot,
@@ -180,6 +193,7 @@ export function prepareBefore(root: string): BeforeHandle {
  * snapshot はディレクトリを再帰削除。none は何もしない。
  */
 export function cleanupBefore(h: BeforeHandle): void {
+  liveBeforeHandles.delete(h);
   if (!h || h.mode === "none") return;
 
   const wtRoot = h.worktreeRoot ?? h.dir;
@@ -192,6 +206,33 @@ export function cleanupBefore(h: BeforeHandle): void {
     rmSync(wtRoot, { recursive: true, force: true });
   } catch {
     // ベストエフォート
+  }
+}
+
+export function cleanupAllBefore(): void {
+  for (const h of Array.from(liveBeforeHandles)) {
+    try {
+      cleanupBefore(h);
+    } catch {
+      // ベストエフォート
+    }
+  }
+}
+
+export function sweepStaleBeforeDirs(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(tmpdir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!/^uim-(before|snap)-/.test(entry)) continue;
+    try {
+      rmSync(join(tmpdir(), entry), { recursive: true, force: true });
+    } catch {
+      // ベストエフォート
+    }
   }
 }
 

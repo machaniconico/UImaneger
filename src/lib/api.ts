@@ -5,24 +5,23 @@ import type {
   ProjectInfo,
 } from "./types.ts";
 
-/** Response が HTTP エラーなら status とボディメッセージを含む例外を投げ、成功なら JSON を返す。 */
+/** Response が HTTP エラーなら例外を投げ、成功なら JSON を返す。 */
 async function parseJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
-    let detail = "";
+    let serverError = "";
     try {
       const body = await res.text();
       try {
         const j = JSON.parse(body);
-        detail = (j && (j.error || j.message)) || body;
+        serverError = j && typeof j.error === "string" ? j.error : "";
       } catch {
-        detail = body;
+        // JSON でない、または error フィールドがない場合は status のみを表示する
       }
     } catch {
-      // ボディ読み取り失敗は空詳細
+      // ボディ読み取り失敗は status のみを表示する
     }
-    throw new Error(
-      `HTTP ${res.status}: ${detail || res.statusText || "request failed"}`
-    );
+    if (serverError) throw new Error(serverError);
+    throw new Error(`HTTP ${res.status}`);
   }
   try {
     return (await res.json()) as T;
