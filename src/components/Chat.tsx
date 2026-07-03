@@ -182,7 +182,7 @@ export function Chat({ selected, hasKey, initialUndoDepth }: Props) {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
       }
     } catch (e: any) {
-      if (String(e?.message || e).startsWith("HTTP 404:")) setUndoDepth(0);
+      if (String(e?.message || e).startsWith("HTTP 404")) setUndoDepth(0);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setBusy(false);

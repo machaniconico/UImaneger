@@ -32,6 +32,11 @@ export function App() {
       });
   }, []);
 
+  useEffect(() => {
+    setSelected(null);
+    setSelectMode(false);
+  }, [info?.root]);
+
   // 編集適用時に右(After)を更新するための合図 (US-005 が dispatch)
   useEffect(() => {
     const onApplied = () => setReloadKey((n) => n + 1);
@@ -65,6 +70,7 @@ export function App() {
         )}
         <div className="min-h-0 flex-1">
           <Chat
+            key={info?.root ?? "none"}
             selected={selected}
             hasKey={hasKey}
             initialUndoDepth={initialUndoDepth}

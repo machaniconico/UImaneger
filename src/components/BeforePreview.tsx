@@ -16,8 +16,14 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
     info?.beforeProxyPort != null
       ? `http://localhost:${info.beforeProxyPort}/`
       : "";
-  const connectionError = info?.running === false;
-  const beforeError = info?.running && !url ? info.beforeError : null;
+  const [loadFailed, setLoadFailed] = useState(false);
+  const beforeError = info?.beforeError || null;
+  const errorMessage = beforeError
+    ? beforeError
+    : loadFailed
+    ? "対象アプリに接続できません — 起動ログを確認してください"
+    : null;
+  const idleStopped = info?.running === false && !errorMessage;
   const { iframeRef } = usePreviewBridge({
     url,
     selectMode,
@@ -27,6 +33,7 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
 
   useEffect(() => {
     setLoaded(false);
+    setLoadFailed(false);
   }, [url]);
 
   return (
@@ -55,19 +62,22 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
             src={url}
             title="before"
             onLoad={() => setLoaded(true)}
+            onError={() => setLoadFailed(true)}
             className="h-full w-full border-0"
           />
         ) : (
           <div className="flex h-full items-center justify-center text-sm text-neutral-400">
-            {beforeError
-              ? `編集前プレビューを起動できませんでした: ${beforeError}`
+            {errorMessage
+              ? null
               : "プロジェクトを開くと編集前の画面が表示されます"}
           </div>
         )}
-        {connectionError ? (
+        {errorMessage ? (
+          <PreviewOverlay tone="error" message={errorMessage} />
+        ) : idleStopped ? (
           <PreviewOverlay
-            tone="error"
-            message="対象アプリに接続できません — 起動ログを確認してください"
+            tone="loading"
+            message="停止中です。「開く」で再表示します。"
           />
         ) : url && !loaded ? (
           <PreviewOverlay tone="loading" message="起動中..." />

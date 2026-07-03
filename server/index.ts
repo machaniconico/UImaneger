@@ -4,6 +4,8 @@ import { logger } from "hono/logger";
 import { env } from "./lib/env.ts";
 import { api } from "./routes/api.ts";
 import { stopProject } from "./lib/state.ts";
+import { killAllChildrenSync } from "./lib/runner.ts";
+import { cleanupAllBefore, sweepStaleBeforeDirs } from "./lib/worktree.ts";
 import { securityMiddleware } from "./middleware/security.ts";
 
 const app = new Hono();
@@ -12,6 +14,8 @@ app.get("/health", (c) => c.text("ok"));
 app.use("/api/*", logger());
 app.use("/api/*", securityMiddleware);
 app.route("/api", api);
+
+sweepStaleBeforeDirs();
 
 const bindHost = process.env.UIM_HOST ?? "127.0.0.1";
 const server = serve(
@@ -55,7 +59,25 @@ async function gracefulExit(code: number): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   // ハードキル: どれだけ後始末が詰まっても 6s 後には確実に落とす(unref で保持しない)
-  const hardKill = setTimeout(() => process.exit(code), 6_000);
+  const hardKill = setTimeout(() => {
+    try {
+      killAllChildrenSync();
+    } catch (err) {
+      safeErrorLog(
+        "[UImaneger] child cleanup during hard shutdown failed:",
+        err
+      );
+    }
+    try {
+      cleanupAllBefore();
+    } catch (err) {
+      safeErrorLog(
+        "[UImaneger] before cleanup during hard shutdown failed:",
+        err
+      );
+    }
+    process.exit(code);
+  }, 6_000);
   hardKill.unref();
   try {
     console.log("\n[UImaneger] shutting down...");
@@ -71,6 +93,16 @@ async function gracefulExit(code: number): Promise<void> {
     safeErrorLog("[UImaneger] shutdown failed:", err);
   } finally {
     clearTimeout(hardKill);
+    try {
+      killAllChildrenSync();
+    } catch (err) {
+      safeErrorLog("[UImaneger] child cleanup during shutdown failed:", err);
+    }
+    try {
+      cleanupAllBefore();
+    } catch (err) {
+      safeErrorLog("[UImaneger] before cleanup during shutdown failed:", err);
+    }
     process.exit(code);
   }
 }
@@ -79,6 +111,9 @@ process.on("SIGINT", () => {
   void gracefulExit(0);
 });
 process.on("SIGTERM", () => {
+  void gracefulExit(0);
+});
+process.on("SIGHUP", () => {
   void gracefulExit(0);
 });
 process.on("uncaughtException", (err) => {

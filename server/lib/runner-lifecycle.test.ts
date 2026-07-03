@@ -6,7 +6,13 @@ import http from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isListening, findFreePort, startTarget, sleep } from "./runner.ts";
+import {
+  isListening,
+  findFreePort,
+  startTarget,
+  sleep,
+  killAllChildrenSync,
+} from "./runner.ts";
 
 // --- helpers (自己完結。各テストファイルで独立定義) ---
 
@@ -68,7 +74,9 @@ async function waitUntilFalse(
 
 // --- isListening ---
 
-const describeIfLoopback = (await canBindLoopback()) ? describe : describe.skip;
+const hasLoopback = await canBindLoopback();
+const describeIfLoopback = hasLoopback ? describe : describe.skip;
+const itIfLoopback = hasLoopback ? it : it.skip;
 
 describeIfLoopback("isListening", () => {
   it("detects a listening IPv4 (127.0.0.1) port and returns false after close", async () => {
@@ -169,4 +177,26 @@ describe("startTarget", () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   }, 20_000);
+
+  itIfLoopback("killAllChildrenSync kills a live detached target registered by startTarget", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-live-"));
+    try {
+      const target = await startTarget(tmp, 0, {
+        command:
+          "node -e \"require('http').createServer((_req,res)=>res.end('ok')).listen(0,'127.0.0.1',function(){console.log('Listening on '+this.address().port)})\"",
+      });
+      expect(await isListening(target.port)).toBe(true);
+
+      killAllChildrenSync();
+
+      const closed = await waitUntilFalse(
+        () => isListening(target.port),
+        3_000
+      );
+      expect(closed).toBe(true);
+    } finally {
+      killAllChildrenSync();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

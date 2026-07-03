@@ -27,6 +27,15 @@ export function ProjectBar({
 
   const isRepo = /^(https?:\/\/|git@)/.test(value.trim());
 
+  async function reconcileInfo() {
+    try {
+      const s = await api.status();
+      onInfo(s.info);
+    } catch {
+      // 元のエラー表示を優先するため、再同期失敗は握りつぶす
+    }
+  }
+
   async function openOrClone() {
     const v = value.trim();
     if (!v || busy) return;
@@ -34,10 +43,15 @@ export function ProjectBar({
     onError("");
     try {
       const res = isRepo ? await api.clone(v) : await api.open(v);
-      if (res.error) onError(res.error);
-      else onInfo(res.info ?? null);
+      if (res.error) {
+        onError(res.error);
+        await reconcileInfo();
+      } else {
+        onInfo(res.info ?? null);
+      }
     } catch (e: any) {
       onError(String(e.message || e));
+      await reconcileInfo();
     } finally {
       setBusy(false);
     }

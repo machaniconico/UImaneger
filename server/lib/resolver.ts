@@ -13,7 +13,9 @@ const DEBUG = !!process.env.UIM_DEBUG;
 
 // rg バイナリが spawn 可能かを一度だけ判定 (シェル関数や未導入環境では false → Node grep)
 let rgUsable: boolean | null = null;
+let rgUsableOverride: boolean | null = null;
 async function isRgUsable(): Promise<boolean> {
+  if (rgUsableOverride !== null) return rgUsableOverride;
   if (rgUsable !== null) return rgUsable;
   try {
     await pExecFile("rg", ["--version"], { maxBuffer: 1 << 16 });
@@ -23,6 +25,24 @@ async function isRgUsable(): Promise<boolean> {
   }
   return rgUsable;
 }
+
+let nodeGrepTreeWalks = 0;
+
+export const __resolverTestHooks = {
+  forceRgUsable(value: boolean | null): void {
+    rgUsableOverride = value;
+    if (value === null) rgUsable = null;
+  },
+  resetNodeGrepTreeWalks(): void {
+    nodeGrepTreeWalks = 0;
+  },
+  getNodeGrepTreeWalks(): number {
+    return nodeGrepTreeWalks;
+  },
+  collectCandidates(root: string, d: DomDescriptor) {
+    return collectCandidates(root, d);
+  },
+};
 
 const IGNORE_DIRS = new Set([
   "node_modules",
@@ -40,6 +60,13 @@ const IGNORE_DIRS = new Set([
 // テキストとして検索する拡張子 (バイナリ回避)
 const TEXT_EXT =
   /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|html?|css|scss|sass|less|md|mdx|json|ya?ml|php|rb|erb|py|go|java|kt|rs|c|h|cpp|cs|swift|ex|exs|txt|hbs|ejs|pug|twig|blade\.php)$/i;
+const NODE_GREP_FILE_CAP = 6000; // 暴走防止
+const NODE_GREP_MAX_FILE_SIZE = 1.5 * 1024 * 1024;
+
+interface NodeGrepFile {
+  file: string;
+  content: string;
+}
 
 /** タームが CJK 文字を含むか (短い CJK 熟語も検索対象にするため)。
  *  U+3000〜U+9FFF: CJK 記号/ひらがな/カタカナ/CJK 統合漢字 等
@@ -63,10 +90,10 @@ async function nodeGrep(
   if (!isSearchableTerm(term)) return [];
   const out: { file: string; line: number; preview: string }[] = [];
   let filesScanned = 0;
-  const FILE_CAP = 6000; // 暴走防止
 
   async function walk(dir: string): Promise<void> {
-    if (out.length >= max || filesScanned >= FILE_CAP) return;
+    nodeGrepTreeWalks++;
+    if (out.length >= max || filesScanned >= NODE_GREP_FILE_CAP) return;
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -74,7 +101,7 @@ async function nodeGrep(
       return;
     }
     for (const ent of entries) {
-      if (out.length >= max || filesScanned >= FILE_CAP) return;
+      if (out.length >= max || filesScanned >= NODE_GREP_FILE_CAP) return;
       const full = join(dir, ent.name);
       if (ent.isDirectory()) {
         if (IGNORE_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
@@ -85,7 +112,7 @@ async function nodeGrep(
         let content: string;
         try {
           const s = await stat(full);
-          if (s.size > 1.5 * 1024 * 1024) continue; // 巨大ファイルskip
+          if (s.size > NODE_GREP_MAX_FILE_SIZE) continue; // 巨大ファイルskip
           content = await readFile(full, "utf8");
         } catch {
           continue;
@@ -108,6 +135,72 @@ async function nodeGrep(
 
   await walk(root);
   return out;
+}
+
+async function readNodeGrepFiles(root: string): Promise<NodeGrepFile[]> {
+  const files: NodeGrepFile[] = [];
+  let filesScanned = 0;
+
+  async function walk(dir: string): Promise<void> {
+    nodeGrepTreeWalks++;
+    if (filesScanned >= NODE_GREP_FILE_CAP) return;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (filesScanned >= NODE_GREP_FILE_CAP) return;
+      const full = join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (IGNORE_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
+        await walk(full);
+      } else if (ent.isFile()) {
+        if (!TEXT_EXT.test(ent.name)) continue;
+        filesScanned++;
+        try {
+          const s = await stat(full);
+          if (s.size > NODE_GREP_MAX_FILE_SIZE) continue;
+          files.push({ file: resolve(full), content: await readFile(full, "utf8") });
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+
+  await walk(root);
+  return files;
+}
+
+function searchNodeGrepFiles(
+  files: NodeGrepFile[],
+  term: string,
+  max = Infinity
+): { file: string; line: number; preview: string }[] {
+  if (!isSearchableTerm(term)) return [];
+  const out: { file: string; line: number; preview: string }[] = [];
+  for (const f of files) {
+    if (out.length >= max) break;
+    if (!f.content.includes(term)) continue;
+    const lines = f.content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes(term)) {
+        out.push({
+          file: f.file,
+          line: i + 1,
+          preview: lines[i].trim().slice(0, 200),
+        });
+        if (out.length >= max) break;
+      }
+    }
+  }
+  return out;
+}
+
+function countNodeGrepFiles(files: NodeGrepFile[], term: string): number {
+  return searchNodeGrepFiles(files, term).length;
 }
 
 function withinRoot(root: string, file: string): boolean {
@@ -401,6 +494,7 @@ async function rgSearch(
         "!**/.git/**",
         "-g",
         "!**/build/**",
+        "--",
         term,
         root,
       ],
@@ -448,6 +542,7 @@ async function rgCount(root: string, term: string): Promise<number> {
         "!**/.git/**",
         "-g",
         "!**/build/**",
+        "--",
         term,
         root,
       ],
@@ -478,6 +573,8 @@ async function collectCandidates(
   root: string,
   d: DomDescriptor
 ): Promise<{ candidates: CandidateAgg[]; termHits: Map<string, number> }> {
+  if (!(await isRgUsable())) return collectCandidatesWithNodeGrep(root, d);
+
   const terms = buildTerms(d);
   // term → 総ヒット件数 (rarity 計算用に第1パスで集計するため、最初は hits=0 で埋める)
   const termHits = new Map<string, number>();
@@ -548,6 +645,80 @@ async function collectCandidates(
     candidates.push(c);
   }
   // score 降順、同点なら行番号昇順で安定
+  candidates.sort((a, b) =>
+    b.score !== a.score ? b.score - a.score : a.line - b.line
+  );
+
+  return { candidates, termHits };
+}
+
+async function collectCandidatesWithNodeGrep(
+  root: string,
+  d: DomDescriptor
+): Promise<{ candidates: CandidateAgg[]; termHits: Map<string, number> }> {
+  const terms = buildTerms(d);
+  const files = await readNodeGrepFiles(root);
+  const termHits = new Map<string, number>();
+  const byKey = new Map<string, CandidateAgg>();
+
+  for (const { term, kind } of terms) {
+    const hits = searchNodeGrepFiles(files, term, 20);
+    termHits.set(term, countNodeGrepFiles(files, term));
+    if (hits.length === 0) continue;
+    for (const h of hits) {
+      if (!withinRoot(root, h.file)) continue;
+      const key = h.file + ":" + h.line;
+      let c = byKey.get(key);
+      if (!c) {
+        c = { file: h.file, line: h.line, preview: h.preview, matched: [], score: 0 };
+        byKey.set(key, c);
+      }
+      if (!c.matched.some((m) => m.term === term && m.kind === kind)) {
+        c.matched.push({ term, kind, hits: hits.length });
+      }
+    }
+  }
+
+  const didFullTextHit =
+    d.textSnippet && d.textSnippet.trim().length >= 4
+      ? (termHits.get(d.textSnippet.trim()) ?? 0) > 0
+      : true;
+  if (!didFullTextHit && d.textSnippet) {
+    const words = splitWords(d.textSnippet);
+    for (const w of words) {
+      const count = countNodeGrepFiles(files, w);
+      if (count === 0 || count > 100) continue;
+      const hits = searchNodeGrepFiles(files, w, 20);
+      if (hits.length === 0) continue;
+      termHits.set("__partial__" + w, count);
+      for (const h of hits) {
+        if (!withinRoot(root, h.file)) continue;
+        const key = h.file + ":" + h.line;
+        let c = byKey.get(key);
+        if (!c) {
+          c = { file: h.file, line: h.line, preview: h.preview, matched: [], score: 0 };
+          byKey.set(key, c);
+        }
+        if (!c.matched.some((m) => m.term === w && m.kind === "textPartial")) {
+          c.matched.push({ term: w, kind: "textPartial", hits: hits.length });
+        }
+      }
+    }
+  }
+
+  const candidates: CandidateAgg[] = [];
+  for (const c of byKey.values()) {
+    const scored: ScoredTerm[] = c.matched.map((m) => ({
+      term: m.term,
+      kind: m.kind,
+      hits: termHits.get(
+        m.kind === "textPartial" ? "__partial__" + m.term : m.term
+      ) ?? m.hits,
+    }));
+    c.matched = scored;
+    c.score = scoreCandidate(scored);
+    candidates.push(c);
+  }
   candidates.sort((a, b) =>
     b.score !== a.score ? b.score - a.score : a.line - b.line
   );

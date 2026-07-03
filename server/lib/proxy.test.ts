@@ -118,6 +118,40 @@ function upgradeViaProxy(proxyPort: number): Promise<net.Socket> {
   });
 }
 
+type ProxyTestResponse = {
+  statusCode: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+};
+
+function requestViaProxy(
+  proxyPort: number,
+  path = "/"
+): Promise<ProxyTestResponse> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: proxyPort,
+        path,
+      },
+      (res) => {
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () => {
+          resolve({
+            statusCode: res.statusCode || 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks),
+          });
+        });
+      }
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
+
 // --- ProxyHandle.close ---
 
 const describeIfLoopback = (await canBindLoopback()) ? describe : describe.skip;
@@ -232,4 +266,166 @@ describeIfLoopback("ProxyHandle.close", () => {
     expect(released).toBe(true);
     expect(await isListening(proxyPort)).toBe(false);
   }, 20_000);
+});
+
+describeIfLoopback("proxy transport fidelity", () => {
+  it("rewrites target Location headers on the pipe response path", async () => {
+    let upstreamPort = 0;
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(302, {
+        "content-type": "text/plain",
+        location: `http://127.0.0.1:${upstreamPort}/next?from=target#frag`,
+      });
+      res.end("redirect");
+    });
+    upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+
+      expect(response.statusCode).toBe(302);
+      expect(response.headers.location).toBe(
+        `http://127.0.0.1:${proxyPort}/next?from=target#frag`
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("rewrites target Location headers on the HTML response path", async () => {
+    let upstreamPort = 0;
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(302, {
+        "content-type": "text/html; charset=utf-8",
+        location: `http://127.0.0.1:${upstreamPort}/html-next`,
+      });
+      res.end("<!doctype html><html><body>redirect</body></html>");
+    });
+    upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      const body = response.body.toString("utf8");
+
+      expect(response.statusCode).toBe(302);
+      expect(response.headers.location).toBe(
+        `http://127.0.0.1:${proxyPort}/html-next`
+      );
+      expect(body).toContain("data-uim-inspector");
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("passes non-UTF-8 HTML through byte-identical without injection", async () => {
+    const shiftJisBody = Buffer.concat([
+      Buffer.from("<!doctype html><html><body>", "ascii"),
+      Buffer.from([
+        0x82, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd,
+      ]),
+      Buffer.from("</body></html>", "ascii"),
+    ]);
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html; charset=shift_jis",
+        "content-length": String(shiftJisBody.byteLength),
+      });
+      res.end(shiftJisBody);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+
+      expect(response.body.equals(shiftJisBody)).toBe(true);
+      expect(response.body.includes(Buffer.from("data-uim-inspector"))).toBe(
+        false
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("injects the inspector into application/xhtml+xml responses", async () => {
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/xhtml+xml; charset=utf-8",
+      });
+      res.end("<html><body><main>xhtml</main></body></html>");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      const body = response.body.toString("utf8");
+
+      expect(body).toContain("xhtml");
+      expect(body).toContain("data-uim-inspector");
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("sniffs content-type-absent HTML and injects the inspector", async () => {
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200);
+      res.end("<!doctype html><html><body>sniffed</body></html>");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      const body = response.body.toString("utf8");
+
+      expect(response.headers["content-type"]).toBeUndefined();
+      expect(body).toContain("sniffed");
+      expect(body).toContain("data-uim-inspector");
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("keeps injecting the inspector into UTF-8 text/html responses", async () => {
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+      });
+      res.end("<html><body>utf8</body></html>");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      const body = response.body.toString("utf8");
+
+      expect(body).toContain("utf8");
+      expect(body).toContain("data-uim-inspector");
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
 });

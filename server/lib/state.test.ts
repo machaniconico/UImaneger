@@ -12,8 +12,9 @@ import {
   openAndStart,
   getInfo,
   getRoot,
+  getBefore,
 } from "./state.ts";
-import { startTarget, findFreePort } from "./runner.ts";
+import { startTarget, findFreePort, detectRunner } from "./runner.ts";
 import { startProxy } from "./proxy.ts";
 import { prepareBefore, cleanupBefore } from "./worktree.ts";
 
@@ -233,5 +234,70 @@ describe("S6 — before プレビュー起動失敗の可視化", () => {
     expect(info.afterProxyPort).not.toBeNull();
     // after proxy のみ起動(before proxy は targetBefore null でスキップ)
     expect(startProxyMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("F1 — runCommand override", () => {
+  let noDetectRoot: string;
+  let beforeDir: string;
+
+  beforeEach(() => {
+    noDetectRoot = mkdtempSync(join(tmpdir(), "uim-state-nodetect-"));
+    beforeDir = mkdtempSync(join(tmpdir(), "uim-before-override-"));
+    prepareBeforeMock.mockReturnValue({
+      dir: beforeDir,
+      mode: "snapshot",
+      root: noDetectRoot,
+      worktreeAdded: false,
+    });
+    startTargetMock.mockImplementation(
+      async (dir: string, port: number, override) => {
+        const f = makeFakeProc();
+        createdProcs.push(f);
+        return {
+          proc: f.proc,
+          plan: detectRunner(dir, port, override),
+          port,
+          logs: [],
+        } as any;
+      }
+    );
+    startProxyMock.mockImplementation(async (_tp: number, pp: number) => {
+      proxyPorts.push(pp);
+      return { server: {}, port: pp, close: async () => {} } as any;
+    });
+  });
+
+  afterEach(() => {
+    rmSync(noDetectRoot, { recursive: true, force: true });
+    rmSync(beforeDir, { recursive: true, force: true });
+  });
+
+  it("persists runCommand override and passes it to both after and before targets", async () => {
+    const info = await openAndStart(noDetectRoot, {
+      command: "printf ready",
+      framework: "custom-fw",
+    });
+
+    expect(info.runCommand).toBe("sh -c printf ready");
+    expect(info.framework).toBe("custom-fw");
+    expect(startTargetMock).toHaveBeenCalledTimes(2);
+    expect(startTargetMock).toHaveBeenNthCalledWith(
+      1,
+      noDetectRoot,
+      5180,
+      { command: "printf ready", framework: "custom-fw" }
+    );
+    expect(startTargetMock).toHaveBeenNthCalledWith(
+      2,
+      beforeDir,
+      5190,
+      { command: "printf ready", framework: "custom-fw" }
+    );
+    expect(getBefore()).toEqual({
+      dir: beforeDir,
+      root: noDetectRoot,
+      mode: "snapshot",
+    });
   });
 });

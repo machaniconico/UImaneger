@@ -1,18 +1,20 @@
 // ラウンド3: バックエンド ライフサイクル統合テスト (worktree)
 // 対象: prepareBefore(root) / cleanup
 // 実 git リポジトリ・temp ディレクトリを使う node 環境テスト。
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { spawnSync } from "node:child_process";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { prepareBefore, cleanup } from "./worktree.ts";
+import { prepareBefore, cleanup, sweepStaleBeforeDirs } from "./worktree.ts";
 
 // --- helpers ---
 
@@ -133,4 +135,68 @@ describe("prepareBefore / cleanup", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("removes a partially-created snapshot dir when cpSync fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "uim-cpfail-root-"));
+    const before = new Set(
+      readdirSync(tmpdir()).filter((entry) => /^uim-snap-/.test(entry))
+    );
+    try {
+      writeFileSync(join(root, "file.txt"), "hello");
+      vi.resetModules();
+      vi.doMock("node:fs", async (importOriginal) => {
+        const actual = await importOriginal<typeof import("node:fs")>();
+        return {
+          ...actual,
+          cpSync: vi.fn(() => {
+            throw new Error("forced cpSync failure");
+          }),
+        };
+      });
+      const { prepareBefore: prepareWithFailingCopy } = await import(
+        "./worktree.ts"
+      );
+      const h = prepareWithFailingCopy(root);
+      expect(h).toMatchObject({
+        dir: root,
+        mode: "none",
+        root,
+        worktreeAdded: false,
+      });
+
+      const leaked = readdirSync(tmpdir()).filter(
+        (entry) => /^uim-snap-/.test(entry) && !before.has(entry)
+      );
+      expect(leaked).toEqual([]);
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("sweeps stale UImaneger before and snapshot dirs from tmpdir", () => {
+    const staleBefore = join(
+      tmpdir(),
+      `uim-before-stale-${process.pid}-${Date.now()}`
+    );
+    const staleSnap = join(
+      tmpdir(),
+      `uim-snap-stale-${process.pid}-${Date.now()}`
+    );
+    mkdirSync(staleBefore, { recursive: true });
+    mkdirSync(staleSnap, { recursive: true });
+    try {
+      expect(existsSync(staleBefore)).toBe(true);
+      expect(existsSync(staleSnap)).toBe(true);
+
+      sweepStaleBeforeDirs();
+
+      expect(existsSync(staleBefore)).toBe(false);
+      expect(existsSync(staleSnap)).toBe(false);
+    } finally {
+      rmSync(staleBefore, { recursive: true, force: true });
+      rmSync(staleSnap, { recursive: true, force: true });
+    }
+  });
 });

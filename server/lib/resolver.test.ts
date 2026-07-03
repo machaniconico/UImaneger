@@ -1,11 +1,16 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import {
+  __resolverTestHooks,
   isGenericClass,
   buildTerms,
   splitWords,
   termWeight,
   scoreCandidate,
   hasRareTerm,
+  resolveSource,
 } from "./resolver.ts";
 import type { DomDescriptor } from "./types.ts";
 import type { ScoredTerm, TermKind } from "./resolver.ts";
@@ -24,6 +29,25 @@ function mkD(over: Partial<DomDescriptor> = {}): DomDescriptor {
 function st(term: string, kind: TermKind, hits: number): ScoredTerm {
   return { term, kind, hits };
 }
+
+const tempRoots: string[] = [];
+
+async function fixture(files: Record<string, string>): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "uim-resolver-"));
+  tempRoots.push(root);
+  for (const [rel, content] of Object.entries(files)) {
+    const file = join(root, rel);
+    await mkdir(dirname(file), { recursive: true });
+    await writeFile(file, content, "utf8");
+  }
+  return root;
+}
+
+afterEach(async () => {
+  __resolverTestHooks.forceRgUsable(null);
+  __resolverTestHooks.resetNodeGrepTreeWalks();
+  await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
 
 describe("isGenericClass — Tailwind 汎用クラスの除外", () => {
   it("flags common Tailwind utilities as generic", () => {
@@ -191,5 +215,122 @@ describe("splitWords — CJK は短くても残す", () => {
 
   it("returns empty array for empty input", () => {
     expect(splitWords("")).toEqual([]);
+  });
+});
+
+describe("resolveSource Layer-B integration", () => {
+  it("locates a source line by textSnippet when source is omitted", async () => {
+    const root = await fixture({
+      "src/TextHit.tsx": [
+        "export function TextHit() {",
+        "  return <button>Launch Control Panel</button>;",
+        "}",
+      ].join("\n"),
+      "src/Other.tsx": [
+        "export function Other() {",
+        "  return <button>Settings</button>;",
+        "}",
+      ].join("\n"),
+    });
+
+    const result = await resolveSource(
+      root,
+      mkD({ textSnippet: "Launch Control Panel" })
+    );
+
+    expect(result.file).toBe(join(root, "src/TextHit.tsx"));
+    expect(result.line).toBe(2);
+  });
+
+  it("locates a source line by id when source is omitted", async () => {
+    const root = await fixture({
+      "src/IdHit.tsx": [
+        "export function IdHit() {",
+        '  return <button id="billing-submit">Pay now</button>;',
+        "}",
+      ].join("\n"),
+      "src/Other.tsx": [
+        "export function Other() {",
+        '  return <button id="billing-cancel">Cancel</button>;',
+        "}",
+      ].join("\n"),
+    });
+
+    const result = await resolveSource(root, mkD({ id: "billing-submit" }));
+
+    expect(result.file).toBe(join(root, "src/IdHit.tsx"));
+    expect(result.line).toBe(2);
+  });
+
+  it("locates a source line by a specific class when source is omitted", async () => {
+    const root = await fixture({
+      "src/ClassHit.tsx": [
+        "export function ClassHit() {",
+        '  return <section className="ProductHeroCta px-4">Buy</section>;',
+        "}",
+      ].join("\n"),
+      "src/Other.tsx": [
+        "export function Other() {",
+        '  return <section className="ProductHeroShell px-4">Read</section>;',
+        "}",
+      ].join("\n"),
+    });
+
+    const result = await resolveSource(root, mkD({ tag: "section", classes: ["ProductHeroCta"] }));
+
+    expect(result.file).toBe(join(root, "src/ClassHit.tsx"));
+    expect(result.line).toBe(2);
+  });
+
+  it("locates a source line for a dash-leading class term", async () => {
+    const root = await fixture({
+      "src/DashHit.tsx": [
+        "export function DashHit() {",
+        '  return <div className="-mt-4">Discount</div>;',
+        "}",
+      ].join("\n"),
+    });
+
+    const result = await resolveSource(root, mkD({ tag: "div", classes: ["-mt-4"] }));
+
+    expect(result.file).toBe(join(root, "src/DashHit.tsx"));
+    expect(result.line).toBe(2);
+  });
+
+  it("uses one project walk in the no-ripgrep path while preserving aggregate matches", async () => {
+    const root = await fixture({
+      "Fixture.tsx": [
+        "export function Fixture() {",
+        '  return <button id="save-order" className="CheckoutSaveCta">Save order</button>;',
+        '  return <button className="CheckoutSaveCta">Secondary</button>;',
+        "}",
+      ].join("\n"),
+    });
+    __resolverTestHooks.forceRgUsable(false);
+
+    const { candidates, termHits } = await __resolverTestHooks.collectCandidates(
+      root,
+      mkD({
+        textSnippet: "Save order",
+        id: "save-order",
+        classes: ["CheckoutSaveCta"],
+      })
+    );
+
+    expect(__resolverTestHooks.getNodeGrepTreeWalks()).toBe(1);
+    expect(termHits.get("Save order")).toBe(1);
+    expect(termHits.get("save-order")).toBe(1);
+    expect(termHits.get("CheckoutSaveCta")).toBe(2);
+    expect(candidates[0]?.file).toBe(join(root, "Fixture.tsx"));
+    expect(candidates[0]?.line).toBe(2);
+    expect(candidates[0]?.matched.map((m) => [m.term, m.kind, m.hits])).toEqual([
+      ["Save order", "textFull", 1],
+      ["save-order", "id", 1],
+      ["CheckoutSaveCta", "classSpecific", 2],
+    ]);
+    expect(candidates[1]?.line).toBe(3);
+    expect(candidates[1]?.matched.map((m) => [m.term, m.kind, m.hits])).toEqual([
+      ["CheckoutSaveCta", "classSpecific", 2],
+    ]);
   });
 });

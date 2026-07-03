@@ -19,6 +19,7 @@ interface Session {
   root: string;
   framework: string;
   runCommand: string;
+  overrideCommand: string | null;
   /** before 配信ディレクトリ(worktree/snapshot/none) */
   before: BeforeHandle | null;
   /** 編集前スナップショット配信 dev server */
@@ -70,6 +71,7 @@ async function _openProject(
     root,
     framework: plan.framework,
     runCommand: `${plan.command} ${plan.args.join(" ")}`,
+    overrideCommand: override?.command ?? null,
     before: null,
     targetBefore: null,
     targetAfter: null,
@@ -113,15 +115,17 @@ async function _startProject(): Promise<ProjectInfo> {
   // --- after (実作業ツリー) 起動 ---
   const afterPort = await findFreePort(5180);
   const targetAfter = await startTarget(session.root, afterPort, {
-    command: undefined,
+    command: session.overrideCommand ?? undefined,
     framework: session.framework,
   });
   session.targetAfter = targetAfter;
   session.target = targetAfter; // legacy alias
   session.framework = targetAfter.plan.framework;
-  session.runCommand = `${targetAfter.plan.command} ${targetAfter.plan.args.join(
-    " "
-  )}`;
+  if (!session.overrideCommand) {
+    session.runCommand = `${targetAfter.plan.command} ${targetAfter.plan.args.join(
+      " "
+    )}`;
+  }
 
   // --- before (HEAD/snapshot) 起動 ---
   // none モードでは before=after 同一ディレクトリなので別プロセスは起動せず、
@@ -132,7 +136,7 @@ async function _startProject(): Promise<ProjectInfo> {
     try {
       const beforePort = await findFreePort(5190);
       session.targetBefore = await startTarget(beforeDir, beforePort, {
-        command: undefined,
+        command: session.overrideCommand ?? undefined,
         framework: session.framework,
       });
     } catch (e) {
@@ -244,6 +248,15 @@ export function getInfo(): ProjectInfo | null {
 
 export function getRoot(): string | null {
   return session?.root ?? null;
+}
+
+export function getBefore(): { dir: string; root: string; mode: string } | null {
+  if (!session?.before) return null;
+  return {
+    dir: session.before.dir,
+    root: session.before.root,
+    mode: session.before.mode,
+  };
 }
 
 export function openProject(

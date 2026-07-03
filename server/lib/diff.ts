@@ -158,12 +158,21 @@ export function createUnifiedDiff(
     if (t === "context" || t === "remove") oldLastIdx = k;
     if (t === "context" || t === "add") newLastIdx = k;
   }
+  const finalContextNewlineChanged =
+    oldNoNL !== newNoNL &&
+    oldLastIdx === newLastIdx &&
+    oldLastIdx >= 0 &&
+    dlines[oldLastIdx].type === "context";
 
   // 変更行のインデックスを収集
   const changeIdx: number[] = [];
   dlines.forEach((l, idx) => {
     if (l.type !== "context") changeIdx.push(idx);
   });
+  if (finalContextNewlineChanged) {
+    changeIdx.push(oldLastIdx);
+    changeIdx.sort((a, b) => a - b);
+  }
 
   // 隣接 hunk のマージ (間隔 <= 2*context+1 なら同一 hunk)
   const hunks: number[][] = [];
@@ -199,11 +208,24 @@ export function createUnifiedDiff(
     for (let k = start; k <= end; k++) {
       const l = dlines[k];
       if (l.type === "context") {
-        body.push(" " + l.text);
-        oldCount++;
-        newCount++;
-        if (k === oldLastIdx && k === newLastIdx && oldNoNL && newNoNL) {
-          body.push("\\ No newline at end of file");
+        if (finalContextNewlineChanged && k === oldLastIdx) {
+          body.push("-" + l.text);
+          oldCount++;
+          if (oldNoNL) {
+            body.push("\\ No newline at end of file");
+          }
+          body.push("+" + l.text);
+          newCount++;
+          if (newNoNL) {
+            body.push("\\ No newline at end of file");
+          }
+        } else {
+          body.push(" " + l.text);
+          oldCount++;
+          newCount++;
+          if (k === oldLastIdx && k === newLastIdx && oldNoNL && newNoNL) {
+            body.push("\\ No newline at end of file");
+          }
         }
       } else if (l.type === "remove") {
         body.push("-" + l.text);
