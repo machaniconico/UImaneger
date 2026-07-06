@@ -39,6 +39,28 @@ describe("stripCodeFence", () => {
     expect(out.startsWith("```")).toBe(false);
   });
 
+  it("preserves tail content after a nested fence near the bottom of a large fenced response", () => {
+    const lines = Array.from({ length: 1000 }, (_, i) => `line ${i + 1}`);
+    lines.splice(
+      949,
+      0,
+      "const script = `",
+      "```bash",
+      "npm run build",
+      "```",
+      "`;",
+      "const finalSentinel = 'tail must remain';"
+    );
+    const inner = lines.join("\n");
+    const nested = ["```tsx", inner, "```"].join("\n");
+
+    const out = stripCodeFence(nested);
+
+    expect(out).toBe(inner);
+    expect(out).toContain("const finalSentinel = 'tail must remain';");
+    expect(out).toContain("line 1000");
+  });
+
   it("returns clean code (never fence markers) for a long preamble + short code block", () => {
     const input =
       "Sure! ".repeat(45) +

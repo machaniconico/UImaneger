@@ -347,6 +347,68 @@ describe("resolveSource Layer-B integration", () => {
     expect(result.line).toBe(2);
   });
 
+  it("prefers authoring files for cross-file top-score ties and exposes low confidence", async () => {
+    const run = async () => {
+      const root = await fixture({
+        "src/TieTarget.tsx": [
+          "export function TieTarget() {",
+          "  return <button>TieBreakerTarget</button>;",
+          "}",
+        ].join("\n"),
+        "src/styles.css": "/* TieBreakerTarget */",
+      });
+
+      const result = await resolveSource(root, mkD({ textSnippet: "TieBreakerTarget" }));
+
+      expect(result.file).toBe(join(root, "src/TieTarget.tsx"));
+      expect(result.line).toBe(2);
+      expect(result.confidence).toBe("low");
+    };
+
+    await run();
+    __resolverTestHooks.forceRgUsable(false);
+    await run();
+  });
+
+  it("keeps a single rare hit in a non-authoring file at medium confidence", async () => {
+    const root = await fixture({
+      "src/messages.json": '{ "cta": "OnlyInLocaleBundle" }',
+    });
+
+    const result = await resolveSource(
+      root,
+      mkD({ textSnippet: "OnlyInLocaleBundle" })
+    );
+
+    expect(result.file).toBe(join(root, "src/messages.json"));
+    expect(result.confidence).toBe("medium");
+  });
+
+  it("downgrades an out-of-range layer-A source line and verifies through candidates", async () => {
+    const root = await fixture({
+      "src/SourceDrift.tsx": [
+        "export function SourceDrift() {",
+        "  return <button>Current Source Target</button>;",
+        "}",
+      ].join("\n"),
+    });
+
+    const result = await resolveSource(
+      root,
+      mkD({
+        textSnippet: "Current Source Target",
+        source: {
+          fileName: join(root, "src/SourceDrift.tsx"),
+          lineNumber: 99,
+        },
+      })
+    );
+
+    expect(result.file).toBe(join(root, "src/SourceDrift.tsx"));
+    expect(result.line).toBe(2);
+    expect(result.confidence).toBe("medium");
+  });
+
   it("does not accept a source without lineNumber as high-confidence", async () => {
     const root = await fixture({
       "src/SourceOnly.tsx": [

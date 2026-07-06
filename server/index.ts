@@ -1,6 +1,8 @@
 import { serve } from "@hono/node-server";
+import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { logger } from "hono/logger";
+import { existsSync } from "node:fs";
 import { env } from "./lib/env.ts";
 import { api } from "./routes/api.ts";
 import { stopProject } from "./lib/state.ts";
@@ -15,9 +17,21 @@ app.use("/api/*", logger());
 app.use("/api/*", securityMiddleware);
 app.route("/api", api);
 
+if (process.env.NODE_ENV === "production" && existsSync("dist")) {
+  const staticFiles = serveStatic({ root: "./dist" });
+  app.use("*", async (c, next) => {
+    const path = c.req.path;
+    if (path === "/api" || path.startsWith("/api/")) {
+      return next();
+    }
+    return staticFiles(c, next);
+  });
+}
+
 sweepStaleBeforeDirs();
 
-const bindHost = process.env.UIM_HOST ?? "127.0.0.1";
+const rawHost = process.env.UIM_HOST?.trim();
+const bindHost = rawHost ? rawHost : "127.0.0.1";
 const server = serve(
   { fetch: app.fetch, hostname: bindHost, port: env.serverPort },
   (info) => {
