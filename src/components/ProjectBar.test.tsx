@@ -63,6 +63,21 @@ describe("ProjectBar.stop()", () => {
     ).not.toBeNull();
   });
 
+  it("要素選択トグルの押下状態を aria-pressed で伝える", () => {
+    setup();
+
+    expect(
+      screen.getByRole("button", { name: "要素を選択" }).getAttribute("aria-pressed")
+    ).toBe("false");
+
+    cleanup();
+    setup({ selectMode: true });
+
+    expect(
+      screen.getByRole("button", { name: "選択中…" }).getAttribute("aria-pressed")
+    ).toBe("true");
+  });
+
   it("停止成功時: onInfo が呼ばれ onError がクリアされ busy が解除される", async () => {
     const user = userEvent.setup();
     vi.mocked(api.stop).mockResolvedValue({ info: null });

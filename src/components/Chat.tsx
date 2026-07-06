@@ -17,7 +17,6 @@ interface Msg {
 interface Props {
   selected: DomDescriptor | null;
   hasKey: boolean;
-  initialUndoDepth?: number;
 }
 
 function descriptorLabel(d: DomDescriptor) {
@@ -34,15 +33,14 @@ function sameDescriptor(a: DomDescriptor, b: DomDescriptor) {
   );
 }
 
-export function Chat({ selected, hasKey, initialUndoDepth }: Props) {
+export function Chat({ selected, hasKey }: Props) {
   const [instruction, setInstruction] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [busy, setBusy] = useState(false);
   const [proposal, setProposal] = useState<EditProposal | null>(null);
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [lastInstruction, setLastInstruction] = useState("");
-  const [undoDepth, setUndoDepth] = useState(initialUndoDepth ?? 0);
-  const undoDepthSeededRef = useRef(initialUndoDepth != null);
+  const [undoDepth, setUndoDepth] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
   // 提案/候補を生成した時点の要素を固定保持 (その後 selected が変わっても誤マッチを防ぐ)
   const [editDescriptor, setEditDescriptor] = useState<DomDescriptor | null>(
@@ -63,11 +61,19 @@ export function Chat({ selected, hasKey, initialUndoDepth }: Props) {
   }, [msgs, busy, proposal, candidates]);
 
   useEffect(() => {
-    if (!undoDepthSeededRef.current && initialUndoDepth != null) {
-      setUndoDepth(initialUndoDepth);
-      undoDepthSeededRef.current = true;
-    }
-  }, [initialUndoDepth]);
+    let alive = true;
+    api
+      .status()
+      .then((s) => {
+        if (alive) setUndoDepth(s.undoDepth ?? 0);
+      })
+      .catch(() => {
+        if (alive) setUndoDepth(0);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   function log(m: Msg) {
     setMsgs((prev) => [...prev, m]);
@@ -182,7 +188,7 @@ export function Chat({ selected, hasKey, initialUndoDepth }: Props) {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
       }
     } catch (e: any) {
-      if (String(e?.message || e).startsWith("HTTP 404")) setUndoDepth(0);
+      setUndoDepth(0);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setBusy(false);

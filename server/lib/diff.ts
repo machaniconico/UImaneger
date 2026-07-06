@@ -208,24 +208,28 @@ export function createUnifiedDiff(
     for (let k = start; k <= end; k++) {
       const l = dlines[k];
       if (l.type === "context") {
-        if (finalContextNewlineChanged && k === oldLastIdx) {
+        const oldContextNoNL = k === oldLastIdx && oldNoNL;
+        const newContextNoNL = k === newLastIdx && newNoNL;
+        if (oldContextNoNL && newContextNoNL) {
+          body.push(" " + l.text);
+          oldCount++;
+          newCount++;
+          body.push("\\ No newline at end of file");
+        } else if (oldContextNoNL || newContextNoNL) {
           body.push("-" + l.text);
           oldCount++;
-          if (oldNoNL) {
+          if (oldContextNoNL) {
             body.push("\\ No newline at end of file");
           }
           body.push("+" + l.text);
           newCount++;
-          if (newNoNL) {
+          if (newContextNoNL) {
             body.push("\\ No newline at end of file");
           }
         } else {
           body.push(" " + l.text);
           oldCount++;
           newCount++;
-          if (k === oldLastIdx && k === newLastIdx && oldNoNL && newNoNL) {
-            body.push("\\ No newline at end of file");
-          }
         }
       } else if (l.type === "remove") {
         body.push("-" + l.text);

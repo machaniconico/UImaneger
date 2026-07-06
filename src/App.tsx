@@ -15,9 +15,6 @@ export function App() {
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<DomDescriptor | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
-  const [initialUndoDepth, setInitialUndoDepth] = useState<number | undefined>(
-    undefined
-  );
 
   useEffect(() => {
     api
@@ -25,7 +22,6 @@ export function App() {
       .then((s) => {
         setInfo(s.info);
         setHasKey(s.hasKey);
-        setInitialUndoDepth(s.undoDepth);
       })
       .catch((e: any) => {
         setError(String(e?.message || e));
@@ -73,7 +69,6 @@ export function App() {
             key={info?.root ?? "none"}
             selected={selected}
             hasKey={hasKey}
-            initialUndoDepth={initialUndoDepth}
           />
         </div>
         <StatusPanel />

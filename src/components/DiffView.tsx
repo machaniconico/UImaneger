@@ -68,12 +68,14 @@ export function DiffView({
           )}
           <button
             type="button"
-            aria-label="diff をコピー"
             onClick={copyDiff}
             className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700"
           >
             {copied ? "コピー済" : "コピー"}
           </button>
+          <span aria-live="polite" className="sr-only">
+            {copied ? "コピーしました" : ""}
+          </span>
         </div>
       </div>
 

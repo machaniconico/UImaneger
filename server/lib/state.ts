@@ -185,15 +185,25 @@ async function _stopProject(): Promise<void> {
   if (!session) return;
 
   // before プロキシ停止 (after と別物のみ)
-  if (session.proxyBefore) {
-    await session.proxyBefore.close().catch(() => {});
+  const proxyBefore = session.proxyBefore;
+  if (proxyBefore) {
     session.proxyBefore = null;
+    if (session.proxyAfter === proxyBefore) session.proxyAfter = null;
+    if (session.proxy === proxyBefore) session.proxy = null;
+    await proxyBefore.close().catch(() => {});
   }
   // after プロキシ停止
-  if (session.proxyAfter) {
-    await session.proxyAfter.close().catch(() => {});
+  const proxyAfter = session.proxyAfter;
+  if (proxyAfter) {
     session.proxyAfter = null;
+    if (session.proxy === proxyAfter) session.proxy = null;
+    await proxyAfter.close().catch(() => {});
+  }
+  // legacy alias が after と別物として残っている場合も先に切り離してから閉じる。
+  const proxy = session.proxy;
+  if (proxy) {
     session.proxy = null;
+    await proxy.close().catch(() => {});
   }
 
   // before ターゲット停止 (none モード時は after と同一オブジェクトなので after 側で停止)

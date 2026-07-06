@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -10,7 +11,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { api, __stores } from "./api.ts";
+import {
+  api,
+  __stores,
+  isSafeGitRepoUrl,
+  isTrustedRunCommandHost,
+} from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
 import type { DomDescriptor } from "../lib/types.ts";
@@ -29,6 +35,15 @@ const claudeMock = vi.hoisted(() => {
   };
 });
 
+const fsPromisesMock = vi.hoisted(() => ({
+  actual: null as any,
+  readFile: vi.fn(),
+  writeFile: vi.fn(),
+  mkdir: vi.fn(),
+  rename: vi.fn(),
+  unlink: vi.fn(),
+}));
+
 vi.mock("../lib/claude.ts", () => ({
   complete: claudeMock.complete,
   hasKey: () => true,
@@ -39,6 +54,34 @@ vi.mock("../lib/claude.ts", () => ({
   },
   TruncatedError: claudeMock.TruncatedError,
 }));
+
+vi.mock("node:fs/promises", async () => {
+  const actual = await vi.importActual<any>("node:fs/promises");
+  fsPromisesMock.actual = actual;
+  fsPromisesMock.readFile.mockImplementation((...args: any[]) =>
+    actual.readFile(...args)
+  );
+  fsPromisesMock.writeFile.mockImplementation((...args: any[]) =>
+    actual.writeFile(...args)
+  );
+  fsPromisesMock.mkdir.mockImplementation((...args: any[]) =>
+    actual.mkdir(...args)
+  );
+  fsPromisesMock.rename.mockImplementation((...args: any[]) =>
+    actual.rename(...args)
+  );
+  fsPromisesMock.unlink.mockImplementation((...args: any[]) =>
+    actual.unlink(...args)
+  );
+  return {
+    ...actual,
+    readFile: fsPromisesMock.readFile,
+    writeFile: fsPromisesMock.writeFile,
+    mkdir: fsPromisesMock.mkdir,
+    rename: fsPromisesMock.rename,
+    unlink: fsPromisesMock.unlink,
+  };
+});
 
 const app = new Hono();
 app.route("/api", api);
@@ -103,11 +146,12 @@ function descriptorFor(fileName: string): DomDescriptor {
 
 async function postJson<T = Record<string, unknown>>(
   path: string,
-  body: unknown
+  body: unknown,
+  headers: Record<string, string> = {}
 ): Promise<JsonResponse<T>> {
   const res = await app.request(path, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
   return {
@@ -138,10 +182,44 @@ async function requestProposal(proposed = editedContent): Promise<ProposalBody> 
   return body;
 }
 
+function resetFsPromiseMocks(): void {
+  const actual = fsPromisesMock.actual;
+  fsPromisesMock.readFile.mockReset();
+  fsPromisesMock.writeFile.mockReset();
+  fsPromisesMock.mkdir.mockReset();
+  fsPromisesMock.rename.mockReset();
+  fsPromisesMock.unlink.mockReset();
+  fsPromisesMock.readFile.mockImplementation((...args: any[]) =>
+    actual.readFile(...args)
+  );
+  fsPromisesMock.writeFile.mockImplementation((...args: any[]) =>
+    actual.writeFile(...args)
+  );
+  fsPromisesMock.mkdir.mockImplementation((...args: any[]) =>
+    actual.mkdir(...args)
+  );
+  fsPromisesMock.rename.mockImplementation((...args: any[]) =>
+    actual.rename(...args)
+  );
+  fsPromisesMock.unlink.mockImplementation((...args: any[]) =>
+    actual.unlink(...args)
+  );
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 beforeEach(async () => {
+  resetFsPromiseMocks();
   claudeMock.complete.mockReset();
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
+  __stores.inFlight.clear();
 
   root = mkdtempSync(join(tmpdir(), "uim-api-"));
   mkdirSync(join(root, "src"), { recursive: true });
@@ -154,8 +232,78 @@ beforeEach(async () => {
 afterEach(async () => {
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
+  __stores.inFlight.clear();
+  resetFsPromiseMocks();
   await stopProject();
   rmSync(root, { recursive: true, force: true });
+});
+
+describe("project security helpers", () => {
+  it("accepts only safe git clone URL formats", () => {
+    expect(isSafeGitRepoUrl("https://github.com/example/repo.git")).toBe(true);
+    expect(isSafeGitRepoUrl("ssh://git@github.com/example/repo.git")).toBe(true);
+    expect(isSafeGitRepoUrl("git://github.com/example/repo.git")).toBe(true);
+    expect(isSafeGitRepoUrl("git@github.com:example/repo.git")).toBe(true);
+
+    expect(isSafeGitRepoUrl("ext::sh -c id")).toBe(false);
+    expect(isSafeGitRepoUrl("file:///tmp/repo")).toBe(false);
+    expect(isSafeGitRepoUrl("file::/tmp/repo")).toBe(false);
+    expect(isSafeGitRepoUrl("-c protocol.ext.allow=always")).toBe(false);
+    expect(isSafeGitRepoUrl("")).toBe(false);
+  });
+
+  it("accepts runCommand only from local Host values", () => {
+    expect(isTrustedRunCommandHost("localhost")).toBe(true);
+    expect(isTrustedRunCommandHost("localhost:5173")).toBe(true);
+    expect(isTrustedRunCommandHost("127.0.0.1:8787")).toBe(true);
+    expect(isTrustedRunCommandHost("app.localhost:8787")).toBe(true);
+
+    expect(isTrustedRunCommandHost(undefined)).toBe(false);
+    expect(isTrustedRunCommandHost("")).toBe(false);
+    expect(isTrustedRunCommandHost("example.com")).toBe(false);
+    expect(isTrustedRunCommandHost("localhost.example.com")).toBe(false);
+  });
+
+  it("rejects unsafe clone URLs before invoking git", async () => {
+    const result = await postJson<{ error: string }>("/api/project/clone", {
+      repo: "ext::sh -c id",
+    });
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe("対応していないリポジトリURL形式です");
+  });
+
+  it("rejects runCommand when Host is not local", async () => {
+    const result = await postJson<{ error: string }>(
+      "/api/project/open",
+      {
+        path: root,
+        runCommand: "sh -c id",
+      },
+      { host: "example.com" }
+    );
+
+    expect(result.res.status).toBe(403);
+    expect(result.body.error).toBe(
+      "runCommand の実行にはローカルからのアクセスが必要です"
+    );
+  });
+
+  it("rejects clone runCommand when Host is not local", async () => {
+    const result = await postJson<{ error: string }>(
+      "/api/project/clone",
+      {
+        repo: "https://github.com/example/repo.git",
+        runCommand: "sh -c id",
+      },
+      { host: "example.com" }
+    );
+
+    expect(result.res.status).toBe(403);
+    expect(result.body.error).toBe(
+      "runCommand の実行にはローカルからのアクセスが必要です"
+    );
+  });
 });
 
 describe("edit proposal API", () => {
@@ -174,6 +322,43 @@ describe("edit proposal API", () => {
     expect(proposal.diff).toContain("+++ b/src/App.tsx");
     expect(proposal.diff).toContain("@@");
     expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("creates a proposal from an explicit candidate file", async () => {
+    claudeMock.complete.mockResolvedValueOnce(editedContent);
+
+    const { res, body } = await postJson<ProposalBody>("/api/edit/candidate", {
+      file: filePath,
+      line: 8,
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+
+    expect(res.status).toBe(200);
+    expect(body).toMatchObject({
+      ok: true,
+      file: filePath,
+      relFile: "src/App.tsx",
+      line: 8,
+      confidence: "medium",
+    });
+    expect(body.diff).toContain("Saved successfully");
+    expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("rejects candidate files outside the project root", async () => {
+    const { res, body } = await postJson<{ error: string }>(
+      "/api/edit/candidate",
+      {
+        file: join(root, "..", "outside.tsx"),
+        descriptor: descriptorFor(filePath),
+        instruction: "Change the button label.",
+      }
+    );
+
+    expect(res.status).toBe(403);
+    expect(body.error).toContain("範囲外");
+    expect(claudeMock.complete).not.toHaveBeenCalled();
   });
 
   it("remaps before-preview source paths back to the real project root", async () => {
@@ -216,6 +401,62 @@ describe("edit proposal API", () => {
     expect(readFileSync(filePath, "utf8")).toBe(editedContent);
   });
 
+  it("refuses to apply while the same proposal is already in flight", async () => {
+    const proposal = await requestProposal();
+    __stores.inFlight.add(proposal.proposalId);
+
+    const { res, body } = await postJson<{ error: string }>(
+      "/api/edit/apply",
+      { proposalId: proposal.proposalId }
+    );
+
+    expect(res.status).toBe(409);
+    expect(body.error).toBe("この提案は現在処理中です。");
+    expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("aborts apply when the project changes after reading the file", async () => {
+    const proposal = await requestProposal();
+    const actualReadFile = fsPromisesMock.actual.readFile;
+    const readStarted = deferred();
+    const releaseRead = deferred();
+    let delayed = false;
+    fsPromisesMock.readFile.mockImplementation(async (...args: any[]) => {
+      if (!delayed && String(args[0]) === filePath) {
+        delayed = true;
+        const result = await actualReadFile(...args);
+        readStarted.resolve();
+        await releaseRead.promise;
+        return result;
+      }
+      return actualReadFile(...args);
+    });
+
+    const oldRoot = root;
+    const oldFilePath = filePath;
+    const applyPromise = postJson<{ error: string }>("/api/edit/apply", {
+      proposalId: proposal.proposalId,
+    });
+    await readStarted.promise;
+
+    const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-race-"));
+    mkdirSync(join(nextRoot, "src"), { recursive: true });
+    writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+    await openProject(nextRoot, { command: "echo test-server-ready" });
+    root = nextRoot;
+    filePath = join(nextRoot, "src", "App.tsx");
+
+    releaseRead.resolve();
+    const result = await applyPromise;
+
+    expect(result.res.status).toBe(409);
+    expect(result.body.error).toBe(
+      "プロジェクトが切り替わったため中断しました"
+    );
+    expect(readFileSync(oldFilePath, "utf8")).toBe(originalContent);
+    rmSync(oldRoot, { recursive: true, force: true });
+  });
+
   it("reports undoDepth through apply, status, and undo", async () => {
     const proposal = await requestProposal();
 
@@ -254,6 +495,64 @@ describe("edit proposal API", () => {
     expect(res.status).toBe(200);
     expect(body).toMatchObject({ ok: true, relFile: "src/App.tsx" });
     expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("refuses to undo while the same proposal is already in flight", async () => {
+    const proposal = await requestProposal();
+    await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    __stores.inFlight.add(proposal.proposalId);
+
+    const { res, body } = await postJson<{ error: string }>(
+      "/api/edit/undo",
+      {}
+    );
+
+    expect(res.status).toBe(409);
+    expect(body.error).toBe("この提案は現在処理中です。");
+    expect(__stores.undoStack).toHaveLength(1);
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+  });
+
+  it("aborts undo when the project changes after reading the file", async () => {
+    const proposal = await requestProposal();
+    await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    const actualReadFile = fsPromisesMock.actual.readFile;
+    const readStarted = deferred();
+    const releaseRead = deferred();
+    let delayed = false;
+    fsPromisesMock.readFile.mockImplementation(async (...args: any[]) => {
+      if (!delayed && String(args[0]) === filePath) {
+        delayed = true;
+        const result = await actualReadFile(...args);
+        readStarted.resolve();
+        await releaseRead.promise;
+        return result;
+      }
+      return actualReadFile(...args);
+    });
+
+    const oldRoot = root;
+    const oldFilePath = filePath;
+    const undoPromise = postJson<{ error: string }>("/api/edit/undo", {});
+    await readStarted.promise;
+
+    const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-undo-race-"));
+    mkdirSync(join(nextRoot, "src"), { recursive: true });
+    writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+    await openProject(nextRoot, { command: "echo test-server-ready" });
+    root = nextRoot;
+    filePath = join(nextRoot, "src", "App.tsx");
+
+    releaseRead.resolve();
+    const result = await undoPromise;
+
+    expect(result.res.status).toBe(409);
+    expect(result.body.error).toBe(
+      "プロジェクトが切り替わったため中断しました"
+    );
+    expect(__stores.undoStack).toHaveLength(1);
+    expect(readFileSync(oldFilePath, "utf8")).toBe(editedContent);
+    rmSync(oldRoot, { recursive: true, force: true });
   });
 
   it("refuses undo when the file changed after apply and keeps the undo entry", async () => {
@@ -447,6 +746,37 @@ describe("edit proposal API", () => {
     );
     expect(read.res.status).toBe(200);
     expect(read.body.content).toBe("inside");
+  });
+
+  it("keeps the original file when atomic file replacement fails", async () => {
+    const target = join(root, "src", "atomic-write.txt");
+    writeFileSync(target, "original", "utf8");
+    const actualRename = fsPromisesMock.actual.rename;
+    const actualUnlink = fsPromisesMock.actual.unlink;
+    const unlinked: string[] = [];
+    fsPromisesMock.rename.mockImplementation(async (...args: any[]) => {
+      if (String(args[1]) === target) throw new Error("rename failed");
+      return actualRename(...args);
+    });
+    fsPromisesMock.unlink.mockImplementation(async (...args: any[]) => {
+      unlinked.push(String(args[0]));
+      return actualUnlink(...args);
+    });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await postJson<{ error: string }>("/api/files/write", {
+        path: target,
+        content: "changed",
+      });
+
+      expect(result.res.status).toBe(500);
+      expect(result.body.error).toContain("rename failed");
+      expect(readFileSync(target, "utf8")).toBe("original");
+      expect(unlinked).toHaveLength(1);
+      expect(existsSync(unlinked[0])).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("does not store a proposal when Claude returns a truncated response", async () => {

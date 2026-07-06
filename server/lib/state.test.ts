@@ -82,6 +82,14 @@ function makeFakeProc(): FakeProc {
   return { proc: proc as unknown as ChildProcess, killed: false };
 }
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 const startTargetMock = vi.mocked(startTarget);
 const startProxyMock = vi.mocked(startProxy);
 const findFreePortMock = vi.mocked(findFreePort);
@@ -118,6 +126,12 @@ beforeEach(() => {
     throw new Error("mocked ESRCH");
   });
 
+  findFreePortMock.mockReset();
+  prepareBeforeMock.mockReset();
+  cleanupBeforeMock.mockReset();
+  startTargetMock.mockReset();
+  startProxyMock.mockReset();
+
   findFreePortMock.mockImplementation(async (start: number) => {
     portCounter.p += 1;
     return start;
@@ -129,8 +143,6 @@ beforeEach(() => {
     worktreeAdded: false,
   });
   cleanupBeforeMock.mockImplementation(() => {});
-  startTargetMock.mockReset();
-  startProxyMock.mockReset();
 });
 
 afterEach(async () => {
@@ -167,6 +179,49 @@ describe("S3 — ライフサイクル直列化 (promise-chain mutex)", () => {
     expect(getRoot()).toBe(root);
     expect(info.beforeError).toBeNull();
     expect(startTargetMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("起動後段で失敗した場合は開始済み target と before を後始末する", async () => {
+    startProxyMock.mockRejectedValueOnce(new Error("boom: proxy"));
+
+    await expect(openAndStart(root)).rejects.toThrow("boom: proxy");
+
+    expect(startTargetMock).toHaveBeenCalledTimes(1);
+    for (const f of createdProcs) expect(f.proc.exitCode).not.toBeNull();
+    expect(cleanupBeforeMock).toHaveBeenCalledTimes(1);
+    expect(getInfo()?.running).toBe(false);
+    expect(getInfo()?.proxyPort).toBeNull();
+  });
+
+  it("proxy close の完了待ち前に session の proxy 参照を外す", async () => {
+    const closeStarted = deferred();
+    const releaseClose = deferred();
+    const seenDuringClose: Array<ReturnType<typeof getInfo>> = [];
+    let closeCount = 0;
+    startProxyMock.mockImplementation(async (_tp: number, pp: number) => {
+      return {
+        server: {},
+        port: pp,
+        close: async () => {
+          closeCount += 1;
+          seenDuringClose.push(getInfo());
+          if (closeCount === 1) closeStarted.resolve();
+          await releaseClose.promise;
+        },
+      } as any;
+    });
+
+    await openAndStart(root);
+    const stopPromise = stopProject();
+    await closeStarted.promise;
+
+    expect(seenDuringClose[0]?.beforeProxyPort).toBeNull();
+    expect(seenDuringClose[0]?.afterProxyPort).not.toBeNull();
+
+    releaseClose.resolve();
+    await stopPromise;
+    expect(getInfo()?.beforeProxyPort).toBeNull();
+    expect(getInfo()?.afterProxyPort).toBeNull();
   });
 
   it("2並行 startProject は直列化され target/proxy は単一セット(2本目は短絡)", async () => {

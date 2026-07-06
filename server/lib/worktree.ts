@@ -18,9 +18,11 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   readdirSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, relative } from "node:path";
@@ -53,6 +55,7 @@ const SKIP_DIRS = new Set([
 ]);
 
 const liveBeforeHandles = new Set<BeforeHandle>();
+const WORKTREE_SOURCE_MARKER = ".uim-worktree-source";
 
 function trackBefore(h: BeforeHandle): BeforeHandle {
   liveBeforeHandles.add(h);
@@ -77,6 +80,43 @@ function isGitRepo(root: string): boolean {
 
 function hasHead(root: string): boolean {
   return runGit(root, ["rev-parse", "--verify", "--quiet", "HEAD"]).ok;
+}
+
+function writeWorktreeSourceMarker(wtDir: string, sourceRoot: string): void {
+  try {
+    writeFileSync(join(wtDir, WORKTREE_SOURCE_MARKER), sourceRoot, "utf8");
+  } catch {
+    // sweep 用の補助情報なので失敗しても before 準備は継続する。
+  }
+}
+
+function readWorktreeSourceMarker(wtDir: string): string | null {
+  try {
+    const sourceRoot = readFileSync(
+      join(wtDir, WORKTREE_SOURCE_MARKER),
+      "utf8"
+    ).trim();
+    return sourceRoot ? resolve(sourceRoot) : null;
+  } catch {
+    return null;
+  }
+}
+
+function pidFromBeforeEntry(entry: string): number | null {
+  const m = entry.match(/^uim-(?:before|snap)-(\d+)-/);
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function isPidAlive(pid: number): boolean {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 /**
@@ -127,6 +167,7 @@ export function prepareBefore(root: string): BeforeHandle {
         const rel = relative(gitRoot, absRoot);
         const beforeDir =
           rel && !rel.startsWith("..") ? join(wtDir, rel) : wtDir;
+        writeWorktreeSourceMarker(wtDir, gitRoot);
         // 依存解決のため node_modules を symlink:
         //  - git ルート側 (モノレポ/hoisted 依存) を worktree ルートへ
         //  - 対象ディレクトリ固有の node_modules があれば before ディレクトリへ
@@ -228,8 +269,25 @@ export function sweepStaleBeforeDirs(): void {
   }
   for (const entry of entries) {
     if (!/^uim-(before|snap)-/.test(entry)) continue;
+    const pid = pidFromBeforeEntry(entry);
+    if (pid !== null && isPidAlive(pid)) continue;
+    const beforeDir = join(tmpdir(), entry);
+    const sourceRoot = readWorktreeSourceMarker(beforeDir);
+    if (sourceRoot) {
+      try {
+        const removed = runGit(sourceRoot, [
+          "worktree",
+          "remove",
+          "--force",
+          beforeDir,
+        ]);
+        if (!removed.ok) runGit(sourceRoot, ["worktree", "prune"]);
+      } catch {
+        // ベストエフォート
+      }
+    }
     try {
-      rmSync(join(tmpdir(), entry), { recursive: true, force: true });
+      rmSync(beforeDir, { recursive: true, force: true });
     } catch {
       // ベストエフォート
     }

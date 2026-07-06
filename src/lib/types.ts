@@ -21,9 +21,9 @@ export interface ProjectInfo {
   beforeProxyPort: number | null;
   /** 変更後(作業ツリー)を配信するプロキシポート */
   afterProxyPort: number | null;
-  targetPortBefore?: number | null;
-  targetPortAfter?: number | null;
-  gitMode?: GitMode;
+  targetPortBefore: number | null;
+  targetPortAfter: number | null;
+  gitMode: GitMode | null;
   beforeError?: string | null;
 }
 

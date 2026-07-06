@@ -602,10 +602,10 @@ async function collectCandidates(
   }
 
   // 第2パス: textSnippet 全文で 0 ヒット → 語分割で部分一致フォールバック
-  const didFullTextHit =
-    d.textSnippet && d.textSnippet.trim().length >= 4
-      ? (termHits.get(d.textSnippet.trim()) ?? 0) > 0
-      : true;
+  const trimmedSnippet = d.textSnippet?.trim() ?? "";
+  const didFullTextHit = isSearchableTerm(trimmedSnippet)
+    ? (termHits.get(trimmedSnippet) ?? 0) > 0
+    : false;
   if (!didFullTextHit && d.textSnippet) {
     const words = splitWords(d.textSnippet);
     for (const w of words) {
@@ -679,10 +679,10 @@ async function collectCandidatesWithNodeGrep(
     }
   }
 
-  const didFullTextHit =
-    d.textSnippet && d.textSnippet.trim().length >= 4
-      ? (termHits.get(d.textSnippet.trim()) ?? 0) > 0
-      : true;
+  const trimmedSnippet = d.textSnippet?.trim() ?? "";
+  const didFullTextHit = isSearchableTerm(trimmedSnippet)
+    ? (termHits.get(trimmedSnippet) ?? 0) > 0
+    : false;
   if (!didFullTextHit && d.textSnippet) {
     const words = splitWords(d.textSnippet);
     for (const w of words) {
