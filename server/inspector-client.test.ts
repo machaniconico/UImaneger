@@ -20,6 +20,8 @@ interface InspectorHelpers {
   safeProps: (props: unknown) => Record<string, unknown> | undefined;
   textWithBoundaries: (el: Element) => string;
   describe: (el: Element) => InspectorPayload;
+  isKeyboardCandidate: (el: Element) => boolean;
+  getKeyboardCandidates: () => Element[];
 }
 
 interface PostedMessage {
@@ -96,6 +98,42 @@ function loadInspector(referrer = "https://editor.example/projects/1"): {
       );
     },
   };
+}
+
+function stubVisibleRect(el: Element, index: number) {
+  const left = index * 120;
+  const top = index * 40;
+  Object.defineProperty(el, "getBoundingClientRect", {
+    configurable: true,
+    value: () =>
+      ({
+        x: left,
+        y: top,
+        left,
+        top,
+        right: left + 100,
+        bottom: top + 24,
+        width: 100,
+        height: 24,
+        toJSON: () => ({}),
+      }) as DOMRect,
+  });
+}
+
+function dispatchKey(
+  _win: Window,
+  doc: Document,
+  key: string,
+  init: KeyboardEventInit = {}
+) {
+  const event = new KeyboardEvent("keydown", {
+    key,
+    bubbles: true,
+    cancelable: true,
+    ...init,
+  });
+  doc.body.dispatchEvent(event);
+  return event;
 }
 
 describe("inspector-client helpers", () => {
@@ -221,5 +259,52 @@ describe("inspector-client helpers", () => {
         targetOrigin: "http://localhost:5173",
       },
     ]);
+  });
+
+  it("selects keyboard candidates when selection mode is enabled", () => {
+    const { doc, win, dispatchParentMessage, messages } = loadInspector();
+    doc.body.innerHTML = `
+      <button id="first">First</button>
+      <button id="second">Second</button>
+      <button id="third">Third</button>
+    `;
+    Array.from(doc.querySelectorAll("button")).forEach(stubVisibleRect);
+
+    dispatchParentMessage(
+      { type: "uim:setEnabled", value: true },
+      "http://localhost:5173"
+    );
+    messages.length = 0;
+
+    expect(dispatchKey(win, doc, "ArrowRight").defaultPrevented).toBe(true);
+    expect(dispatchKey(win, doc, "Tab").defaultPrevented).toBe(true);
+    expect(dispatchKey(win, doc, "Enter").defaultPrevented).toBe(true);
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].targetOrigin).toBe("http://localhost:5173");
+    expect(messages[0].message).toMatchObject({
+      type: "uim:select",
+      payload: {
+        tag: "button",
+        id: "second",
+        textSnippet: "Second",
+      },
+    });
+  });
+
+  it("leaves keyboard events alone when selection mode is disabled", () => {
+    const { doc, win, dispatchParentMessage, messages } = loadInspector();
+    doc.body.innerHTML = `
+      <button id="first">First</button>
+      <button id="second">Second</button>
+    `;
+    Array.from(doc.querySelectorAll("button")).forEach(stubVisibleRect);
+
+    dispatchParentMessage({ type: "uim:ping" }, "http://localhost:5173");
+    messages.length = 0;
+
+    expect(dispatchKey(win, doc, "ArrowRight").defaultPrevented).toBe(false);
+    expect(dispatchKey(win, doc, "Enter").defaultPrevented).toBe(false);
+    expect(messages).toEqual([]);
   });
 });

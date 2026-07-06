@@ -88,6 +88,10 @@ export function Chat({ selected, hasKey }: Props) {
     if (res.ok && res.proposalId && res.diff) {
       setProposal(res);
       setCandidates(res.candidates ?? []);
+      log({
+        role: "system",
+        text: "差分の準備ができました。承認または却下してください。",
+      });
     } else if (res.candidates && res.candidates.length) {
       setProposal(null);
       setCandidates(res.candidates);

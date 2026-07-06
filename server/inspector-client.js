@@ -342,6 +342,170 @@
     observeCurrent(el);
   }
 
+  function isFocusableElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.disabled) return false;
+    if (el.hasAttribute("tabindex")) {
+      var tabIndex = parseInt(el.getAttribute("tabindex") || "", 10);
+      return !isNaN(tabIndex) && tabIndex >= 0;
+    }
+    var tag = el.nodeName.toLowerCase();
+    if (tag === "a" || tag === "area") return !!el.getAttribute("href");
+    return (
+      tag === "button" ||
+      tag === "input" ||
+      tag === "select" ||
+      tag === "textarea" ||
+      tag === "summary" ||
+      tag === "iframe" ||
+      tag === "object" ||
+      tag === "embed" ||
+      tag === "video" ||
+      tag === "audio" ||
+      el.hasAttribute("contenteditable")
+    );
+  }
+
+  function hasVisibleBox(el) {
+    try {
+      var r = el.getBoundingClientRect();
+      if (r && r.width > 0 && r.height > 0) return true;
+      if (typeof el.getClientRects === "function" && el.getClientRects().length) {
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function isKeyboardCandidate(el) {
+    if (!el || el.nodeType !== 1 || el === overlay || !el.isConnected) return false;
+    var tag = el.nodeName.toLowerCase();
+    if (
+      tag === "script" ||
+      tag === "style" ||
+      tag === "link" ||
+      tag === "meta" ||
+      tag === "title" ||
+      tag === "noscript" ||
+      tag === "template"
+    ) {
+      return false;
+    }
+    if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+    try {
+      if (window.getComputedStyle) {
+        var style = window.getComputedStyle(el);
+        if (
+          style &&
+          (style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.visibility === "collapse")
+        ) {
+          return false;
+        }
+      }
+    } catch (e) {}
+    return hasVisibleBox(el) || isFocusableElement(el);
+  }
+
+  function getKeyboardCandidates() {
+    if (!document.body) return [];
+    var selector = [
+      "a[href]",
+      "button",
+      "input",
+      "select",
+      "textarea",
+      "summary",
+      "iframe",
+      "object",
+      "embed",
+      "video",
+      "audio",
+      "[tabindex]",
+      "[role]",
+      "[contenteditable]",
+      "[data-testid]",
+      "[data-component]",
+      "[data-test]",
+      "[data-cy]",
+      "main",
+      "header",
+      "nav",
+      "section",
+      "article",
+      "aside",
+      "footer",
+      "form",
+      "div",
+      "p",
+      "ul",
+      "ol",
+      "li",
+      "table",
+      "thead",
+      "tbody",
+      "tr",
+      "th",
+      "td",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "label",
+      "img",
+      "svg",
+      "canvas",
+    ].join(",");
+    return Array.prototype.filter.call(
+      document.body.querySelectorAll(selector),
+      isKeyboardCandidate
+    );
+  }
+
+  function revealKeyboardCandidate(el) {
+    try {
+      if (el && typeof el.scrollIntoView === "function") {
+        el.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
+    } catch (e) {
+      try {
+        el.scrollIntoView();
+      } catch (e2) {}
+    }
+  }
+
+  function moveKeyboardSelection(delta) {
+    var candidates = getKeyboardCandidates();
+    if (!candidates.length) {
+      setCurrentEl(null);
+      hideOverlay();
+      return;
+    }
+    var index = currentEl ? candidates.indexOf(currentEl) : -1;
+    if (index < 0) index = delta < 0 ? 0 : -1;
+    var nextIndex = (index + delta + candidates.length) % candidates.length;
+    var next = candidates[nextIndex];
+    setCurrentEl(next);
+    revealKeyboardCandidate(next);
+    scheduleOverlayFollow();
+  }
+
+  function selectElement(el) {
+    if (!el || el === overlay) return false;
+    try {
+      var payload = describe(el);
+      return postToParent({ type: "uim:select", payload: payload });
+    } catch (e) {
+      // describe/postMessage が投げても選択イベントごと失われないよう握る
+      return false;
+    }
+  }
+
   function onMove(e) {
     if (!enabled) return;
     var el = e.target;
@@ -355,15 +519,32 @@
     if (!enabled) return;
     e.preventDefault();
     e.stopPropagation();
-    try {
-      var el = e.target;
-      if (!el || el === overlay) return false;
-      var payload = describe(el);
-      postToParent({ type: "uim:select", payload: payload });
-    } catch (e2) {
-      // describe/postMessage が投げても選択イベントごと失われないよう握る
-    }
+    selectElement(e.target);
     return false;
+  }
+
+  function onKeyDown(e) {
+    if (!enabled) return;
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+    var key = e.key;
+    var handled = false;
+    if (key === "Tab" || key === "ArrowRight" || key === "ArrowLeft") {
+      handled = true;
+      moveKeyboardSelection(key === "ArrowLeft" || (key === "Tab" && e.shiftKey) ? -1 : 1);
+    } else if (key === "Enter" || key === " " || key === "Spacebar") {
+      handled = true;
+      if (currentEl && currentEl.isConnected) selectElement(currentEl);
+    } else if (key === "Escape") {
+      handled = true;
+      setCurrentEl(null);
+      hideOverlay();
+      postToParent({ type: "uim:cancel" });
+    }
+
+    if (!handled) return;
+    e.preventDefault();
+    e.stopPropagation();
   }
 
   function setEnabled(v) {
@@ -416,6 +597,8 @@
       textWithBoundaries: textWithBoundaries,
       minimalDescriptor: minimalDescriptor,
       describe: describe,
+      isKeyboardCandidate: isKeyboardCandidate,
+      getKeyboardCandidates: getKeyboardCandidates,
     };
   }
 
@@ -423,6 +606,7 @@
   // ネストした同一 origin iframe からの選択イベントは relay しない。
   window.addEventListener("mousemove", onMove, true);
   window.addEventListener("click", onClick, true);
+  document.addEventListener("keydown", onKeyDown, true);
   window.addEventListener("scroll", scheduleOverlayFollow, true);
   window.addEventListener("resize", scheduleOverlayFollow);
 

@@ -49,17 +49,19 @@ export function usePreviewBridge({
   }, [acceptSelect, onSelect, url]);
 
   useEffect(() => {
-    let targetOrigin = "*";
+    let targetOrigin: string | null = null;
     try {
-      targetOrigin = url ? new URL(url, window.location.origin).origin : "*";
+      targetOrigin = url ? new URL(url, window.location.origin).origin : null;
     } catch {
-      targetOrigin = "*";
+      targetOrigin = null;
     }
-    const send = () =>
+    const send = () => {
+      if (!targetOrigin) return;
       iframeRef.current?.contentWindow?.postMessage(
         { type: "uim:setEnabled", value: selectMode },
         targetOrigin
       );
+    };
     send();
     const t = setInterval(send, 1000);
     return () => clearInterval(t);

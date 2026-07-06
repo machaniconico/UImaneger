@@ -58,6 +58,8 @@ const undoStack: UndoEntry[] = [];
 
 /** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
 const inFlight = new Set<string>();
+/** apply/undo の read-compare-write を対象ファイル単位で直列化するキュー。 */
+const fileLocks = new Map<string, Promise<void>>();
 // テスト/検証用途にストアを公開 (本番はプロセス内メモリ)
 export const __stores = { proposalStore, undoStack, inFlight };
 let storesRoot: string | null = null;
@@ -93,6 +95,31 @@ function ensureStoresForCurrentRoot(): void {
   undoStack.splice(0);
   inFlight.clear();
   storesRoot = root;
+}
+
+async function withFileLock<T>(
+  file: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const key = resolve(file);
+  const previous = fileLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((r) => {
+    release = r;
+  });
+  const queued = previous.then(
+    () => current,
+    () => current
+  );
+  fileLocks.set(key, queued);
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (fileLocks.get(key) === queued) fileLocks.delete(key);
+  }
 }
 
 function isWithinPath(parent: string, child: string): boolean {
@@ -731,37 +758,39 @@ api.post("/edit/apply", async (c) => {
   inFlight.add(proposalId);
 
   try {
-    const beforeBytes = await readFile(p.file);
-    if (getRoot() !== root) {
-      return c.json(
-        { error: "プロジェクトが切り替わったため中断しました" },
-        409
-      );
-    }
-    if (Buffer.compare(beforeBytes, p.originalBytes) !== 0) {
-      return c.json(
-        { error: "ファイルが変更されています。再提案してください。" },
-        409
-      );
-    }
-    const before = beforeBytes.toString("utf8");
-    const appliedContent = withBom(p.proposed, p.hadBom);
-    await atomicWrite(p.file, appliedContent);
-    pushUndo({
-      file: p.file,
-      relFile: p.relFile,
-      previousContent: before,
-      appliedContent,
-      proposalId,
-    });
-    proposalStore.delete(proposalId);
-    return c.json({
-      ok: true,
-      file: p.file,
-      relFile: p.relFile,
-      line: p.line,
-      summary: `${p.relFile} を適用しました。`,
-      undoDepth: undoStack.length,
+    return await withFileLock(p.file, async () => {
+      const beforeBytes = await readFile(p.file);
+      if (getRoot() !== root) {
+        return c.json(
+          { error: "プロジェクトが切り替わったため中断しました" },
+          409
+        );
+      }
+      if (Buffer.compare(beforeBytes, p.originalBytes) !== 0) {
+        return c.json(
+          { error: "ファイルが変更されています。再提案してください。" },
+          409
+        );
+      }
+      const before = beforeBytes.toString("utf8");
+      const appliedContent = withBom(p.proposed, p.hadBom);
+      await atomicWrite(p.file, appliedContent);
+      pushUndo({
+        file: p.file,
+        relFile: p.relFile,
+        previousContent: before,
+        appliedContent,
+        proposalId,
+      });
+      proposalStore.delete(proposalId);
+      return c.json({
+        ok: true,
+        file: p.file,
+        relFile: p.relFile,
+        line: p.line,
+        summary: `${p.relFile} を適用しました。`,
+        undoDepth: undoStack.length,
+      });
     });
   } catch (e) {
     return serverError(c, e, p.relFile);
@@ -804,31 +833,35 @@ api.post("/edit/undo", async (c) => {
     return c.json({ error: "対象がプロジェクト範囲外" }, 403);
   }
   try {
-    const currentBytes = await readFile(entry.file);
-    if (getRoot() !== root) {
-      undoStack.push(entry);
-      return c.json(
-        { error: "プロジェクトが切り替わったため中断しました" },
-        409
-      );
-    }
-    if (
-      Buffer.compare(currentBytes, Buffer.from(entry.appliedContent, "utf8")) !==
-      0
-    ) {
-      undoStack.push(entry);
-      return c.json(
-        { error: "適用後にファイルが変更されているため取り消せません。" },
-        409
-      );
-    }
-    await atomicWrite(entry.file, entry.previousContent);
-    return c.json({
-      ok: true,
-      file: entry.file,
-      relFile: entry.relFile,
-      summary: `${entry.relFile} の適用を取り消しました。`,
-      undoDepth: undoStack.length,
+    return await withFileLock(entry.file, async () => {
+      const currentBytes = await readFile(entry.file);
+      if (getRoot() !== root) {
+        undoStack.push(entry);
+        return c.json(
+          { error: "プロジェクトが切り替わったため中断しました" },
+          409
+        );
+      }
+      if (
+        Buffer.compare(
+          currentBytes,
+          Buffer.from(entry.appliedContent, "utf8")
+        ) !== 0
+      ) {
+        undoStack.push(entry);
+        return c.json(
+          { error: "適用後にファイルが変更されているため取り消せません。" },
+          409
+        );
+      }
+      await atomicWrite(entry.file, entry.previousContent);
+      return c.json({
+        ok: true,
+        file: entry.file,
+        relFile: entry.relFile,
+        summary: `${entry.relFile} の適用を取り消しました。`,
+        undoDepth: undoStack.length,
+      });
     });
   } catch (e) {
     undoStack.push(entry);

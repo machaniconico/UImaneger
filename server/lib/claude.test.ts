@@ -1,5 +1,50 @@
-import { describe, expect, it } from "vitest";
-import { stripCodeFence } from "./claude.ts";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { env } from "./env.ts";
+import {
+  complete,
+  getClient,
+  hasKey,
+  stripCodeFence,
+  TruncatedError,
+} from "./claude.ts";
+
+const anthropicMock = vi.hoisted(() => {
+  const create = vi.fn();
+  const Anthropic = vi.fn(function Anthropic() {
+    return {
+      messages: { create },
+    };
+  });
+  return { Anthropic, create };
+});
+
+vi.mock("@anthropic-ai/sdk", () => ({
+  default: anthropicMock.Anthropic,
+}));
+
+const originalAnthropicKey = env.anthropicKey;
+
+type MockMessage = {
+  content: Array<{ type: string; text?: string }>;
+  stop_reason: string;
+};
+
+function message(
+  content: MockMessage["content"],
+  stop_reason: MockMessage["stop_reason"]
+): MockMessage {
+  return { content, stop_reason };
+}
+
+beforeEach(() => {
+  env.anthropicKey = "test-key";
+  anthropicMock.Anthropic.mockClear();
+  anthropicMock.create.mockReset();
+});
+
+afterAll(() => {
+  env.anthropicKey = originalAnthropicKey;
+});
 
 describe("stripCodeFence", () => {
   it("extracts code from a fenced tsx block", () => {
@@ -75,5 +120,51 @@ describe("stripCodeFence", () => {
     expect(stripCodeFence("```ts\nconst ok = true;\n```")).toBe(
       "const ok = true;"
     );
+  });
+});
+
+describe("complete", () => {
+  it("rejects with TruncatedError when max_tokens stops the response", async () => {
+    anthropicMock.create.mockResolvedValue(
+      message([{ type: "text", text: "partial" }], "max_tokens")
+    );
+
+    await expect(complete("prompt")).rejects.toBeInstanceOf(TruncatedError);
+  });
+
+  it("resolves text when the response ends normally", async () => {
+    anthropicMock.create.mockResolvedValue(
+      message([{ type: "text", text: "complete text" }], "end_turn")
+    );
+
+    await expect(complete("prompt")).resolves.toBe("complete text");
+  });
+
+  it("resolves partial text for max_tokens when truncation is allowed", async () => {
+    anthropicMock.create.mockResolvedValue(
+      message([{ type: "text", text: "partial text" }], "max_tokens")
+    );
+
+    await expect(
+      complete("prompt", { allowTruncated: true })
+    ).resolves.toBe("partial text");
+  });
+
+  it("falls back to an empty string when no text content block exists", async () => {
+    anthropicMock.create.mockResolvedValue(
+      message([{ type: "tool_use" }], "end_turn")
+    );
+
+    await expect(complete("prompt")).resolves.toBe("");
+  });
+
+  it("reports a missing Anthropic key and throws before creating a client", async () => {
+    env.anthropicKey = "";
+
+    expect(hasKey()).toBe(false);
+    expect(() => getClient()).toThrow("ANTHROPIC_API_KEY");
+    await expect(complete("prompt")).rejects.toThrow("ANTHROPIC_API_KEY");
+    expect(anthropicMock.Anthropic).not.toHaveBeenCalled();
+    expect(anthropicMock.create).not.toHaveBeenCalled();
   });
 });

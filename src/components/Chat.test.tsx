@@ -84,6 +84,11 @@ describe("Chat", () => {
 
     expect(api.edit).toHaveBeenCalledWith(descriptor, "赤くして");
     expect(await screen.findByText("承認して適用")).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.getByRole("log").textContent).toContain(
+        "差分の準備ができました。承認または却下してください。"
+      )
+    );
     expect(screen.getByText("+added line")).not.toBeNull();
     expect(screen.getByText("-removed line")).not.toBeNull();
     expect(api.applyEdit).not.toHaveBeenCalled();
