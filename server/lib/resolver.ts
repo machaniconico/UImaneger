@@ -64,6 +64,7 @@ const IGNORE_DIRS = new Set([
 // テキストとして検索する拡張子 (バイナリ回避)
 const TEXT_EXT =
   /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|html?|css|scss|sass|less|md|mdx|json|ya?ml|php|rb|erb|py|go|java|kt|rs|c|h|cpp|cs|swift|ex|exs|txt|hbs|ejs|pug|twig|blade\.php)$/i;
+const AUTHORING_EXT = /\.(tsx?|jsx?|vue|svelte|astro|html?)$/i;
 const NODE_GREP_FILE_CAP = 6000; // 暴走防止
 const NODE_GREP_MAX_FILE_SIZE = 1.5 * 1024 * 1024;
 const NODE_GREP_TOTAL_BYTES_CAP = 200 * 1024 * 1024;
@@ -596,6 +597,43 @@ interface CandidateAgg {
   score: number;
 }
 
+function isAuthoringFile(file: string): boolean {
+  return AUTHORING_EXT.test(file);
+}
+
+function comparePath(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareCandidates(a: CandidateAgg, b: CandidateAgg): number {
+  if (b.score !== a.score) return b.score - a.score;
+  if (a.file === b.file) return a.line - b.line;
+
+  const aAuthoring = isAuthoringFile(a.file);
+  const bAuthoring = isAuthoringFile(b.file);
+  if (aAuthoring !== bAuthoring) return aAuthoring ? -1 : 1;
+
+  return comparePath(a.file, b.file);
+}
+
+function topScoreTiedAcrossFiles(candidates: CandidateAgg[]): boolean {
+  if (candidates.length < 2) return false;
+  const topScore = candidates[0].score;
+  if (topScore <= 1) return false;
+  const topFile = candidates[0].file;
+  return candidates.some((c) => c.score === topScore && c.file !== topFile);
+}
+
+function countFileLines(content: string): number {
+  return content.length === 0 ? 0 : content.split(/\r\n|\r|\n/).length;
+}
+
+function clampLine(line: number, totalLines: number): number {
+  const n = Math.trunc(line);
+  if (totalLines <= 0) return Math.max(1, n);
+  return Math.min(Math.max(1, n), totalLines);
+}
+
 async function mapWithConcurrency<T, R>(
   items: readonly T[],
   concurrency: number,
@@ -704,10 +742,7 @@ async function collectCandidates(
     c.score = scoreCandidate(scored);
     candidates.push(c);
   }
-  // score 降順、同点なら行番号昇順で安定
-  candidates.sort((a, b) =>
-    b.score !== a.score ? b.score - a.score : a.line - b.line
-  );
+  candidates.sort(compareCandidates);
 
   return { candidates, termHits };
 }
@@ -779,9 +814,7 @@ async function collectCandidatesWithNodeGrep(
     c.score = scoreCandidate(scored);
     candidates.push(c);
   }
-  candidates.sort((a, b) =>
-    b.score !== a.score ? b.score - a.score : a.line - b.line
-  );
+  candidates.sort(compareCandidates);
 
   return { candidates, termHits };
 }
@@ -800,6 +833,9 @@ export async function resolveSource(
 ): Promise<ResolveResult> {
   // --- 層A: フレームワークが出した正確な source (回帰なし: 即 high) ---
   const sourceLine = d.source?.lineNumber;
+  let downgradedSource:
+    | { file: string; line: number; col?: number }
+    | null = null;
   if (
     d.source?.fileName &&
     typeof sourceLine === "number" &&
@@ -807,26 +843,60 @@ export async function resolveSource(
   ) {
     const f = resolve(d.source.fileName);
     if (existsSync(f) && withinRoot(root, f)) {
-      if (DEBUG) {
-        console.log(
-          `[UImaneger] resolve 層A high ${relative(
-            root,
-            f
-          )}:${sourceLine}`
-        );
+      try {
+        const content = await readFile(f, "utf8");
+        const totalLines = countFileLines(content);
+        if (
+          Number.isInteger(sourceLine) &&
+          sourceLine >= 1 &&
+          sourceLine <= totalLines
+        ) {
+          if (DEBUG) {
+            console.log(
+              `[UImaneger] resolve 層A high ${relative(
+                root,
+                f
+              )}:${sourceLine}`
+            );
+          }
+          return {
+            file: f,
+            line: sourceLine,
+            col: d.source.columnNumber,
+            confidence: "high",
+          };
+        }
+        downgradedSource = {
+          file: f,
+          line: clampLine(sourceLine, totalLines),
+          col: d.source.columnNumber,
+        };
+        if (DEBUG) {
+          console.log(
+            `[UImaneger] resolve 層A medium ${relative(
+              root,
+              f
+            )}:${sourceLine} out of current range 1-${totalLines}`
+          );
+        }
+      } catch {
+        // 読取失敗時は層Bの既存フォールバックに委ねる。
       }
-      return {
-        file: f,
-        line: sourceLine,
-        col: d.source.columnNumber,
-        confidence: "high",
-      };
     }
   }
 
   // --- 層B: 汎用クラス除外スコアリング + フォールバック ---
   const { candidates } = await collectCandidates(root, d);
 
+  if (candidates.length === 0 && downgradedSource) {
+    return {
+      file: downgradedSource.file,
+      line: downgradedSource.line,
+      col: downgradedSource.col,
+      confidence: "medium",
+      candidates: [],
+    };
+  }
   if (candidates.length === 0) {
     return { file: "", confidence: "low", candidates: [] };
   }
@@ -834,6 +904,7 @@ export async function resolveSource(
   const best = candidates[0];
   const bestRare = hasRareTerm(best.matched);
   const single = candidates.length === 1;
+  const ambiguousTopTie = topScoreTiedAcrossFiles(candidates);
 
   // confidence 判定
   // - 候補1件 かつ 希少 term(id / textSnippet) あり → high 寄り (high に寄せる)
@@ -841,10 +912,12 @@ export async function resolveSource(
   // - 複数候補 だが best が希少 term で明確にリード → medium
   // - それ以外 → low
   let confidence: ResolveResult["confidence"];
-  if (single && bestRare) confidence = "high";
+  if (ambiguousTopTie) confidence = "low";
+  else if (single && bestRare && isAuthoringFile(best.file)) confidence = "high";
   else if (single) confidence = "medium";
   else if (bestRare && best.score > 0) confidence = "medium";
   else confidence = "low";
+  if (downgradedSource && confidence === "high") confidence = "medium";
 
   // 候補のプレビュー配列 (上位10件)
   const previewList = candidates.slice(0, 10).map((c) => ({
@@ -857,7 +930,7 @@ export async function resolveSource(
   const hasClearLead =
     candidates.length === 1 || (candidates.length >= 2 &&
       best.score - (candidates[1]?.score ?? 0) >= 30);
-  if (!hasClearLead && hasKey()) {
+  if (!ambiguousTopTie && !hasClearLead && hasKey()) {
     const picked = await pickWithLLM(root, d, candidates, previewList);
     if (picked) {
       if (DEBUG) {

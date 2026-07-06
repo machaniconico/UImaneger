@@ -17,7 +17,8 @@
     "@anthropic-ai/sdk": "latest",
     "@hono/node-server": "latest",
     "hono": "latest",
-    "http-proxy": "^1.18.1"
+    "http-proxy": "^1.18.1",
+    "tsx": "latest"
   },
   "devDependencies": {
     "@tailwindcss/vite": "latest",
@@ -34,7 +35,6 @@
     "react": "latest",
     "react-dom": "latest",
     "tailwindcss": "latest",
-    "tsx": "latest",
     "typescript": "latest",
     "vite": "latest",
     "vitest": "latest"

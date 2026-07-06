@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, cleanup, waitFor, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ProjectBar } from "./ProjectBar";
 import { api } from "../lib/api";
@@ -78,6 +78,25 @@ describe("ProjectBar.stop()", () => {
     ).toBe("true");
   });
 
+  it("busy 中は停止ボタンと選択トグルが無効化され、停止 API を呼ばない", async () => {
+    const user = userEvent.setup();
+    const props = setup({ busy: true });
+
+    const selectButton = screen.getByRole("button", { name: "要素を選択" });
+    const stopButton = screen.getByRole("button", { name: "停止" });
+
+    expect(selectButton).toHaveProperty("disabled", true);
+    expect(stopButton).toHaveProperty("disabled", true);
+
+    await user.click(selectButton);
+    await user.click(stopButton);
+
+    expect(props.setSelectMode).not.toHaveBeenCalled();
+    expect(api.stop).not.toHaveBeenCalled();
+    expect(props.setBusy).not.toHaveBeenCalled();
+    expect(props.onError).not.toHaveBeenCalled();
+  });
+
   it("停止成功時: onInfo が呼ばれ onError がクリアされ busy が解除される", async () => {
     const user = userEvent.setup();
     vi.mocked(api.stop).mockResolvedValue({ info: null });
@@ -151,6 +170,26 @@ describe("ProjectBar.stop()", () => {
       expect.stringContaining("clone boom")
     );
     expect(props.onInfo).toHaveBeenCalledWith(stoppedInfo);
+    await waitFor(() => expect(props.setBusy).toHaveBeenLastCalledWith(false));
+  });
+
+  it("IME 合成中の Enter では open/clone せず、通常 Enter では open する", async () => {
+    vi.mocked(api.open).mockResolvedValue({ info: runningInfo });
+    const props = setup({ info: null });
+    const input = screen.getByRole("textbox", {
+      name: "ローカルパスまたはGitHub URL",
+    });
+
+    fireEvent.change(input, { target: { value: "/demo/project" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+
+    expect(api.open).not.toHaveBeenCalled();
+    expect(props.setBusy).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(api.open).toHaveBeenCalledWith("/demo/project"));
+    expect(props.onInfo).toHaveBeenCalledWith(runningInfo);
     await waitFor(() => expect(props.setBusy).toHaveBeenLastCalledWith(false));
   });
 

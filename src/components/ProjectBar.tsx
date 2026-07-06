@@ -58,6 +58,7 @@ export function ProjectBar({
   }
 
   async function stop() {
+    if (busy) return;
     setBusy(true);
     onError("");
     try {
@@ -86,7 +87,10 @@ export function ProjectBar({
       <input
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && openOrClone()}
+        onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+          if (e.key === "Enter") openOrClone();
+        }}
         aria-label="ローカルパスまたはGitHub URL"
         placeholder="ローカルパス または GitHub URL"
         className="w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 outline-none focus:border-blue-500"
@@ -105,6 +109,7 @@ export function ProjectBar({
             <button
               onClick={() => setSelectMode(!selectMode)}
               aria-pressed={selectMode}
+              disabled={busy}
               className={`flex-1 rounded px-3 py-1 font-medium ${
                 selectMode
                   ? "bg-amber-500 text-black"
@@ -115,6 +120,7 @@ export function ProjectBar({
             </button>
             <button
               onClick={stop}
+              disabled={busy}
               className="rounded bg-neutral-700 px-3 py-1 hover:bg-neutral-600"
             >
               停止

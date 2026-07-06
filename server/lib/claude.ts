@@ -59,21 +59,14 @@ export async function complete(
 
 /**
  * ```lang ... ``` で囲まれたコードブロックがあれば中身だけ取り出す。
- * 前置きテキストがあっても最初のコードブロックを抽出し、
+ * 前置きテキストがあっても最初の開きフェンスから最後の閉じフェンスまでを抽出し、
  * 閉じフェンスは行頭の ``` のみ認識する。
  * フェンスが無ければ入力を trim して返す(既存挙動)。
  */
 export function stripCodeFence(text: string): string {
-  const m = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)^```/m);
+  const m = text.match(
+    /```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*)^```[ \t]*\r?\n?$/m
+  );
   if (!m) return text.trim();
-  const extracted = m[1].replace(/\r?\n$/, "");
-  const deviation = text.length - extracted.length;
-  if (deviation > 200 && extracted.length < text.length * 0.5) {
-    // 早期クローズの疑い(入れ子フェンスで lazy 抽出が途中で止まった等)。
-    // 生テキスト(フェンス記号や前置きを含む)をそのまま返すとディスクに書き込まれて壊れるため、
-    // 最後の行頭フェンスまで貪欲に再抽出し、外側フェンスのみ除いた中身を返す。
-    const greedy = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*)^```/m);
-    if (greedy) return greedy[1].replace(/\r?\n$/, "");
-  }
-  return extracted;
+  return m[1].replace(/\r?\n$/, "");
 }
