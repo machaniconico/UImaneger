@@ -121,13 +121,17 @@ describe("createUnifiedDiff", () => {
   });
 
   it("includes +/- body lines for an added line", () => {
-    const out = createUnifiedDiff("a\nb", "a\nb\nc", "f.txt");
+    // 純粋な追加を検証するため両側とも末尾改行付き入力を使う
+    // (末尾改行なし入力だと最終行 b の終端子が変化し GNU 準拠で -b/+b になる。
+    //  そのケースは別テスト "emits an old-side no-newline marker ..." がカバー)
+    const out = createUnifiedDiff("a\nb\n", "a\nb\nc\n", "f.txt");
     const lines = out.split("\n");
     expect(lines.some((l) => l === "+c")).toBe(true);
     expect(lines.some((l) => l === " a")).toBe(true);
     expect(lines.some((l) => l === " b")).toBe(true);
     // No remove lines in a pure addition
     expect(lines.some((l) => l === "-c")).toBe(false);
+    expect(lines.some((l) => l === "-b")).toBe(false);
   });
 
   it("includes - lines for a removed line", () => {
@@ -155,6 +159,22 @@ describe("createUnifiedDiff", () => {
     const out = createUnifiedDiff("a\n", "a\nb\n");
     expect(out).not.toContain("\\ No newline at end of file");
     expect(out).toContain("+b");
+  });
+
+  it("emits an old-side no-newline marker when the old final context line gets following new lines", () => {
+    const out = createUnifiedDiff("a", "a\nb\n", "f.txt");
+    expect(out).toBe(
+      [
+        "--- a/f.txt",
+        "+++ b/f.txt",
+        "@@ -1 +1,2 @@",
+        "-a",
+        "\\ No newline at end of file",
+        "+a",
+        "+b",
+        "",
+      ].join("\n")
+    );
   });
 
   it("emits a diff when only the original is missing the final newline", () => {

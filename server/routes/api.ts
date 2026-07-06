@@ -3,7 +3,7 @@ import type { Context } from "hono";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
 import { env } from "../lib/env.ts";
@@ -55,11 +55,11 @@ const UNDO_MAX = 50;
 
 const proposalStore = new Map<string, ProposalEntry>();
 const undoStack: UndoEntry[] = [];
-// テスト/検証用途にストアを公開 (本番はプロセス内メモリ)
-export const __stores = { proposalStore, undoStack };
 
 /** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
 const inFlight = new Set<string>();
+// テスト/検証用途にストアを公開 (本番はプロセス内メモリ)
+export const __stores = { proposalStore, undoStack, inFlight };
 let storesRoot: string | null = null;
 
 function sanitizeForLog(value: unknown): string {
@@ -98,6 +98,63 @@ function ensureStoresForCurrentRoot(): void {
 function isWithinPath(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child));
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+export function isSafeGitRepoUrl(repo: unknown): repo is string {
+  if (typeof repo !== "string") return false;
+  const value = repo.trim();
+  if (!value || value !== repo) return false;
+  if (value.startsWith("-")) return false;
+  if (/\s/.test(value)) return false;
+  if (value.includes("::")) return false;
+  if (value.startsWith("file:")) return false;
+
+  const scpLike = value.match(/^git@([^:\s]+):([^\s]+)$/);
+  if (scpLike) return !scpLike[1].startsWith("-");
+
+  try {
+    const url = new URL(value);
+    return (
+      Boolean(url.hostname) &&
+      !url.hostname.startsWith("-") &&
+      (url.protocol === "https:" ||
+        url.protocol === "git:" ||
+        url.protocol === "ssh:")
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function isTrustedRunCommandHost(
+  host: string | null | undefined
+): boolean {
+  const raw = host?.trim().toLowerCase();
+  if (!raw || raw.includes("/") || raw.includes("@")) return false;
+  const hostname = raw.split(":")[0];
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname.endsWith(".localhost")
+  );
+}
+
+function hasRunCommand(runCommand: unknown): boolean {
+  return runCommand !== undefined;
+}
+
+export async function atomicWrite(
+  path: string,
+  content: string | Uint8Array
+): Promise<void> {
+  const tmp = `${path}.tmp-${randomUUID()}`;
+  try {
+    await writeFile(tmp, content, "utf8");
+    await rename(tmp, path);
+  } catch (e) {
+    await unlink(tmp).catch(() => {});
+    throw e;
+  }
 }
 
 function remapBeforeSource(root: string, d: DomDescriptor): DomDescriptor {
@@ -261,6 +318,15 @@ api.post("/project/open", async (c) => {
     path: string;
     runCommand?: string;
   }>();
+  if (
+    hasRunCommand(runCommand) &&
+    !isTrustedRunCommandHost(c.req.header("host"))
+  ) {
+    return c.json(
+      { error: "runCommand の実行にはローカルからのアクセスが必要です" },
+      403
+    );
+  }
   if (!path || !existsSync(path))
     return c.json({ error: `パスが存在しません: ${path}` }, 400);
   try {
@@ -276,7 +342,18 @@ api.post("/project/clone", async (c) => {
     repo: string;
     runCommand?: string;
   }>();
+  if (
+    hasRunCommand(runCommand) &&
+    !isTrustedRunCommandHost(c.req.header("host"))
+  ) {
+    return c.json(
+      { error: "runCommand の実行にはローカルからのアクセスが必要です" },
+      403
+    );
+  }
   if (!repo) return c.json({ error: "repo URL が必要です" }, 400);
+  if (!isSafeGitRepoUrl(repo))
+    return c.json({ error: "対応していないリポジトリURL形式です" }, 400);
   let installError: string | null = null;
   try {
     const wsDir = resolve(env.workspacesDir);
@@ -284,12 +361,29 @@ api.post("/project/clone", async (c) => {
     const name = basename(repo).replace(/\.git$/, "") || "repo";
     const dest = join(wsDir, name);
     if (!existsSync(dest)) {
-      await pExecFile("git", ["clone", "--depth", "1", repo, dest], {
-        maxBuffer: 8 * 1024 * 1024,
-      });
+      await pExecFile(
+        "git",
+        [
+          "-c",
+          "protocol.ext.allow=never",
+          "clone",
+          "--depth",
+          "1",
+          "--",
+          repo,
+          dest,
+        ],
+        {
+          env: { ...process.env, GIT_ALLOW_PROTOCOL: "https:git:ssh:http" },
+          maxBuffer: 8 * 1024 * 1024,
+        }
+      );
     }
     // 依存があれば install (node プロジェクト)
-    if (existsSync(join(dest, "package.json")) && !existsSync(join(dest, "node_modules"))) {
+    if (
+      existsSync(join(dest, "package.json")) &&
+      !existsSync(join(dest, "node_modules"))
+    ) {
       await pExecFile("npm", ["install", "--ignore-scripts"], {
         cwd: dest,
         maxBuffer: 32 * 1024 * 1024,
@@ -301,7 +395,14 @@ api.post("/project/clone", async (c) => {
       });
     }
     const info = await openAndStart(dest, { command: runCommand });
-    return c.json({ info });
+    return c.json(
+      installError
+        ? {
+            info,
+            warning: `依存関係のインストールに失敗した可能性があります:\n${installError}`,
+          }
+        : { info }
+    );
   } catch (e) {
     if (installError) {
       return c.json(
@@ -351,7 +452,7 @@ api.post("/files/write", async (c) => {
     return c.json({ error: "path と content は文字列である必要があります。" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
   try {
-    await writeFile(resolve(path), content, "utf8");
+    await atomicWrite(resolve(path), content);
     return c.json({ ok: true });
   } catch (e) {
     return serverError(c, e);
@@ -601,6 +702,12 @@ api.post("/edit/apply", async (c) => {
 
   try {
     const beforeBytes = await readFile(p.file);
+    if (getRoot() !== root) {
+      return c.json(
+        { error: "プロジェクトが切り替わったため中断しました" },
+        409
+      );
+    }
     if (Buffer.compare(beforeBytes, p.originalBytes) !== 0) {
       return c.json(
         { error: "ファイルが変更されています。再提案してください。" },
@@ -609,7 +716,7 @@ api.post("/edit/apply", async (c) => {
     }
     const before = beforeBytes.toString("utf8");
     const appliedContent = withBom(p.proposed, p.hadBom);
-    await writeFile(p.file, appliedContent, "utf8");
+    await atomicWrite(p.file, appliedContent);
     pushUndo({
       file: p.file,
       relFile: p.relFile,
@@ -668,6 +775,13 @@ api.post("/edit/undo", async (c) => {
   }
   try {
     const currentBytes = await readFile(entry.file);
+    if (getRoot() !== root) {
+      undoStack.push(entry);
+      return c.json(
+        { error: "プロジェクトが切り替わったため中断しました" },
+        409
+      );
+    }
     if (
       Buffer.compare(currentBytes, Buffer.from(entry.appliedContent, "utf8")) !==
       0
@@ -678,7 +792,7 @@ api.post("/edit/undo", async (c) => {
         409
       );
     }
-    await writeFile(entry.file, entry.previousContent, "utf8");
+    await atomicWrite(entry.file, entry.previousContent);
     return c.json({
       ok: true,
       file: entry.file,

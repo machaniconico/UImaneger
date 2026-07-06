@@ -242,6 +242,55 @@ describe("resolveSource Layer-B integration", () => {
     expect(result.line).toBe(2);
   });
 
+  it("locates a short CJK label by textSnippet over generic classes", async () => {
+    const root = await fixture({
+      "src/AOther.tsx": [
+        "export function AOther() {",
+        '  return <button className="flex grid">送信</button>;',
+        "}",
+      ].join("\n"),
+      "src/ZSave.tsx": [
+        "export function ZSave() {",
+        "  const ready = true;",
+        '  return <button className="flex grid">保存</button>;',
+        "}",
+      ].join("\n"),
+    });
+
+    const result = await resolveSource(
+      root,
+      mkD({ textSnippet: "保存", classes: ["flex", "grid"] })
+    );
+
+    expect(result.file).toBe(join(root, "src/ZSave.tsx"));
+    expect(result.line).toBe(3);
+  });
+
+  it("locates a 3-char ASCII label by textSnippet in the no-ripgrep path", async () => {
+    const root = await fixture({
+      "src/AOther.tsx": [
+        "export function AOther() {",
+        '  return <button className="flex grid">Pay</button>;',
+        "}",
+      ].join("\n"),
+      "src/ZBuy.tsx": [
+        "export function ZBuy() {",
+        "  const ready = true;",
+        '  return <button className="flex grid">Buy</button>;',
+        "}",
+      ].join("\n"),
+    });
+    __resolverTestHooks.forceRgUsable(false);
+
+    const result = await resolveSource(
+      root,
+      mkD({ textSnippet: "Buy", classes: ["flex", "grid"] })
+    );
+
+    expect(result.file).toBe(join(root, "src/ZBuy.tsx"));
+    expect(result.line).toBe(3);
+  });
+
   it("locates a source line by id when source is omitted", async () => {
     const root = await fixture({
       "src/IdHit.tsx": [

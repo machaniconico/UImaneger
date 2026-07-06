@@ -199,4 +199,69 @@ describe("prepareBefore / cleanup", () => {
       rmSync(staleSnap, { recursive: true, force: true });
     }
   });
+
+  it("does not sweep before dirs whose encoded pid is still alive", () => {
+    const liveBefore = join(
+      tmpdir(),
+      `uim-before-${process.pid}-${Date.now()}-live`
+    );
+    mkdirSync(liveBefore, { recursive: true });
+    try {
+      sweepStaleBeforeDirs();
+
+      expect(existsSync(liveBefore)).toBe(true);
+    } finally {
+      rmSync(liveBefore, { recursive: true, force: true });
+    }
+  });
+
+  it("removes stale worktree metadata before deleting marker-backed worktree dirs", async () => {
+    const staleWorktree = join(
+      tmpdir(),
+      `uim-before-stale-worktree-${Date.now()}`
+    );
+    const sourceRoot = mkdtempSync(join(tmpdir(), "uim-wt-source-"));
+    mkdirSync(staleWorktree, { recursive: true });
+    writeFileSync(join(staleWorktree, ".uim-worktree-source"), sourceRoot);
+
+    const spawnMock = vi.fn((_cmd: string, args: string[]) => ({
+      status: args.includes("remove") ? 1 : 0,
+      stdout: "",
+      stderr: "",
+    }));
+
+    try {
+      vi.resetModules();
+      vi.doMock("node:child_process", async (importOriginal) => {
+        const actual =
+          await importOriginal<typeof import("node:child_process")>();
+        return {
+          ...actual,
+          spawnSync: spawnMock,
+        };
+      });
+      const { sweepStaleBeforeDirs: sweepWithMockedGit } = await import(
+        "./worktree.ts"
+      );
+
+      sweepWithMockedGit();
+
+      expect(spawnMock).toHaveBeenCalledWith(
+        "git",
+        ["worktree", "remove", "--force", staleWorktree],
+        { cwd: sourceRoot, encoding: "utf8" }
+      );
+      expect(spawnMock).toHaveBeenCalledWith(
+        "git",
+        ["worktree", "prune"],
+        { cwd: sourceRoot, encoding: "utf8" }
+      );
+      expect(existsSync(staleWorktree)).toBe(false);
+    } finally {
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+      rmSync(staleWorktree, { recursive: true, force: true });
+      rmSync(sourceRoot, { recursive: true, force: true });
+    }
+  });
 });

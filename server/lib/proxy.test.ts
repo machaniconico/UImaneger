@@ -1,9 +1,10 @@
 // ラウンド3: バックエンド ライフサイクル統合テスト (proxy)
 // 対象: ProxyHandle.close の永久ハング修正の回帰
 // 実 http サーバ・実ポートを使う node 環境テスト。
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import http from "node:http";
 import net from "node:net";
+import { EventEmitter } from "node:events";
 import { findFreePort, isListening, sleep } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
 
@@ -152,6 +153,54 @@ function requestViaProxy(
   });
 }
 
+type AbortableProxyTestResponse = {
+  statusCode: number;
+  aborted: boolean;
+  body: Buffer;
+  errorMessage?: string;
+};
+
+function requestViaProxyAllowAbort(
+  proxyPort: number,
+  path = "/"
+): Promise<AbortableProxyTestResponse> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const chunks: Buffer[] = [];
+    const finish = (
+      statusCode: number,
+      aborted: boolean,
+      errorMessage?: string
+    ) => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        statusCode,
+        aborted,
+        body: Buffer.concat(chunks),
+        errorMessage,
+      });
+    };
+    const req = http.request(
+      {
+        host: "127.0.0.1",
+        port: proxyPort,
+        path,
+      },
+      (res) => {
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () => finish(res.statusCode || 0, false));
+        res.on("aborted", () => finish(res.statusCode || 0, true));
+        res.on("error", (err) =>
+          finish(res.statusCode || 0, true, err.message)
+        );
+      }
+    );
+    req.on("error", (err) => finish(0, true, err.message));
+    req.end();
+  });
+}
+
 // --- ProxyHandle.close ---
 
 const describeIfLoopback = (await canBindLoopback()) ? describe : describe.skip;
@@ -266,6 +315,104 @@ describeIfLoopback("ProxyHandle.close", () => {
     expect(released).toBe(true);
     expect(await isListening(proxyPort)).toBe(false);
   }, 20_000);
+});
+
+describeIfLoopback("proxy upstream response errors", () => {
+  it("returns 502 when the upstream response errors before proxy headers are sent", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let handle: ProxyHandle | null = null;
+    try {
+      vi.resetModules();
+      vi.doMock("http-proxy", () => ({
+        default: {
+          createProxyServer: () => {
+            const proxy = Object.assign(new EventEmitter(), {
+              close: vi.fn(),
+              web: (req: http.IncomingMessage, res: http.ServerResponse) => {
+                const proxyRes = Object.assign(new EventEmitter(), {
+                  statusCode: 200,
+                  headers: { "content-type": "text/html; charset=utf-8" },
+                });
+                proxy.emit("proxyRes", proxyRes, req, res);
+                setImmediate(() => {
+                  proxyRes.emit(
+                    "error",
+                    new Error("synthetic upstream reset")
+                  );
+                });
+              },
+              ws: vi.fn(),
+            });
+            return proxy;
+          },
+        },
+      }));
+      const { startProxy: startProxyWithMock } = await import("./proxy.ts");
+      const proxyPort = await findFreePort(50_000);
+      handle = await startProxyWithMock(9, proxyPort);
+
+      const response = await requestViaProxy(proxyPort);
+
+      expect(response.statusCode).toBe(502);
+      expect(response.body.toString("utf8")).toContain(
+        "synthetic upstream reset"
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      vi.doUnmock("http-proxy");
+      vi.resetModules();
+      consoleSpy.mockRestore();
+    }
+  });
+
+  it("destroys the client response when the upstream response errors after proxy headers are sent", async () => {
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let handle: ProxyHandle | null = null;
+    try {
+      vi.resetModules();
+      vi.doMock("http-proxy", () => ({
+        default: {
+          createProxyServer: () => {
+            const proxy = Object.assign(new EventEmitter(), {
+              close: vi.fn(),
+              web: (req: http.IncomingMessage, res: http.ServerResponse) => {
+                const proxyRes = Object.assign(new EventEmitter(), {
+                  statusCode: 200,
+                  headers: { "content-type": "text/plain" },
+                  pipe: (dest: http.ServerResponse) => {
+                    dest.write("partial body");
+                    return dest;
+                  },
+                });
+                proxy.emit("proxyRes", proxyRes, req, res);
+                setImmediate(() => {
+                  proxyRes.emit(
+                    "error",
+                    new Error("synthetic upstream reset")
+                  );
+                });
+              },
+              ws: vi.fn(),
+            });
+            return proxy;
+          },
+        },
+      }));
+      const { startProxy: startProxyWithMock } = await import("./proxy.ts");
+      const proxyPort = await findFreePort(50_000);
+      handle = await startProxyWithMock(9, proxyPort);
+
+      const response = await requestViaProxyAllowAbort(proxyPort);
+
+      expect(response.statusCode).toBe(200);
+      expect(response.aborted).toBe(true);
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      vi.doUnmock("http-proxy");
+      vi.resetModules();
+      consoleSpy.mockRestore();
+    }
+  });
 });
 
 describeIfLoopback("proxy transport fidelity", () => {

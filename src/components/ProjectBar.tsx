@@ -104,6 +104,7 @@ export function ProjectBar({
           <div className="flex gap-2">
             <button
               onClick={() => setSelectMode(!selectMode)}
+              aria-pressed={selectMode}
               className={`flex-1 rounded px-3 py-1 font-medium ${
                 selectMode
                   ? "bg-amber-500 text-black"

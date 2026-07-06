@@ -12,6 +12,8 @@ const runningInfo: ProjectInfo = {
   running: true,
   beforeProxyPort: 5174,
   afterProxyPort: 5175,
+  targetPortBefore: 5173,
+  targetPortAfter: 5173,
   gitMode: "worktree",
 };
 

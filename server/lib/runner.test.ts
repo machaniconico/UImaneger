@@ -1,7 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import type { ChildProcess } from "node:child_process";
 import {
   detectRunnerFromFacts,
   extractPort,
+  extractPortForRunnerOutput,
+  reduceDetectedPort,
+  killGroup,
   type ProjectFacts,
 } from "./runner.ts";
 
@@ -231,5 +235,99 @@ describe("extractPort — 境界値", () => {
     expect(
       extractPort("Local: http://localhost:3000 also listening on :4000")
     ).toBe(3000);
+  });
+});
+
+describe("extractPortForRunnerOutput — knownPort の上書き制限", () => {
+  it("knownPort では無関係な依存ポートを無視し listen 行だけ採用する", () => {
+    expect(
+      extractPortForRunnerOutput("cache: redis://localhost:6379", true)
+    ).toBeNull();
+    expect(
+      extractPortForRunnerOutput("db: postgres://localhost:5432", true)
+    ).toBeNull();
+    expect(
+      extractPortForRunnerOutput(
+        "dependency dashboard: http://127.0.0.1:6379",
+        true
+      )
+    ).toBeNull();
+
+    expect(
+      extractPortForRunnerOutput("  ➜  Local:   http://localhost:61234/", true)
+    ).toBe(61234);
+  });
+
+  it("knownPort でない場合は従来どおり最初に見つかったポートを採用する", () => {
+    expect(
+      extractPortForRunnerOutput(
+        "dependency dashboard: http://127.0.0.1:6379",
+        false
+      )
+    ).toBe(6379);
+  });
+
+  it("Django/旧 Laravel の development server 行を listen 行として拾う", () => {
+    expect(
+      extractPortForRunnerOutput(
+        "Starting development server at http://127.0.0.1:8001/",
+        true
+      )
+    ).toBe(8001);
+  });
+});
+
+describe("reduceDetectedPort — 次ポート決定", () => {
+  it("knownPort: listen 行の実ポートに上書きする(#11 の再検出)", () => {
+    // assumed port 3000 で起動 → 実際は 3001 に listen
+    expect(
+      reduceDetectedPort(3000, "- Local: http://localhost:3001", true)
+    ).toBe(3001);
+  });
+
+  it("knownPort: 無関係な依存ポート行では上書きしない(デコイ耐性)", () => {
+    expect(
+      reduceDetectedPort(3000, "cache: redis://localhost:6379", true)
+    ).toBe(3000);
+  });
+
+  it("非 knownPort: 最初に検出したポートを維持する(first-wins、last-wins 回帰を防ぐ)", () => {
+    // 最初の実ポートを採用
+    expect(reduceDetectedPort(0, "listening on http://localhost:4000", false)).toBe(
+      4000
+    );
+    // 後続の無関係トークンでは 4000 から動かさない
+    expect(
+      reduceDetectedPort(4000, "Proxying /api -> http://localhost:9999", false)
+    ).toBe(4000);
+  });
+
+  it("同一ポート・ポート無し行では現在値を維持する", () => {
+    expect(reduceDetectedPort(5173, "  Local: http://localhost:5173/", true)).toBe(
+      5173
+    );
+    expect(reduceDetectedPort(5173, "compiling...", true)).toBe(5173);
+  });
+});
+
+describe("killGroup", () => {
+  it("sends SIGKILL to the process group even when the leader has already exited", async () => {
+    const proc = {
+      pid: 12345,
+      exitCode: 0,
+      signalCode: null,
+      kill: vi.fn(),
+    } as unknown as ChildProcess;
+    const killSpy = vi.spyOn(process, "kill").mockReturnValue(true);
+
+    try {
+      await killGroup(proc, { graceMs: 0 });
+
+      expect(killSpy).toHaveBeenCalledWith(-12345, "SIGTERM");
+      expect(killSpy).toHaveBeenCalledWith(-12345, "SIGKILL");
+      expect(proc.kill).not.toHaveBeenCalled();
+    } finally {
+      killSpy.mockRestore();
+    }
   });
 });

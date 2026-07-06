@@ -94,9 +94,11 @@ describe("DiffView", () => {
     });
     render(<DiffView diff={SAMPLE_DIFF} onApply={() => {}} onReject={() => {}} />);
 
-    await user.click(screen.getByRole("button", { name: "diff をコピー" }));
+    expect(screen.queryByRole("button", { name: "diff をコピー" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "コピー" }));
 
     expect(writeText).toHaveBeenCalledWith(SAMPLE_DIFF);
     expect(await screen.findByText("コピー済")).not.toBeNull();
+    expect(screen.getByText("コピーしました")).not.toBeNull();
   });
 });

@@ -8,6 +8,7 @@ import type { DomDescriptor, EditProposal } from "../lib/types";
 
 vi.mock("../lib/api", () => ({
   api: {
+    status: vi.fn(),
     edit: vi.fn(),
     editCandidate: vi.fn(),
     applyEdit: vi.fn(),
@@ -53,6 +54,7 @@ async function sendInstruction(user: ReturnType<typeof userEvent.setup>, text: s
 describe("Chat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(api.status).mockReturnValue(new Promise<never>(() => {}));
   });
   afterEach(cleanup);
 
@@ -213,7 +215,7 @@ describe("Chat", () => {
     expect(screen.queryByText("処理中…")).toBeNull();
   });
 
-  it("api.undoEdit が例外を投げたときエラー表示し busy 解除される", async () => {
+  it("api.undoEdit が例外を投げたときエラー表示し undoDepth を 0 にする", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
     vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
@@ -227,13 +229,54 @@ describe("Chat", () => {
     await user.click(undoBtn);
 
     expect(await screen.findByText(/network down/)).not.toBeNull();
-    await waitFor(() => expect(undoBtn.disabled).toBe(false));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /undo/ })).toBeNull()
+    );
+    expect(screen.queryByText("処理中…")).toBeNull();
   });
 
-  it("初期 undoDepth があると undo ボタンを表示する", () => {
-    render(<Chat selected={descriptor} hasKey={true} initialUndoDepth={3} />);
+  it("mount 時に api.status から undoDepth を取得して undo ボタンを表示する", async () => {
+    vi.mocked(api.status).mockResolvedValueOnce({
+      info: null,
+      hasKey: true,
+      logs: [],
+      undoDepth: 3,
+    });
+    render(<Chat selected={descriptor} hasKey={true} />);
 
-    expect(screen.getByRole("button", { name: /undo \(3\)/ })).not.toBeNull();
+    expect(
+      await screen.findByRole("button", { name: /undo \(3\)/ })
+    ).not.toBeNull();
+  });
+
+  it("project key が変わると新しい project の undoDepth を再取得する", async () => {
+    vi.mocked(api.status)
+      .mockResolvedValueOnce({
+        info: null,
+        hasKey: true,
+        logs: [],
+        undoDepth: 3,
+      })
+      .mockResolvedValueOnce({
+        info: null,
+        hasKey: true,
+        logs: [],
+        undoDepth: 1,
+      });
+    const { rerender } = render(
+      <Chat key="/demo" selected={descriptor} hasKey={true} />
+    );
+
+    expect(
+      await screen.findByRole("button", { name: /undo \(3\)/ })
+    ).not.toBeNull();
+
+    rerender(<Chat key="/other" selected={descriptor} hasKey={true} />);
+
+    expect(
+      await screen.findByRole("button", { name: /undo \(1\)/ })
+    ).not.toBeNull();
+    expect(api.status).toHaveBeenCalledTimes(2);
   });
 
   it("提案生成の hard failure では入力した指示文を復元する", async () => {

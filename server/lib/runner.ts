@@ -379,7 +379,7 @@ export function waitForExit(
 }
 
 /**
- * プロセスグループへ SIGTERM → (graceMs 内に終了しなければ) SIGKILL で確実に停止。
+ * プロセスグループへ SIGTERM → graceMs 待機 → SIGKILL で確実に停止。
  * プロセスの所有者である runner.ts でのみ定義し、export して全利用側で共有する。
  */
 export async function killGroup(
@@ -387,8 +387,7 @@ export async function killGroup(
   opts?: { graceMs?: number }
 ): Promise<void> {
   signalGroup(proc, "SIGTERM");
-  const exited = await waitForExit(proc, opts?.graceMs ?? 3_000);
-  if (exited) return;
+  await waitForExit(proc, opts?.graceMs ?? 3_000);
   signalGroup(proc, "SIGKILL");
   await waitForExit(proc, 1_000);
 }
@@ -411,6 +410,8 @@ export const PORT_PATTERNS: readonly RegExp[] = [
   /Server\s+running\s+(?:at\s+(?:[^\s:]*:)?|on\s+port\s+)(\d{2,5})\b/,
   // "started on host:PORT" / "started on PORT"
   /[Ss]tarted\s+on\s+(?:[^\s:]*:)?(\d{2,5})\b/,
+  // "started server on host:PORT" / "started server on port PORT"
+  /[Ss]tarted\s+server\s+(?:at\s+|on\s+)?(?:port\s+)?(?:[^\s:]*:)?(\d{2,5})\b/,
   // "started on 7000" / "listening on 7000" など scheme 無し裸ポート
   /\b(?:started|listening)\s+on\s+(\d{2,5})\b/,
   // "ready on http://host:PORT" (Next.js) は URL パターンでカバー済み
@@ -426,6 +427,37 @@ export function extractPort(line: string): number | null {
     }
   }
   return null;
+}
+
+const KNOWN_PORT_OVERRIDE_LINE_PATTERN =
+  /(?:\blocal\s*:|\blistening\b|\bready\b|\bserver\s+running\b|\bstarted\s+server\b|\bdevelopment\s+server\b|\bon\s+your\s+network\b|https?:\/\/localhost:)/i;
+
+export function extractPortForRunnerOutput(
+  line: string,
+  knownPort: boolean
+): number | null {
+  if (knownPort && !KNOWN_PORT_OVERRIDE_LINE_PATTERN.test(line)) {
+    return null;
+  }
+  return extractPort(line);
+}
+
+/**
+ * 収集した 1 行から次の detectedPort を決める純関数。
+ * - knownPort プラン: listen/ready 行で検出した実ポートに上書き(#11 の 60s ハング防止)。
+ *   起動ログ中の無関係ポート(redis:// 等)には extractPortForRunnerOutput のガードで騙されない。
+ * - 非 knownPort プラン: 最初に検出したポートを維持(first-wins)。後続の無関係トークンで
+ *   正しいポートから外れる last-wins 回帰を避ける。
+ */
+export function reduceDetectedPort(
+  current: number,
+  line: string,
+  knownPort: boolean
+): number {
+  const p = extractPortForRunnerOutput(line, knownPort);
+  if (!p || p === current) return current;
+  if (!knownPort && current) return current; // 非 knownPort は first-wins
+  return p;
 }
 
 /** 対象を起動し、ポートが listen するまで待つ。 */
@@ -454,16 +486,24 @@ export async function startTarget(
   });
 
   let detectedPort = plan.knownPort ? port : 0;
+  const appendLog = (line: string) => {
+    logs.push(line);
+    if (logs.length > 500) logs.shift();
+    onLog?.(line);
+  };
   const collect = (buf: Buffer) => {
     const text = buf.toString();
     for (const line of text.split("\n")) {
       if (!line.trim()) continue;
-      logs.push(line);
-      if (logs.length > 500) logs.shift();
-      onLog?.(line);
-      if (!detectedPort) {
-        const p = extractPort(line);
-        if (p) detectedPort = p;
+      appendLog(line);
+      const next = reduceDetectedPort(detectedPort, line, plan.knownPort);
+      if (next !== detectedPort) {
+        if (detectedPort) {
+          appendLog(
+            `[UImaneger] detected port ${next} from output; using it instead of ${detectedPort}`
+          );
+        }
+        detectedPort = next;
       }
     }
   };

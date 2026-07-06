@@ -3,7 +3,7 @@
 // 実プロセス・実ポートを使う node 環境テスト。jsdom 不要。
 import { describe, it, expect } from "vitest";
 import http from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -174,6 +174,31 @@ describe("startTarget", () => {
       // 60秒待たず数秒以内に reject されること
       expect(elapsed).toBeLessThan(10_000);
     } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("rejects promptly when direct spawn fails with ENOENT", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-enoent-"));
+    const oldPath = process.env.PATH;
+    try {
+      writeFileSync(
+        join(tmp, "package.json"),
+        JSON.stringify({ dependencies: { next: "14.0.0" } })
+      );
+      process.env.PATH = join(tmp, "missing-bin");
+
+      const start = Date.now();
+      await expect(startTarget(tmp, 3000)).rejects.toThrow(/起動できません/);
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeLessThan(10_000);
+    } finally {
+      if (oldPath === undefined) {
+        delete process.env.PATH;
+      } else {
+        process.env.PATH = oldPath;
+      }
+      killAllChildrenSync();
       rmSync(tmp, { recursive: true, force: true });
     }
   }, 20_000);
