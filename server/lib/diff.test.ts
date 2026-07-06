@@ -91,6 +91,18 @@ describe("diffLines", () => {
     expect(out[1499]).toEqual({ type: "remove", text: "old 1499" });
     expect(out[1500]).toEqual({ type: "add", text: "new 0" });
   });
+
+  it("falls back to a full replacement when one side has too many lines", () => {
+    const original = [
+      "shared anchor",
+      ...Array.from({ length: 20_000 }, (_, i) => `old ${i}`),
+    ].join("\n");
+    const out = diffLines(original, "shared anchor");
+
+    expect(out).toHaveLength(20_002);
+    expect(out[0]).toEqual({ type: "remove", text: "shared anchor" });
+    expect(out[20_001]).toEqual({ type: "add", text: "shared anchor" });
+  });
 });
 
 describe("createUnifiedDiff", () => {

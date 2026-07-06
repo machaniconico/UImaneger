@@ -292,6 +292,106 @@ describe("S6 — before プレビュー起動失敗の可視化", () => {
   });
 });
 
+describe("R12 — セッション状態機械", () => {
+  it("exit 済み after target は running=false になり、startProject が再起動する", async () => {
+    let portOffset = 0;
+    const closedProxyPorts: number[] = [];
+    findFreePortMock.mockImplementation(async (start: number) => {
+      portOffset += 1;
+      return start + portOffset;
+    });
+    startTargetMock.mockImplementation(async (_dir: string, port: number) => {
+      const f = makeFakeProc();
+      createdProcs.push(f);
+      return {
+        proc: f.proc,
+        plan: {
+          framework: "Vite",
+          command: "npx",
+          args: ["vite"],
+          knownPort: true,
+        },
+        port,
+        logs: [],
+      } as any;
+    });
+    startProxyMock.mockImplementation(async (_tp: number, pp: number) => {
+      return {
+        server: {},
+        port: pp,
+        close: async () => {
+          closedProxyPorts.push(pp);
+        },
+      } as any;
+    });
+
+    await openProject(root);
+    const first = await startProject();
+    createdProcs[0].proc.kill("SIGTERM");
+
+    expect(getInfo()?.running).toBe(false);
+
+    const restarted = await startProject();
+
+    expect(startTargetMock).toHaveBeenCalledTimes(2);
+    expect(startProxyMock).toHaveBeenCalledTimes(4);
+    expect(closedProxyPorts).toHaveLength(2);
+    expect(restarted.running).toBe(true);
+    expect(restarted.targetPortAfter).not.toBe(first.targetPortAfter);
+    expect(createdProcs[1].proc.exitCode).toBeNull();
+  });
+
+  it("before proxy 起動失敗時、起動済み before target を停止して参照を外す", async () => {
+    const beforeDir = mkdtempSync(join(tmpdir(), "uim-before-proxy-"));
+    let afterProc!: FakeProc;
+    let beforeProc!: FakeProc;
+    try {
+      prepareBeforeMock.mockReturnValue({
+        dir: beforeDir,
+        mode: "worktree",
+        root,
+        worktreeAdded: true,
+        worktreeRoot: beforeDir,
+      });
+      startTargetMock.mockImplementation(async (dir: string, port: number) => {
+        const f = makeFakeProc();
+        createdProcs.push(f);
+        if (dir === beforeDir) beforeProc = f;
+        else afterProc = f;
+        return {
+          proc: f.proc,
+          plan: {
+            framework: "Vite",
+            command: "npx",
+            args: ["vite"],
+            knownPort: true,
+          },
+          port,
+          logs: [],
+        } as any;
+      });
+      startProxyMock.mockImplementation(async (_tp: number, pp: number) => {
+        if (pp === 6110) throw new Error("boom: before proxy");
+        return { server: {}, port: pp, close: async () => {} } as any;
+      });
+
+      const info = await openAndStart(root);
+
+      expect(info.beforeError).toContain("編集前プレビュー起動失敗");
+      expect(info.beforeError).toContain("boom: before proxy");
+      expect(info.beforeProxyPort).toBeNull();
+      expect(info.targetPortBefore).toBeNull();
+      expect(info.running).toBe(true);
+      expect(startTargetMock).toHaveBeenCalledTimes(2);
+      expect(startProxyMock).toHaveBeenCalledTimes(2);
+      expect(beforeProc.proc.exitCode).not.toBeNull();
+      expect(afterProc.proc.exitCode).toBeNull();
+    } finally {
+      rmSync(beforeDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("F1 — runCommand override", () => {
   let noDetectRoot: string;
   let beforeDir: string;

@@ -4,6 +4,7 @@ import {
   findFreePort,
   detectRunner,
   killGroup,
+  hasExited,
   type RunningTarget,
 } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
@@ -88,7 +89,16 @@ async function _openProject(
 async function _startProject(): Promise<ProjectInfo> {
   if (!session) throw new Error("プロジェクトが開かれていません。");
   // 2本目の並行 start はここで短絡する(直列化されているので最初の start 完了後)
-  if (session.targetAfter && session.proxyAfter) return getInfo()!;
+  if (
+    session.targetAfter &&
+    session.proxyAfter &&
+    !hasExited(session.targetAfter.proc)
+  ) {
+    return getInfo()!;
+  }
+  if (session.targetAfter || session.proxyAfter) {
+    await _stopProject();
+  }
 
   try {
   // before 配信ディレクトリ準備 (worktree/snapshot/none)
@@ -169,6 +179,11 @@ async function _startProject(): Promise<ProjectInfo> {
       session.beforeError = `編集前プレビュー起動失敗: ${String(
         (e as any)?.message ?? e
       )}`;
+      const targetBefore = session.targetBefore;
+      session.targetBefore = null;
+      if (targetBefore && targetBefore !== session.targetAfter) {
+        await killGroup(targetBefore.proc).catch(() => {});
+      }
       session.proxyBefore = null;
     }
   }
@@ -245,7 +260,11 @@ export function getInfo(): ProjectInfo | null {
     // legacy (after 側)
     targetPort: session.targetAfter?.port ?? null,
     proxyPort: session.proxyAfter?.port ?? null,
-    running: Boolean(session.targetAfter && session.proxyAfter),
+    running: Boolean(
+      session.targetAfter &&
+        session.proxyAfter &&
+        !hasExited(session.targetAfter.proc)
+    ),
     // shared_contract (before/after 二重配信)
     beforeProxyPort: session.proxyBefore?.port ?? null,
     afterProxyPort: session.proxyAfter?.port ?? null,

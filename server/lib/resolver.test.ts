@@ -46,6 +46,7 @@ async function fixture(files: Record<string, string>): Promise<string> {
 afterEach(async () => {
   __resolverTestHooks.forceRgUsable(null);
   __resolverTestHooks.resetNodeGrepTreeWalks();
+  __resolverTestHooks.setNodeGrepTotalBytesCapForTest(null);
   await Promise.all(tempRoots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -344,6 +345,46 @@ describe("resolveSource Layer-B integration", () => {
 
     expect(result.file).toBe(join(root, "src/DashHit.tsx"));
     expect(result.line).toBe(2);
+  });
+
+  it("does not accept a source without lineNumber as high-confidence", async () => {
+    const root = await fixture({
+      "src/SourceOnly.tsx": [
+        "export function SourceOnly() {",
+        "  return <button>Source only</button>;",
+        "}",
+      ].join("\n"),
+    });
+    __resolverTestHooks.forceRgUsable(true);
+
+    const result = await resolveSource(
+      root,
+      mkD({
+        source: { fileName: join(root, "src/SourceOnly.tsx") } as any,
+      })
+    );
+
+    expect(result).toEqual({ file: "", confidence: "low", candidates: [] });
+  });
+
+  it("stops the no-ripgrep file cache when the total byte cap is reached", async () => {
+    const root = await fixture({
+      "src/Hit.tsx": [
+        "export function Hit() {",
+        "  return <button>Byte Cap Target</button>;",
+        "}",
+      ].join("\n"),
+    });
+    __resolverTestHooks.forceRgUsable(false);
+    __resolverTestHooks.setNodeGrepTotalBytesCapForTest(1);
+
+    const { candidates, termHits } = await __resolverTestHooks.collectCandidates(
+      root,
+      mkD({ textSnippet: "Byte Cap Target" })
+    );
+
+    expect(candidates).toEqual([]);
+    expect(termHits.get("Byte Cap Target")).toBe(0);
   });
 
   it("uses one project walk in the no-ripgrep path while preserving aggregate matches", async () => {

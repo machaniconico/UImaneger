@@ -17,22 +17,33 @@
   var currentEl = null;
   var rafPending = false;
   var resizeObs = null;
-  var cachedParentOrigin;
+  var trustedParentOrigin = null;
+  var readySent = false;
 
-  function parentOrigin() {
-    if (cachedParentOrigin !== undefined) return cachedParentOrigin;
+  function isTrustedOrigin(o) {
     try {
-      cachedParentOrigin = document.referrer
-        ? new URL(document.referrer).origin
-        : "";
+      var u = new URL(o);
+      return (
+        u.hostname === "127.0.0.1" ||
+        u.hostname === "localhost" ||
+        u.hostname === "[::1]" ||
+        u.hostname === "::1" ||
+        u.hostname.endsWith(".localhost")
+      );
     } catch (e) {
-      cachedParentOrigin = "";
+      return false;
     }
-    return cachedParentOrigin;
   }
 
   function postToParent(message) {
-    window.parent.postMessage(message, parentOrigin() || "*");
+    if (!trustedParentOrigin) return false;
+    window.parent.postMessage(message, trustedParentOrigin);
+    return true;
+  }
+
+  function sendReady() {
+    if (readySent) return;
+    if (postToParent({ type: "uim:ready" })) readySent = true;
   }
 
   function ensureOverlay() {
@@ -231,11 +242,23 @@
     }
   }
 
+  function textWithBoundaries(el) {
+    var s = "";
+    if (!el || !el.childNodes) return s;
+    el.childNodes.forEach(function (n) {
+      s +=
+        n.nodeType === 3
+          ? n.textContent || ""
+          : " " + textWithBoundaries(n) + " ";
+    });
+    return s;
+  }
+
   // 層A含め全て失敗した時の DOM のみ最小 descriptor (payload 互換性を維持)
   function minimalDescriptor(el) {
     try {
       var r = el.getBoundingClientRect();
-      var text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120);
+      var text = textWithBoundaries(el).trim().replace(/\s+/g, " ").slice(0, 120);
       return {
         tag: el.nodeName.toLowerCase(),
         id: el.id || undefined,
@@ -268,7 +291,7 @@
         attrs[a.name] = a.value;
       }
       var r = el.getBoundingClientRect();
-      var text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120);
+      var text = textWithBoundaries(el).trim().replace(/\s+/g, " ").slice(0, 120);
       // 層A取得は個別に try/catch — 1つ失敗しても DOM 情報は生かす
       var vue, svelte, hints, source;
       try { vue = getVueInfo(el); } catch (e) {}
@@ -386,15 +409,18 @@
 
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      parentOrigin: parentOrigin,
+      isTrustedOrigin: isTrustedOrigin,
       safeProps: safeProps,
       cssPath: cssPath,
       getClasses: getClasses,
+      textWithBoundaries: textWithBoundaries,
       minimalDescriptor: minimalDescriptor,
       describe: describe,
     };
   }
 
+  // このスクリプトは注入された被プレビュー文書だけを inspect 対象にする。
+  // ネストした同一 origin iframe からの選択イベントは relay しない。
   window.addEventListener("mousemove", onMove, true);
   window.addEventListener("click", onClick, true);
   window.addEventListener("scroll", scheduleOverlayFollow, true);
@@ -402,6 +428,10 @@
 
   window.addEventListener("message", function (e) {
     if (e.source !== window.parent) return;
+    if (!isTrustedOrigin(e.origin)) return;
+    if (trustedParentOrigin && e.origin !== trustedParentOrigin) return;
+    trustedParentOrigin = e.origin;
+    sendReady();
     var d = e.data || {};
     if (d.type === "uim:setEnabled") setEnabled(!!d.value);
     else if (d.type === "uim:previewCss") applyPreviewCss(d.css);
@@ -410,5 +440,5 @@
   });
 
   // 起動通知
-  postToParent({ type: "uim:ready" });
+  sendReady();
 })();

@@ -7,6 +7,8 @@ import { AfterPreview } from "./components/AfterPreview.tsx";
 import { Chat } from "./components/Chat.tsx";
 import { StatusPanel } from "./components/StatusPanel.tsx";
 
+const STATUS_RETRY_DELAYS_MS = [500, 1000, 2000];
+
 export function App() {
   const [info, setInfo] = useState<ProjectInfo | null>(null);
   const [hasKey, setHasKey] = useState(false);
@@ -17,15 +19,44 @@ export function App() {
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    api
-      .status()
-      .then((s) => {
-        setInfo(s.info);
-        setHasKey(s.hasKey);
-      })
-      .catch((e: any) => {
-        setError(String(e?.message || e));
+    let alive = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const wait = (ms: number) =>
+      new Promise<void>((resolve) => {
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          resolve();
+        }, ms);
       });
+
+    async function loadStatus() {
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt <= STATUS_RETRY_DELAYS_MS.length; attempt++) {
+        try {
+          const s = await api.status();
+          if (!alive) return;
+          setInfo(s.info);
+          setHasKey(s.hasKey);
+          setError("");
+          return;
+        } catch (e) {
+          lastError = e;
+          if (!alive) return;
+          const delay = STATUS_RETRY_DELAYS_MS[attempt];
+          if (delay == null) break;
+          await wait(delay);
+          if (!alive) return;
+        }
+      }
+      if (alive) setError(String((lastError as any)?.message || lastError));
+    }
+
+    loadStatus();
+    return () => {
+      alive = false;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
   }, []);
 
   useEffect(() => {

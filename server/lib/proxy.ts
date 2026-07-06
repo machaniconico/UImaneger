@@ -7,6 +7,9 @@ import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INSPECTOR_PATH = join(__dirname, "..", "inspector-client.js");
+const FRAME_ANCESTORS_CSP =
+  "frame-ancestors 'self' http://localhost:* http://*.localhost:* http://127.0.0.1:* http://[::1]:*";
+const HTML_SNIFF_BYTES = 1024;
 
 let inspectorScript: string | null | undefined;
 function inspectorTag(): string {
@@ -53,12 +56,29 @@ function injectableCharset(contentType: string): boolean {
 
 function sniffHtmlBody(body: Buffer): boolean {
   const leading = body
-    .subarray(0, 512)
+    .subarray(0, HTML_SNIFF_BYTES)
     .toString("utf8")
     .replace(/^\uFEFF/, "")
     .trimStart()
     .toLowerCase();
   return leading.startsWith("<!doctype html") || leading.startsWith("<html");
+}
+
+function sniffHtmlStart(body: Buffer): "html" | "non-html" | "unknown" {
+  const leading = body
+    .subarray(0, HTML_SNIFF_BYTES)
+    .toString("utf8")
+    .replace(/^\uFEFF/, "")
+    .trimStart()
+    .toLowerCase();
+  if (leading.startsWith("<!doctype html") || leading.startsWith("<html")) {
+    return "html";
+  }
+  if (!leading) return body.byteLength >= HTML_SNIFF_BYTES ? "non-html" : "unknown";
+  if ("<!doctype html".startsWith(leading) || "<html".startsWith(leading)) {
+    return "unknown";
+  }
+  return "non-html";
 }
 
 function rewriteLocationValue(
@@ -112,9 +132,9 @@ export function startProxy(
     const mustSniff = ct.trim() === "";
 
     const headers = { ...proxyRes.headers };
-    // フレーム埋め込みを許可
+    // フレーム埋め込みは localhost ファミリの UImaneger UI に限定する。
     delete headers["x-frame-options"];
-    delete headers["content-security-policy"];
+    headers["content-security-policy"] = FRAME_ANCESTORS_CSP;
     // location は存在する時だけ書き換える。非リダイレクト応答(location 無し)で
     // undefined を代入すると res.writeHead が ERR_HTTP_INVALID_HEADER_VALUE を投げる。
     if (headers.location !== undefined) {
@@ -157,18 +177,8 @@ export function startProxy(
       );
     });
 
-    if (!declaredHtml && !mustSniff) {
-      res.writeHead(proxyRes.statusCode || 200, headers);
-      proxyRes.pipe(res);
-      return;
-    }
-
-    const chunks: Buffer[] = [];
-    proxyRes.on("data", (c) => chunks.push(Buffer.from(c)));
-    proxyRes.on("end", () => {
+    const sendBufferedResponse = (rawBody: Buffer, isHtml: boolean) => {
       if (upstreamErrored || res.destroyed || res.writableEnded) return;
-      const rawBody = Buffer.concat(chunks);
-      const isHtml = declaredHtml || (mustSniff && sniffHtmlBody(rawBody));
       if (!isHtml || !injectableCharset(ct)) {
         res.writeHead(proxyRes.statusCode || 200, headers);
         res.end(rawBody);
@@ -190,6 +200,53 @@ export function startProxy(
       headers["content-length"] = String(Buffer.byteLength(body));
       res.writeHead(proxyRes.statusCode || 200, headers);
       res.end(body);
+    };
+
+    if (!declaredHtml && !mustSniff) {
+      res.writeHead(proxyRes.statusCode || 200, headers);
+      proxyRes.pipe(res);
+      return;
+    }
+
+    const chunks: Buffer[] = [];
+    if (mustSniff) {
+      let bufferingForHtml = false;
+      const streamBufferedThenPipe = () => {
+        proxyRes.pause();
+        proxyRes.off("data", onSniffData);
+        proxyRes.off("end", onSniffEnd);
+        res.writeHead(proxyRes.statusCode || 200, headers);
+        for (const chunk of chunks) {
+          res.write(chunk);
+        }
+        proxyRes.pipe(res);
+        proxyRes.resume();
+      };
+      function onSniffData(c: Buffer) {
+        chunks.push(Buffer.from(c));
+        if (bufferingForHtml) return;
+        const buffered = Buffer.concat(chunks);
+        const decision = sniffHtmlStart(buffered);
+        if (decision === "html") {
+          bufferingForHtml = true;
+          return;
+        }
+        if (decision === "non-html" || buffered.byteLength >= HTML_SNIFF_BYTES) {
+          streamBufferedThenPipe();
+        }
+      }
+      function onSniffEnd() {
+        const rawBody = Buffer.concat(chunks);
+        sendBufferedResponse(rawBody, sniffHtmlBody(rawBody));
+      }
+      proxyRes.on("data", onSniffData);
+      proxyRes.on("end", onSniffEnd);
+      return;
+    }
+
+    proxyRes.on("data", (c) => chunks.push(Buffer.from(c)));
+    proxyRes.on("end", () => {
+      sendBufferedResponse(Buffer.concat(chunks), declaredHtml);
     });
   });
 

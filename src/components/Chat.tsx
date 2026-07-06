@@ -79,6 +79,11 @@ export function Chat({ selected, hasKey }: Props) {
     setMsgs((prev) => [...prev, m]);
   }
 
+  async function refreshUndoDepth() {
+    const s = await api.status();
+    setUndoDepth(s.undoDepth ?? 0);
+  }
+
   function handleProposal(res: EditProposal, originalText?: string) {
     if (res.ok && res.proposalId && res.diff) {
       setProposal(res);
@@ -164,10 +169,17 @@ export function Chat({ selected, hasKey }: Props) {
 
   async function reject() {
     if (busy) return; // apply とのレースを防ぐ
-    if (proposal?.proposalId) await api.rejectEdit(proposal.proposalId).catch(() => {});
-    setProposal(null);
-    setCandidates([]);
-    log({ role: "system", text: "提案を却下しました" });
+    setBusy(true);
+    try {
+      if (proposal?.proposalId) {
+        await api.rejectEdit(proposal.proposalId).catch(() => {});
+      }
+      setProposal(null);
+      setCandidates([]);
+      log({ role: "system", text: "提案を却下しました" });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function undo() {
@@ -184,12 +196,20 @@ export function Chat({ selected, hasKey }: Props) {
         window.dispatchEvent(new CustomEvent("uim:applied"));
         setUndoDepth(res.undoDepth ?? 0);
       } else {
-        setUndoDepth(res.undoDepth ?? 0);
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
+        if (res.undoDepth != null) {
+          setUndoDepth(res.undoDepth);
+        } else {
+          await refreshUndoDepth().catch((statusError) => {
+            console.error(statusError);
+          });
+        }
       }
     } catch (e: any) {
-      setUndoDepth(0);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+      await refreshUndoDepth().catch((statusError) => {
+        console.error(statusError);
+      });
     } finally {
       setBusy(false);
     }
@@ -316,7 +336,10 @@ export function Chat({ selected, hasKey }: Props) {
           value={instruction}
           onChange={(e) => setInstruction(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              send();
+            }
           }}
           aria-label="編集指示"
           placeholder={
