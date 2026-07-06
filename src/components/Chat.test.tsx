@@ -1,10 +1,18 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  createEvent,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Chat } from "./Chat";
 import { api } from "../lib/api";
-import type { DomDescriptor, EditProposal } from "../lib/types";
+import type { DomDescriptor, EditProposal, ProjectInfo } from "../lib/types";
 
 vi.mock("../lib/api", () => ({
   api: {
@@ -81,6 +89,28 @@ describe("Chat", () => {
     expect(api.applyEdit).not.toHaveBeenCalled();
   });
 
+  it("Ctrl+Enter 送信では textarea の既定改行を抑止して送信する", async () => {
+    vi.mocked(api.edit).mockResolvedValue(goodProposal());
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    const textarea = screen.getByRole("textbox", {
+      name: "編集指示",
+    }) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "赤くして" } });
+    const event = createEvent.keyDown(textarea, {
+      key: "Enter",
+      ctrlKey: true,
+    });
+    const preventDefault = vi.spyOn(event, "preventDefault");
+
+    fireEvent(textarea, event);
+
+    expect(preventDefault).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(api.edit).toHaveBeenCalledWith(descriptor, "赤くして")
+    );
+  });
+
   it("承認クリックで api.applyEdit が呼ばれ、成功メッセージが出る", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
@@ -143,6 +173,41 @@ describe("Chat", () => {
     expect(screen.queryByText("処理中…")).toBeNull();
   });
 
+  it("却下中は busy になり二重 reject を防ぐ", async () => {
+    const user = userEvent.setup();
+    let resolveReject!: () => void;
+    vi.mocked(api.edit).mockResolvedValue(goodProposal());
+    vi.mocked(api.rejectEdit).mockReturnValue(
+      new Promise((resolve) => {
+        resolveReject = () => resolve({ ok: true });
+      })
+    );
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByText("承認して適用");
+    const rejectBtn = screen.getByRole("button", {
+      name: "却下",
+    }) as HTMLButtonElement;
+
+    await user.click(rejectBtn);
+
+    expect(api.rejectEdit).toHaveBeenCalledWith("p1");
+    expect(screen.getByText("処理中…")).not.toBeNull();
+    expect(rejectBtn.disabled).toBe(true);
+
+    await user.click(rejectBtn);
+
+    expect(api.rejectEdit).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveReject();
+    });
+
+    expect(await screen.findByText("提案を却下しました")).not.toBeNull();
+    expect(screen.queryByText("処理中…")).toBeNull();
+  });
+
   it("confidence=low/candidates ありのとき Candidates が表示され、選択で api.editCandidate が呼ばれる", async () => {
     const user = userEvent.setup();
     const candidate = { file: "src/App.tsx", line: 10, preview: "const x = 1" };
@@ -190,8 +255,7 @@ describe("Chat", () => {
     expect(await screen.findByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
   });
 
-  // undo 失敗の回帰テスト(R4で catch を追加。apply 側と対称にカバー)
-  it("api.undoEdit が ok:false を返したときエラー表示し undoDepth を 0 にする", async () => {
+  it("api.undoEdit が ok:false を返したとき status を再取得して undoDepth を更新する", async () => {
     const user = userEvent.setup();
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
     vi.mocked(api.applyEdit).mockResolvedValue({
@@ -206,17 +270,24 @@ describe("Chat", () => {
     await screen.findByText("承認して適用");
     await user.click(screen.getByRole("button", { name: "承認して適用" }));
     const undoBtn = (await screen.findByRole("button", { name: /undo/ })) as HTMLButtonElement;
+    vi.mocked(api.status).mockResolvedValueOnce({
+      info: null,
+      hasKey: true,
+      logs: [],
+      undoDepth: 2,
+    });
     await user.click(undoBtn);
 
     expect(await screen.findByText(/undo失敗/)).not.toBeNull();
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: /undo/ })).toBeNull()
-    );
+    expect(
+      await screen.findByRole("button", { name: /undo \(2\)/ })
+    ).not.toBeNull();
     expect(screen.queryByText("処理中…")).toBeNull();
   });
 
-  it("api.undoEdit が例外を投げたときエラー表示し undoDepth を 0 にする", async () => {
+  it("api.undoEdit と status 再取得が失敗したとき undoDepth を維持する", async () => {
     const user = userEvent.setup();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
     vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx" });
     vi.mocked(api.undoEdit).mockRejectedValue(new Error("network down"));
@@ -226,13 +297,16 @@ describe("Chat", () => {
     await screen.findByText("承認して適用");
     await user.click(screen.getByRole("button", { name: "承認して適用" }));
     const undoBtn = (await screen.findByRole("button", { name: /undo/ })) as HTMLButtonElement;
+    vi.mocked(api.status).mockRejectedValueOnce(new Error("status down"));
     await user.click(undoBtn);
 
     expect(await screen.findByText(/network down/)).not.toBeNull();
-    await waitFor(() =>
-      expect(screen.queryByRole("button", { name: /undo/ })).toBeNull()
-    );
+    expect(
+      await screen.findByRole("button", { name: /undo \(1\)/ })
+    ).not.toBeNull();
+    expect(consoleError).toHaveBeenCalled();
     expect(screen.queryByText("処理中…")).toBeNull();
+    consoleError.mockRestore();
   });
 
   it("mount 時に api.status から undoDepth を取得して undo ボタンを表示する", async () => {
@@ -333,5 +407,98 @@ describe("Chat", () => {
     expect(screen.queryByText("+added line")).toBeNull();
     expect(screen.queryByText("提案対象: <button #btn> \"Click me\"")).toBeNull();
     expect(screen.queryByRole("button", { name: "承認して適用" })).toBeNull();
+  });
+});
+
+describe("App", () => {
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+    vi.doUnmock("../lib/api.ts");
+    vi.doUnmock("./ProjectBar.tsx");
+    vi.doUnmock("./BeforePreview.tsx");
+    vi.doUnmock("./AfterPreview.tsx");
+    vi.doUnmock("./Chat.tsx");
+    vi.doUnmock("./StatusPanel.tsx");
+  });
+
+  it("初回 status が一度失敗しても短いバックオフ後に再取得して両プレビューへ info を渡す", async () => {
+    const info: ProjectInfo = {
+      root: "/tmp/retry-project",
+      name: "Retry Project",
+      framework: "vite",
+      runCommand: "npm run dev",
+      running: true,
+      beforeProxyPort: 3101,
+      afterProxyPort: 3102,
+      targetPortBefore: 5173,
+      targetPortAfter: 5174,
+      gitMode: "worktree",
+    };
+    const status = vi.mocked(api.status);
+    status
+      .mockReset()
+      .mockRejectedValueOnce(new Error("temporary status failure"))
+      .mockResolvedValue({
+        info,
+        hasKey: true,
+        logs: [],
+        undoDepth: 0,
+      });
+
+    vi.doMock("./ProjectBar.tsx", () => ({
+      ProjectBar: ({
+        info,
+        hasKey,
+      }: {
+        info: ProjectInfo | null;
+        hasKey: boolean;
+      }) => (
+        <div data-testid="project-bar">
+          {info?.name ?? "none"}:{hasKey ? "key" : "no-key"}
+        </div>
+      ),
+    }));
+    vi.doMock("./BeforePreview.tsx", () => ({
+      BeforePreview: ({ info }: { info: ProjectInfo | null }) => (
+        <div data-testid="before-preview">before:{info?.name ?? "none"}</div>
+      ),
+    }));
+    vi.doMock("./AfterPreview.tsx", () => ({
+      AfterPreview: ({ info }: { info: ProjectInfo | null }) => (
+        <div data-testid="after-preview">after:{info?.name ?? "none"}</div>
+      ),
+    }));
+    vi.doMock("./Chat.tsx", () => ({
+      Chat: () => <div data-testid="chat" />,
+    }));
+    vi.doMock("./StatusPanel.tsx", () => ({
+      StatusPanel: () => <div data-testid="status-panel" />,
+    }));
+
+    const { App } = await import("../App");
+    vi.useFakeTimers();
+    render(<App />);
+
+    expect(status).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("before-preview").textContent).toBe("before:none");
+    expect(screen.getByTestId("after-preview").textContent).toBe("after:none");
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("before:Retry Project")).not.toBeNull();
+    expect(screen.getByText("after:Retry Project")).not.toBeNull();
+    expect(screen.getByTestId("project-bar").textContent).toBe("Retry Project:key");
+    expect(screen.queryByText(/temporary status failure/)).toBeNull();
+    expect(status).toHaveBeenCalledTimes(2);
   });
 });

@@ -9,6 +9,7 @@ export interface DiffLine {
 }
 
 const MAX_LCS_CELLS = 2_000_000;
+const MAX_LCS_LINES = 20_000;
 
 /** CRLF/CR を LF に正規化してから行配列へ。空文字列は空配列。末尾の空行は取り除く。 */
 function splitLines(text: string): string[] {
@@ -65,7 +66,7 @@ export function diffLines(original: string, proposed: string): DiffLine[] {
   const n = a.length;
   const m = b.length;
 
-  if (n * m > MAX_LCS_CELLS) {
+  if (Math.max(n, m) > MAX_LCS_LINES || n * m > MAX_LCS_CELLS) {
     return fullReplacementDiff(a, b);
   }
 

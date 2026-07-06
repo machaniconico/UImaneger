@@ -196,6 +196,33 @@ function withBom(content: string, hadBom: boolean): string {
   return hadBom ? `\uFEFF${withoutBom}` : withoutBom;
 }
 
+function countEols(content: string): { crlf: number; bareLf: number } {
+  let crlf = 0;
+  let bareLf = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] !== "\n") continue;
+    if (i > 0 && content[i - 1] === "\r") crlf++;
+    else bareLf++;
+  }
+  return { crlf, bareLf };
+}
+
+function restoreDominantCrLf(original: string, edited: string): string {
+  const { crlf, bareLf } = countEols(original);
+  if (crlf <= bareLf) return edited;
+
+  let restored = "";
+  for (let i = 0; i < edited.length; i++) {
+    const ch = edited[i];
+    if (ch === "\n" && (i === 0 || edited[i - 1] !== "\r")) {
+      restored += "\r\n";
+    } else {
+      restored += ch;
+    }
+  }
+  return restored;
+}
+
 /** 期限切れ・過剰件数の提案を破棄(TTL 30分 / 上限 PROPOSAL_MAX)。 */
 function pruneProposals(): void {
   const now = Date.now();
@@ -582,9 +609,12 @@ async function buildProposalForFile(
     }
     throw e;
   }
-  const edited = withBom(stripCodeFence(raw), false);
+  const edited = restoreDominantCrLf(
+    original,
+    withBom(stripCodeFence(raw), false)
+  );
 
-  if (!edited || edited.trim() === original.trim()) {
+  if (!edited || edited === original) {
     return {
       ok: false,
       file,

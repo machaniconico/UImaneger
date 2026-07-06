@@ -16,8 +16,9 @@ interface InspectorPayload {
 }
 
 interface InspectorHelpers {
-  parentOrigin: () => string;
+  isTrustedOrigin: (origin: string) => boolean;
   safeProps: (props: unknown) => Record<string, unknown> | undefined;
+  textWithBoundaries: (el: Element) => string;
   describe: (el: Element) => InspectorPayload;
 }
 
@@ -35,18 +36,26 @@ const inspectorSource = readFileSync(
 function loadInspector(referrer = "https://editor.example/projects/1"): {
   helpers: InspectorHelpers;
   messages: PostedMessage[];
+  doc: Document;
+  win: Window;
+  dispatchParentMessage: (data: unknown, origin: string) => void;
 } {
-  document.head.innerHTML = "";
   document.body.innerHTML = "";
-  delete (window as typeof window & { __uimInspectorLoaded?: boolean })
+  const frame = document.createElement("iframe");
+  document.body.appendChild(frame);
+  const win = frame.contentWindow!;
+  const doc = frame.contentDocument!;
+  doc.head.innerHTML = "";
+  doc.body.innerHTML = "";
+  delete (win as typeof window & { __uimInspectorLoaded?: boolean })
     .__uimInspectorLoaded;
-  Object.defineProperty(document, "referrer", {
+  Object.defineProperty(doc, "referrer", {
     configurable: true,
     value: referrer,
   });
 
   const messages: PostedMessage[] = [];
-  const parentWindow = window.parent as Window & {
+  const parentWindow = win.parent as Window & {
     postMessage: (message: unknown, targetOrigin: string) => void;
   };
   parentWindow.postMessage = (message: unknown, targetOrigin: string) => {
@@ -55,8 +64,8 @@ function loadInspector(referrer = "https://editor.example/projects/1"): {
 
   const module = { exports: {} };
   const context = vm.createContext({
-    window,
-    document,
+    window: win,
+    document: doc,
     URL,
     module,
     console,
@@ -75,13 +84,24 @@ function loadInspector(referrer = "https://editor.example/projects/1"): {
   return {
     helpers: module.exports as InspectorHelpers,
     messages,
+    doc,
+    win,
+    dispatchParentMessage: (data: unknown, origin: string) => {
+      win.dispatchEvent(
+        new MessageEvent("message", {
+          data,
+          origin,
+          source: win.parent,
+        })
+      );
+    },
   };
 }
 
 describe("inspector-client helpers", () => {
   it("keeps the selected element payload backward-compatible", () => {
-    const { helpers } = loadInspector();
-    document.body.innerHTML = `
+    const { helpers, doc } = loadInspector();
+    doc.body.innerHTML = `
       <main>
         <button
           id="save"
@@ -95,7 +115,7 @@ describe("inspector-client helpers", () => {
       </main>
     `;
 
-    const el = document.querySelector("button");
+    const el = doc.querySelector("button");
     expect(el).not.toBeNull();
 
     const payload = helpers.describe(el!);
@@ -143,15 +163,63 @@ describe("inspector-client helpers", () => {
     expect(() => JSON.stringify(safe)).not.toThrow();
   });
 
-  it("derives a stable parent origin from document.referrer", () => {
-    const { helpers, messages } = loadInspector(
+  it("adds spaces at child element boundaries in text snippets", () => {
+    const { helpers, doc } = loadInspector();
+    doc.body.innerHTML = `
+      <div id="label"><span>Hello</span><span>World</span><em>Again</em></div>
+    `;
+
+    const payload = helpers.describe(doc.querySelector("#label")!);
+    expect(payload.textSnippet).toBe("Hello World Again");
+  });
+
+  it("trusts only localhost-family origins", () => {
+    const { helpers } = loadInspector();
+
+    expect(helpers.isTrustedOrigin("http://localhost:5173")).toBe(true);
+    expect(helpers.isTrustedOrigin("http://127.0.0.1:5173")).toBe(true);
+    expect(helpers.isTrustedOrigin("http://[::1]:5173")).toBe(true);
+    expect(helpers.isTrustedOrigin("http://app.localhost:5173")).toBe(true);
+    expect(helpers.isTrustedOrigin("https://evil.com")).toBe(false);
+    expect(helpers.isTrustedOrigin("http://localhost.evil.com")).toBe(false);
+    expect(helpers.isTrustedOrigin("not a url")).toBe(false);
+  });
+
+  it("does not post ready from document.referrer or wildcard before trust is established", () => {
+    const { messages } = loadInspector(
       "https://editor.example/projects/1?preview=1"
     );
 
-    expect(helpers.parentOrigin()).toBe("https://editor.example");
-    expect(messages[0]).toEqual({
-      message: { type: "uim:ready" },
-      targetOrigin: "https://editor.example",
-    });
+    expect(messages).toEqual([]);
+  });
+
+  it("rejects inbound messages from non-localhost parent origins", () => {
+    const { doc, dispatchParentMessage, messages } = loadInspector();
+
+    dispatchParentMessage(
+      { type: "uim:previewCss", css: "body { color: red; }" },
+      "https://evil.com"
+    );
+
+    expect(doc.querySelector("#uim-preview-style")).toBeNull();
+    expect(messages).toEqual([]);
+  });
+
+  it("uses the first trusted parent origin for outbound messages", () => {
+    const { dispatchParentMessage, messages } = loadInspector();
+
+    dispatchParentMessage({ type: "uim:ping" }, "http://localhost:5173");
+    dispatchParentMessage({ type: "uim:ping" }, "http://127.0.0.1:5173");
+
+    expect(messages).toEqual([
+      {
+        message: { type: "uim:ready" },
+        targetOrigin: "http://localhost:5173",
+      },
+      {
+        message: { type: "uim:pong" },
+        targetOrigin: "http://localhost:5173",
+      },
+    ]);
   });
 });

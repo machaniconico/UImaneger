@@ -416,6 +416,36 @@ describeIfLoopback("proxy upstream response errors", () => {
 });
 
 describeIfLoopback("proxy transport fidelity", () => {
+  it("sets frame-ancestors to localhost-family origins only", async () => {
+    const expectedCsp =
+      "frame-ancestors 'self' http://localhost:* http://*.localhost:* http://127.0.0.1:* http://[::1]:*";
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "x-frame-options": "DENY",
+        "content-security-policy": "frame-ancestors https://evil.com",
+      });
+      res.end("<html><body>framed</body></html>");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+
+      expect(response.headers["x-frame-options"]).toBeUndefined();
+      expect(response.headers["content-security-policy"]).toBe(expectedCsp);
+      expect(response.headers["content-security-policy"]).not.toContain(
+        "evil.com"
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
   it("rewrites target Location headers on the pipe response path", async () => {
     let upstreamPort = 0;
     const upstream = http.createServer((_req, res) => {
@@ -547,6 +577,94 @@ describeIfLoopback("proxy transport fidelity", () => {
       expect(body).toContain("sniffed");
       expect(body).toContain("data-uim-inspector");
     } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("streams content-type-absent non-HTML responses without buffering the full body", async () => {
+    const firstChunk = Buffer.from('{"kind":"asset"}\n');
+    const tail = Buffer.alloc(1024 * 1024, "a");
+    let released = false;
+    let releaseRest!: () => void;
+    const restGate = new Promise<void>((resolve) => {
+      releaseRest = () => {
+        released = true;
+        resolve();
+      };
+    });
+    const upstream = http.createServer(async (_req, res) => {
+      res.writeHead(200, {
+        "content-length": String(firstChunk.byteLength + tail.byteLength),
+      });
+      res.flushHeaders();
+      res.write(firstChunk);
+      await restGate;
+      res.end(tail);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const chunks: Buffer[] = [];
+      let sawFirstChunk = false;
+      let resolveFirstChunk!: (chunk: Buffer) => void;
+      let rejectFirstChunk!: (err: Error) => void;
+      const firstChunkSeen = new Promise<Buffer>((resolve, reject) => {
+        resolveFirstChunk = resolve;
+        rejectFirstChunk = reject;
+      });
+      const done = new Promise<Buffer>((resolve, reject) => {
+        const req = http.request(
+          {
+            host: "127.0.0.1",
+            port: proxyPort,
+            path: "/asset",
+          },
+          (res) => {
+            res.on("data", (chunk) => {
+              const b = Buffer.from(chunk);
+              chunks.push(b);
+              if (!sawFirstChunk) {
+                sawFirstChunk = true;
+                resolveFirstChunk(b);
+              }
+            });
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+            res.on("error", reject);
+          }
+        );
+        req.on("error", reject);
+        req.end();
+      });
+      const timer = setTimeout(() => {
+        rejectFirstChunk(
+          new Error("timed out waiting for streamed non-HTML chunk")
+        );
+      }, 1_000);
+
+      let streamedChunk: Buffer;
+      try {
+        streamedChunk = await firstChunkSeen;
+      } catch (err) {
+        releaseRest();
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+
+      expect(streamedChunk.toString("utf8")).toContain('{"kind":"asset"}');
+      expect(released).toBe(false);
+      releaseRest();
+      const body = await done;
+      expect(body.byteLength).toBe(firstChunk.byteLength + tail.byteLength);
+      expect(body.subarray(0, firstChunk.byteLength).equals(firstChunk)).toBe(
+        true
+      );
+    } finally {
+      if (!released) releaseRest();
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});
     }

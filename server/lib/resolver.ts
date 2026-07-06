@@ -27,6 +27,7 @@ async function isRgUsable(): Promise<boolean> {
 }
 
 let nodeGrepTreeWalks = 0;
+let nodeGrepTotalBytesCapOverride: number | null = null;
 
 export const __resolverTestHooks = {
   forceRgUsable(value: boolean | null): void {
@@ -38,6 +39,9 @@ export const __resolverTestHooks = {
   },
   getNodeGrepTreeWalks(): number {
     return nodeGrepTreeWalks;
+  },
+  setNodeGrepTotalBytesCapForTest(value: number | null): void {
+    nodeGrepTotalBytesCapOverride = value;
   },
   collectCandidates(root: string, d: DomDescriptor) {
     return collectCandidates(root, d);
@@ -62,6 +66,8 @@ const TEXT_EXT =
   /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|html?|css|scss|sass|less|md|mdx|json|ya?ml|php|rb|erb|py|go|java|kt|rs|c|h|cpp|cs|swift|ex|exs|txt|hbs|ejs|pug|twig|blade\.php)$/i;
 const NODE_GREP_FILE_CAP = 6000; // 暴走防止
 const NODE_GREP_MAX_FILE_SIZE = 1.5 * 1024 * 1024;
+const NODE_GREP_TOTAL_BYTES_CAP = 200 * 1024 * 1024;
+const RG_TERM_CONCURRENCY = 4;
 
 interface NodeGrepFile {
   file: string;
@@ -140,10 +146,28 @@ async function nodeGrep(
 async function readNodeGrepFiles(root: string): Promise<NodeGrepFile[]> {
   const files: NodeGrepFile[] = [];
   let filesScanned = 0;
+  let totalBytes = 0;
+  let totalBytesCapReached = false;
+  const totalBytesCap = nodeGrepTotalBytesCapOverride ?? NODE_GREP_TOTAL_BYTES_CAP;
+
+  function stopForTotalBytesCap(nextFileSize: number): boolean {
+    if (totalBytes >= totalBytesCap || totalBytes + nextFileSize > totalBytesCap) {
+      totalBytesCapReached = true;
+      if (DEBUG) {
+        console.log(
+          `[UImaneger] node-grep stopped at total byte cap (${Math.round(
+            totalBytes / 1024 / 1024
+          )}MB/${Math.round(totalBytesCap / 1024 / 1024)}MB)`
+        );
+      }
+      return true;
+    }
+    return false;
+  }
 
   async function walk(dir: string): Promise<void> {
     nodeGrepTreeWalks++;
-    if (filesScanned >= NODE_GREP_FILE_CAP) return;
+    if (filesScanned >= NODE_GREP_FILE_CAP || totalBytesCapReached) return;
     let entries;
     try {
       entries = await readdir(dir, { withFileTypes: true });
@@ -151,7 +175,7 @@ async function readNodeGrepFiles(root: string): Promise<NodeGrepFile[]> {
       return;
     }
     for (const ent of entries) {
-      if (filesScanned >= NODE_GREP_FILE_CAP) return;
+      if (filesScanned >= NODE_GREP_FILE_CAP || totalBytesCapReached) return;
       const full = join(dir, ent.name);
       if (ent.isDirectory()) {
         if (IGNORE_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
@@ -162,7 +186,11 @@ async function readNodeGrepFiles(root: string): Promise<NodeGrepFile[]> {
         try {
           const s = await stat(full);
           if (s.size > NODE_GREP_MAX_FILE_SIZE) continue;
-          files.push({ file: resolve(full), content: await readFile(full, "utf8") });
+          // Node grep caches file contents; stop before reading beyond the total cap.
+          if (stopForTotalBytesCap(s.size)) return;
+          const content = await readFile(full, "utf8");
+          totalBytes += s.size;
+          files.push({ file: resolve(full), content });
         } catch {
           continue;
         }
@@ -568,6 +596,27 @@ interface CandidateAgg {
   score: number;
 }
 
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    async () => {
+      while (true) {
+        const index = next++;
+        if (index >= items.length) return;
+        results[index] = await worker(items[index], index);
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 /** textSnippet 単語分割フォールバックを含む候補収集 */
 async function collectCandidates(
   root: string,
@@ -581,10 +630,19 @@ async function collectCandidates(
 
   // 第1パス: textSnippet(全文) / id / 各クラス で検索
   const byKey = new Map<string, CandidateAgg>();
-  for (const { term, kind } of terms) {
-    const hits = await rgSearch(root, term);
-    // rarity は上限なしの真の件数で判定 (rgSearch は位置取得用に20で打ち切るため)
-    termHits.set(term, await rgCount(root, term));
+  const termResults = await mapWithConcurrency(
+    terms,
+    RG_TERM_CONCURRENCY,
+    async ({ term, kind }) => {
+      const [hits, count] = await Promise.all([
+        rgSearch(root, term),
+        rgCount(root, term),
+      ]);
+      return { term, kind, hits, count };
+    }
+  );
+  for (const { term, kind, hits, count } of termResults) {
+    termHits.set(term, count);
     if (hits.length === 0) continue;
     for (const h of hits) {
       if (!withinRoot(root, h.file)) continue;
@@ -608,11 +666,13 @@ async function collectCandidates(
     : false;
   if (!didFullTextHit && d.textSnippet) {
     const words = splitWords(d.textSnippet);
-    for (const w of words) {
-      const count = await rgCount(root, w);
+    const wordResults = await mapWithConcurrency(words, RG_TERM_CONCURRENCY, async (w) => {
+      const [count, hits] = await Promise.all([rgCount(root, w), rgSearch(root, w)]);
+      return { word: w, count, hits };
+    });
+    for (const { word: w, count, hits } of wordResults) {
       // 1 word で 100 件も引っかかるようならノイズなので無視 (真の件数で判定)
       if (count === 0 || count > 100) continue;
-      const hits = await rgSearch(root, w);
       if (hits.length === 0) continue;
       termHits.set("__partial__" + w, count);
       for (const h of hits) {
@@ -739,7 +799,12 @@ export async function resolveSource(
   d: DomDescriptor
 ): Promise<ResolveResult> {
   // --- 層A: フレームワークが出した正確な source (回帰なし: 即 high) ---
-  if (d.source?.fileName) {
+  const sourceLine = d.source?.lineNumber;
+  if (
+    d.source?.fileName &&
+    typeof sourceLine === "number" &&
+    Number.isFinite(sourceLine)
+  ) {
     const f = resolve(d.source.fileName);
     if (existsSync(f) && withinRoot(root, f)) {
       if (DEBUG) {
@@ -747,12 +812,12 @@ export async function resolveSource(
           `[UImaneger] resolve 層A high ${relative(
             root,
             f
-          )}:${d.source.lineNumber ?? "?"}`
+          )}:${sourceLine}`
         );
       }
       return {
         file: f,
-        line: d.source.lineNumber,
+        line: sourceLine,
         col: d.source.columnNumber,
         confidence: "high",
       };

@@ -107,6 +107,20 @@ const editedContent = originalContent.replace(
   "const label = \"Saved successfully\";"
 );
 
+function toCrLf(content: string): string {
+  return content.replace(/\n/g, "\r\n");
+}
+
+function countBareLf(content: string): number {
+  let count = 0;
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === "\n" && (i === 0 || content[i - 1] !== "\r")) {
+      count++;
+    }
+  }
+  return count;
+}
+
 interface JsonResponse<T = Record<string, unknown>> {
   res: Response;
   body: T;
@@ -344,6 +358,87 @@ describe("edit proposal API", () => {
     });
     expect(body.diff).toContain("Saved successfully");
     expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("keeps CRLF files CRLF when model output is LF-normalized", async () => {
+    const originalCrLf = toCrLf(originalContent);
+    const editedCrLf = toCrLf(editedContent);
+    writeFileSync(filePath, originalCrLf, "utf8");
+    claudeMock.complete.mockResolvedValueOnce(editedContent);
+
+    const { res, body } = await postJson<ProposalBody>("/api/edit/candidate", {
+      file: filePath,
+      line: 4,
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(true);
+
+    const diffLines = body.diff
+      .split("\n")
+      .map((line) => line.replace(/\r$/, ""));
+    const removals = diffLines.filter(
+      (line) => line.startsWith("-") && !line.startsWith("---")
+    );
+    const additions = diffLines.filter(
+      (line) => line.startsWith("+") && !line.startsWith("+++")
+    );
+    expect(removals).toEqual(['-  const label = "Save now";']);
+    expect(additions).toEqual(['+  const label = "Saved successfully";']);
+
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: body.proposalId,
+    });
+    expect(applied.res.status).toBe(200);
+    const appliedContent = readFileSync(filePath, "utf8");
+    expect(appliedContent).toBe(editedCrLf);
+    expect(countBareLf(appliedContent)).toBe(0);
+  });
+
+  it("allows trailing newline-only edits but rejects identical output", async () => {
+    claudeMock.complete.mockResolvedValueOnce(originalContent);
+
+    const identical = await postJson<{
+      ok: false;
+      proposalId?: string;
+      error?: string;
+    }>("/api/edit/candidate", {
+      file: filePath,
+      descriptor: descriptorFor(filePath),
+      instruction: "Keep the file unchanged.",
+    });
+
+    expect(identical.res.status).toBe(200);
+    expect(identical.body.ok).toBe(false);
+    expect(identical.body.proposalId).toBeUndefined();
+    expect(identical.body.error).toBe(
+      "変更が生成されませんでした。指示をより具体的にしてください。"
+    );
+    expect(__stores.proposalStore.size).toBe(0);
+
+    claudeMock.complete.mockResolvedValueOnce(
+      `\`\`\`tsx\n${originalContent}\n\n\`\`\``
+    );
+    const trailingNewline = await postJson<ProposalBody>(
+      "/api/edit/candidate",
+      {
+        file: filePath,
+        descriptor: descriptorFor(filePath),
+        instruction: "Add a final newline.",
+      }
+    );
+
+    expect(trailingNewline.res.status).toBe(200);
+    expect(trailingNewline.body.ok).toBe(true);
+    expect(trailingNewline.body.diff).toContain("@@");
+
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: trailingNewline.body.proposalId,
+    });
+    expect(applied.res.status).toBe(200);
+    expect(readFileSync(filePath, "utf8")).toBe(`${originalContent}\n`);
   });
 
   it("rejects candidate files outside the project root", async () => {
