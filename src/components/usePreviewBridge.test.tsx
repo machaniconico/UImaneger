@@ -25,7 +25,10 @@ const PAYLOAD: DomDescriptor = {
 };
 
 describe("usePreviewBridge", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
 
   it("期待originと異なる postMessage は無視し、onSelect は呼ばれない", () => {
     const onSelect = vi.fn();
@@ -86,5 +89,59 @@ describe("usePreviewBridge", () => {
 
     dispatchMessage(EXPECTED_ORIGIN, { type: "uim:other", payload: PAYLOAD });
     expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("selectMode 通知は期待 origin 宛に送り wildcard は使わない", () => {
+    vi.useFakeTimers();
+    const iframe = document.createElement("iframe");
+    document.body.appendChild(iframe);
+    const postMessage = vi
+      .spyOn(iframe.contentWindow!, "postMessage")
+      .mockImplementation(() => {});
+    const { result } = renderHook(() =>
+      usePreviewBridge({
+        url: EXPECTED_ORIGIN,
+        selectMode: true,
+        acceptSelect: true,
+        onSelect: vi.fn(),
+      })
+    );
+
+    (result.current.iframeRef as { current: HTMLIFrameElement | null }).current =
+      iframe;
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: "uim:setEnabled", value: true },
+      EXPECTED_ORIGIN
+    );
+    expect(postMessage).not.toHaveBeenCalledWith(expect.anything(), "*");
+  });
+
+  it("selectMode 通知は origin を確定できない URL では送らない", () => {
+    vi.useFakeTimers();
+    const iframe = document.createElement("iframe");
+    document.body.appendChild(iframe);
+    const postMessage = vi
+      .spyOn(iframe.contentWindow!, "postMessage")
+      .mockImplementation(() => {});
+    const { result } = renderHook(() =>
+      usePreviewBridge({
+        url: "http://[invalid-url",
+        selectMode: true,
+        acceptSelect: true,
+        onSelect: vi.fn(),
+      })
+    );
+
+    (result.current.iframeRef as { current: HTMLIFrameElement | null }).current =
+      iframe;
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+
+    expect(postMessage).not.toHaveBeenCalled();
   });
 });

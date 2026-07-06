@@ -228,6 +228,10 @@ function deferred<T = void>() {
   return { promise, resolve };
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 beforeEach(async () => {
   resetFsPromiseMocks();
   claudeMock.complete.mockReset();
@@ -508,6 +512,132 @@ describe("edit proposal API", () => {
     expect(res.status).toBe(409);
     expect(body.error).toBe("この提案は現在処理中です。");
     expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("serializes concurrent apply operations for proposals targeting the same file", async () => {
+    const firstContent = originalContent.replace(
+      'const label = "Save now";',
+      'const label = "First edit";'
+    );
+    const secondContent = originalContent.replace(
+      'const label = "Save now";',
+      'const label = "Second edit";'
+    );
+    const firstProposal = await requestProposal(firstContent);
+    const secondProposal = await requestProposal(secondContent);
+
+    const actualReadFile = fsPromisesMock.actual.readFile;
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const firstWriteStarted = deferred();
+    const releaseFirstWrite = deferred();
+    let blockedWrite = false;
+    let targetReads = 0;
+    fsPromisesMock.readFile.mockImplementation(async (...args: any[]) => {
+      if (String(args[0]) === filePath) targetReads++;
+      return actualReadFile(...args);
+    });
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (
+        !blockedWrite &&
+        String(args[0]).startsWith(`${filePath}.tmp-`)
+      ) {
+        blockedWrite = true;
+        firstWriteStarted.resolve();
+        await releaseFirstWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    const firstApply = postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: firstProposal.proposalId,
+    });
+    await firstWriteStarted.promise;
+    expect(targetReads).toBe(1);
+
+    const secondApply = postJson<{ error: string }>("/api/edit/apply", {
+      proposalId: secondProposal.proposalId,
+    });
+    await delay(25);
+    expect(targetReads).toBe(1);
+
+    releaseFirstWrite.resolve();
+    const [firstResult, secondResult] = await Promise.all([
+      firstApply,
+      secondApply,
+    ]);
+
+    expect(firstResult.res.status).toBe(200);
+    expect(secondResult.res.status).toBe(409);
+    expect(secondResult.body.error).toBe(
+      "ファイルが変更されています。再提案してください。"
+    );
+    expect(readFileSync(filePath, "utf8")).toBe(firstContent);
+    expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.proposalStore.has(secondProposal.proposalId)).toBe(true);
+  });
+
+  it("does not serialize concurrent apply operations for different files", async () => {
+    const otherFilePath = join(root, "src", "Other.tsx");
+    writeFileSync(otherFilePath, originalContent, "utf8");
+    const firstContent = originalContent.replace(
+      'const label = "Save now";',
+      'const label = "First file edit";'
+    );
+    const secondContent = originalContent.replace(
+      'const label = "Save now";',
+      'const label = "Second file edit";'
+    );
+    const firstProposal = await requestProposal(firstContent);
+    claudeMock.complete.mockResolvedValueOnce(secondContent);
+    const secondProposal = await postJson<ProposalBody>(
+      "/api/edit/candidate",
+      {
+        file: otherFilePath,
+        descriptor: descriptorFor(otherFilePath),
+        instruction: "Change the button label.",
+      }
+    );
+    expect(secondProposal.res.status).toBe(200);
+
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const firstWriteStarted = deferred();
+    const releaseFirstWrite = deferred();
+    let blockedWrite = false;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (
+        !blockedWrite &&
+        String(args[0]).startsWith(`${filePath}.tmp-`)
+      ) {
+        blockedWrite = true;
+        firstWriteStarted.resolve();
+        await releaseFirstWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    const firstApply = postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: firstProposal.proposalId,
+    });
+    await firstWriteStarted.promise;
+
+    const secondApply = postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondProposal.body.proposalId,
+    });
+    const completedBeforeRelease = await Promise.race([
+      secondApply.then(() => true),
+      delay(50).then(() => false),
+    ]);
+    releaseFirstWrite.resolve();
+    const [firstResult, secondResult] = await Promise.all([
+      firstApply,
+      secondApply,
+    ]);
+
+    expect(completedBeforeRelease).toBe(true);
+    expect(firstResult.res.status).toBe(200);
+    expect(secondResult.res.status).toBe(200);
+    expect(readFileSync(filePath, "utf8")).toBe(firstContent);
+    expect(readFileSync(otherFilePath, "utf8")).toBe(secondContent);
   });
 
   it("aborts apply when the project changes after reading the file", async () => {
