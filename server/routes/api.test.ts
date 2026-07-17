@@ -19,6 +19,7 @@ import {
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
+import { env } from "../lib/env.ts";
 import type { DomDescriptor } from "../lib/types.ts";
 
 const claudeMock = vi.hoisted(() => {
@@ -356,6 +357,97 @@ describe("project security helpers", () => {
 });
 
 describe("edit proposal API", () => {
+  it("returns the available edit models and server default", async () => {
+    const originalEditModel = env.editModel;
+    env.editModel = "claude-opus-4-8";
+    try {
+      const { res, body } = await getJson<{
+        models: Array<{ id: string; label: string; note: string }>;
+        default: string;
+      }>("/api/models");
+
+      expect(res.status).toBe(200);
+      expect(body).toEqual({
+        models: [
+          { id: "claude-opus-4-8", label: "Opus 4.8", note: "高品質(既定)" },
+          { id: "claude-sonnet-5", label: "Sonnet 5", note: "バランス・高速" },
+          { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "最速・最安" },
+        ],
+        default: "claude-opus-4-8",
+      });
+    } finally {
+      env.editModel = originalEditModel;
+    }
+  });
+
+  it("includes and accepts a custom UIM_EDIT_MODEL", async () => {
+    const originalEditModel = env.editModel;
+    env.editModel = "claude-custom-local";
+    try {
+      const models = await getJson<{
+        models: Array<{ id: string; label: string; note: string }>;
+        default: string;
+      }>("/api/models");
+      expect(models.body.default).toBe("claude-custom-local");
+      expect(models.body.models.at(-1)).toEqual({
+        id: "claude-custom-local",
+        label: "claude-custom-local",
+        note: "UIM_EDIT_MODEL",
+      });
+
+      claudeMock.complete.mockResolvedValueOnce(editedContent);
+      const edit = await postJson<ProposalBody>("/api/edit", {
+        descriptor: descriptorFor(filePath),
+        instruction: "Change the button label.",
+        model: "claude-custom-local",
+      });
+      expect(edit.res.status).toBe(200);
+      expect(claudeMock.streamComplete).toHaveBeenCalledWith(
+        expect.any(String),
+        {
+          maxTokens: 64000,
+          model: "claude-custom-local",
+          adaptive: false,
+        },
+        undefined
+      );
+    } finally {
+      env.editModel = originalEditModel;
+    }
+  });
+
+  it("rejects an unknown edit model", async () => {
+    const { res, body } = await postJson<{ error: string }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+      model: "claude-unknown",
+    });
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({ error: "許可されていないモデルです" });
+    expect(claudeMock.streamComplete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["claude-haiku-4-5", false],
+    ["claude-sonnet-5", true],
+  ])("forwards model %s with adaptive=%s", async (model, adaptive) => {
+    claudeMock.complete.mockResolvedValueOnce(editedContent);
+
+    const { res } = await postJson<ProposalBody>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+      model,
+    });
+
+    expect(res.status).toBe(200);
+    expect(claudeMock.streamComplete).toHaveBeenCalledWith(
+      expect.any(String),
+      { maxTokens: 64000, model, adaptive },
+      undefined
+    );
+  });
+
   it("streams resolving, generating, progress, and a successful result", async () => {
     claudeMock.complete.mockImplementationOnce(
       async (

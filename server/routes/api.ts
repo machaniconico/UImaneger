@@ -9,6 +9,11 @@ import { existsSync, realpathSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
 import { env } from "../lib/env.ts";
 import {
+  EDIT_MODELS,
+  isAllowedEditModel,
+  supportsAdaptiveThinking,
+} from "../lib/models.ts";
+import {
   hasKey,
   streamComplete,
   stripCodeFence,
@@ -412,6 +417,20 @@ api.get("/status", (c) => {
   });
 });
 
+api.get("/models", (c) => {
+  const models: Array<{ id: string; label: string; note: string }> = [
+    ...EDIT_MODELS,
+  ];
+  if (!EDIT_MODELS.some((model) => model.id === env.editModel)) {
+    models.push({
+      id: env.editModel,
+      label: env.editModel,
+      note: "UIM_EDIT_MODEL",
+    });
+  }
+  return c.json({ models, default: env.editModel });
+});
+
 api.post("/project/open", async (c) => {
   const { path, runCommand } = await c.req.json<{
     path: string;
@@ -562,6 +581,7 @@ interface EditRequestBody {
   descriptor: DomDescriptor;
   instruction: string;
   previousProposalId?: string;
+  model?: string;
 }
 
 interface EditFlowHooks {
@@ -588,6 +608,11 @@ async function runEditFlow(
       status: 400,
       body: { error: "ANTHROPIC_API_KEY 未設定。.env に設定してください。" },
     };
+
+  if (request.model !== undefined && !isAllowedEditModel(request.model)) {
+    return { status: 400, body: { error: "許可されていないモデルです" } };
+  }
+  const chosenModel = request.model || env.editModel;
 
   const {
     descriptor: rawDescriptor,
@@ -626,7 +651,7 @@ async function runEditFlow(
     descriptor,
     instruction,
     resolved.confidence,
-    { onProgress: hooks.onProgress, previousProposalId }
+    { onProgress: hooks.onProgress, previousProposalId, model: chosenModel }
   );
 
   const includeCandidates =
@@ -694,6 +719,7 @@ async function buildProposalForFile(
   options: {
     onProgress?: (info: { chars: number; tail: string }) => void;
     previousProposalId?: string;
+    model?: string;
   } = {}
 ): Promise<
   | {
@@ -764,9 +790,14 @@ async function buildProposalForFile(
   );
   let raw: string;
   try {
+    const chosenModel = options.model || env.editModel;
     raw = await streamComplete(
       prompt,
-      { maxTokens: 64000, adaptive: true },
+      {
+        maxTokens: 64000,
+        model: chosenModel,
+        adaptive: supportsAdaptiveThinking(chosenModel),
+      },
       options.onProgress
     );
   } catch (e) {
