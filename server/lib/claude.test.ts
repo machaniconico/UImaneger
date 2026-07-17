@@ -4,18 +4,20 @@ import {
   complete,
   getClient,
   hasKey,
+  streamComplete,
   stripCodeFence,
   TruncatedError,
 } from "./claude.ts";
 
 const anthropicMock = vi.hoisted(() => {
   const create = vi.fn();
+  const stream = vi.fn();
   const Anthropic = vi.fn(function Anthropic() {
     return {
-      messages: { create },
+      messages: { create, stream },
     };
   });
-  return { Anthropic, create };
+  return { Anthropic, create, stream };
 });
 
 vi.mock("@anthropic-ai/sdk", () => ({
@@ -40,6 +42,7 @@ beforeEach(() => {
   env.anthropicKey = "test-key";
   anthropicMock.Anthropic.mockClear();
   anthropicMock.create.mockReset();
+  anthropicMock.stream.mockReset();
 });
 
 afterAll(() => {
@@ -166,5 +169,107 @@ describe("complete", () => {
     await expect(complete("prompt")).rejects.toThrow("ANTHROPIC_API_KEY");
     expect(anthropicMock.Anthropic).not.toHaveBeenCalled();
     expect(anthropicMock.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("streamComplete", () => {
+  function mockStream(
+    deltas: string[],
+    final: MockMessage
+  ): { on: ReturnType<typeof vi.fn>; finalMessage: ReturnType<typeof vi.fn> } {
+    let textHandler: ((delta: string) => void) | undefined;
+    const on = vi.fn((event: string, handler: (delta: string) => void) => {
+      if (event === "text") textHandler = handler;
+    });
+    const finalMessage = vi.fn(async () => {
+      for (const delta of deltas) textHandler?.(delta);
+      return final;
+    });
+    anthropicMock.stream.mockReturnValue({ on, finalMessage });
+    return { on, finalMessage };
+  }
+
+  it("streams with adaptive thinking and returns text from the final message", async () => {
+    const mocked = mockStream(
+      ["streamed partial"],
+      message([{ type: "text", text: "final text" }], "end_turn")
+    );
+
+    await expect(
+      streamComplete("prompt", {
+        model: "claude-opus-4-8",
+        system: "system prompt",
+        adaptive: true,
+      })
+    ).resolves.toBe("final text");
+
+    expect(anthropicMock.stream).toHaveBeenCalledWith({
+      model: "claude-opus-4-8",
+      max_tokens: 64000,
+      system: "system prompt",
+      messages: [{ role: "user", content: "prompt" }],
+      thinking: { type: "adaptive" },
+    });
+    expect(mocked.on).toHaveBeenCalledWith("text", expect.any(Function));
+    expect(mocked.finalMessage).toHaveBeenCalledOnce();
+  });
+
+  it("omits thinking unless adaptive is opted in", async () => {
+    mockStream([], message([{ type: "text", text: "done" }], "end_turn"));
+
+    await streamComplete("prompt", { maxTokens: 1234 });
+
+    expect(anthropicMock.stream).toHaveBeenCalledWith({
+      model: env.editModel,
+      max_tokens: 1234,
+      system: undefined,
+      messages: [{ role: "user", content: "prompt" }],
+    });
+  });
+
+  it("throttles progress updates and reports accumulated chars with a 120-character tail", async () => {
+    const longDelta = "x".repeat(125);
+    mockStream(
+      [longDelta, "ignored", "reported"],
+      message([{ type: "text", text: "done" }], "end_turn")
+    );
+    const now = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1100)
+      .mockReturnValueOnce(1150);
+    const onProgress = vi.fn();
+
+    await streamComplete("prompt", {}, onProgress);
+
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    expect(onProgress).toHaveBeenNthCalledWith(1, {
+      chars: 125,
+      tail: "x".repeat(120),
+    });
+    expect(onProgress).toHaveBeenNthCalledWith(2, {
+      chars: 140,
+      tail: `${"x".repeat(105)}ignoredreported`,
+    });
+    now.mockRestore();
+  });
+
+  it("rejects truncated final messages unless explicitly allowed", async () => {
+    mockStream(
+      ["partial"],
+      message([{ type: "text", text: "partial" }], "max_tokens")
+    );
+
+    await expect(streamComplete("prompt")).rejects.toBeInstanceOf(
+      TruncatedError
+    );
+
+    mockStream(
+      ["partial"],
+      message([{ type: "text", text: "partial" }], "max_tokens")
+    );
+    await expect(
+      streamComplete("prompt", { allowTruncated: true })
+    ).resolves.toBe("partial");
   });
 });

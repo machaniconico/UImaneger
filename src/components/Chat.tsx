@@ -41,6 +41,7 @@ export function Chat({ selected, hasKey }: Props) {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [lastInstruction, setLastInstruction] = useState("");
   const [undoDepth, setUndoDepth] = useState(0);
+  const [redoDepth, setRedoDepth] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
   // 提案/候補を生成した時点の要素を固定保持 (その後 selected が変わっても誤マッチを防ぐ)
   const [editDescriptor, setEditDescriptor] = useState<DomDescriptor | null>(
@@ -65,10 +66,16 @@ export function Chat({ selected, hasKey }: Props) {
     api
       .status()
       .then((s) => {
-        if (alive) setUndoDepth(s.undoDepth ?? 0);
+        if (alive) {
+          setUndoDepth(s.undoDepth ?? 0);
+          setRedoDepth(s.redoDepth ?? 0);
+        }
       })
       .catch(() => {
-        if (alive) setUndoDepth(0);
+        if (alive) {
+          setUndoDepth(0);
+          setRedoDepth(0);
+        }
       });
     return () => {
       alive = false;
@@ -82,6 +89,12 @@ export function Chat({ selected, hasKey }: Props) {
   async function refreshUndoDepth() {
     const s = await api.status();
     setUndoDepth(s.undoDepth ?? 0);
+  }
+
+  async function refreshDepths() {
+    const s = await api.status();
+    setUndoDepth(s.undoDepth ?? 0);
+    setRedoDepth(s.redoDepth ?? 0);
   }
 
   function handleProposal(res: EditProposal, originalText?: string) {
@@ -156,6 +169,7 @@ export function Chat({ selected, hasKey }: Props) {
           text: `✓ ${res.relFile || proposal.relFile} に適用しました`,
         });
         setUndoDepth((depth) => res.undoDepth ?? depth + 1);
+        setRedoDepth(0);
         window.dispatchEvent(new CustomEvent("uim:applied"));
         setProposal(null);
         setCandidates([]);
@@ -199,6 +213,7 @@ export function Chat({ selected, hasKey }: Props) {
         });
         window.dispatchEvent(new CustomEvent("uim:applied"));
         setUndoDepth(res.undoDepth ?? 0);
+        setRedoDepth((depth) => res.redoDepth ?? depth + 1);
       } else {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
         if (res.undoDepth != null) {
@@ -219,20 +234,62 @@ export function Chat({ selected, hasKey }: Props) {
     }
   }
 
+  async function redo() {
+    if (busy || redoDepth <= 0) return;
+    setBusy(true);
+    try {
+      const res = await api.redoEdit();
+      if (res.ok) {
+        log({
+          role: "system",
+          ok: true,
+          text: `↪ ${res.relFile || ""} をやり直しました`,
+        });
+        window.dispatchEvent(new CustomEvent("uim:applied"));
+        setUndoDepth((depth) => res.undoDepth ?? depth + 1);
+        setRedoDepth(res.redoDepth ?? 0);
+      } else {
+        log({ role: "system", ok: false, text: "✗ " + (res.error || "redo失敗") });
+        await refreshDepths().catch((statusError) => {
+          console.error(statusError);
+        });
+      }
+    } catch (e: any) {
+      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+      await refreshDepths().catch((statusError) => {
+        console.error(statusError);
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="flex h-full flex-col bg-neutral-950 text-neutral-200">
       <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2 text-sm font-semibold">
         <span>自然言語で編集</span>
-        {undoDepth > 0 && (
-          <button
-            type="button"
-            onClick={undo}
-            disabled={busy}
-            className="rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:opacity-50"
-          >
-            ↩ undo ({undoDepth})
-          </button>
-        )}
+        <div className="flex items-center gap-1">
+          {undoDepth > 0 && (
+            <button
+              type="button"
+              onClick={undo}
+              disabled={busy}
+              className="cursor-pointer rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50"
+            >
+              ↩ undo ({undoDepth})
+            </button>
+          )}
+          {redoDepth > 0 && (
+            <button
+              type="button"
+              onClick={redo}
+              disabled={busy}
+              className="cursor-pointer rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50"
+            >
+              ↪ redo ({redoDepth})
+            </button>
+          )}
+        </div>
       </div>
 
       {/* 選択中の要素 */}

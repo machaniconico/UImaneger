@@ -2,6 +2,7 @@ import type {
   Candidate,
   DomDescriptor,
   EditProposal,
+  HistoryEntry,
   ProjectInfo,
 } from "./types.ts";
 
@@ -44,6 +45,8 @@ export interface StatusResp {
   hasKey: boolean;
   logs: string[];
   undoDepth?: number;
+  redoDepth?: number;
+  historyCount?: number;
 }
 
 export const api = {
@@ -89,8 +92,26 @@ export const api = {
   rejectEdit: (proposalId: string) =>
     post<{ ok: boolean; error?: string }>("/api/edit/reject", { proposalId }),
   undoEdit: () =>
-    post<{ ok: boolean; relFile?: string; error?: string; undoDepth?: number }>(
+    post<{
+      ok: boolean;
+      relFile?: string;
+      error?: string;
+      undoDepth?: number;
+      redoDepth?: number;
+    }>(
       "/api/edit/undo",
       {}
+    ),
+  redoEdit: () =>
+    post<{
+      ok: boolean;
+      relFile?: string;
+      error?: string;
+      undoDepth?: number;
+      redoDepth?: number;
+    }>("/api/edit/redo", {}),
+  editHistory: () =>
+    fetch("/api/edit/history").then((r) =>
+      parseJson<{ history: HistoryEntry[] }>(r)
     ),
 };
