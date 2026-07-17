@@ -491,6 +491,54 @@ describe("edit proposal API", () => {
     expect(typeof events[3].proposalId).toBe("string");
   });
 
+  it("does not store completed generations after an A-B-A project switch", async () => {
+    const bothGenerationsStarted = deferred();
+    const releaseGenerations = deferred();
+    let started = 0;
+    claudeMock.complete.mockImplementation(async () => {
+      started++;
+      if (started === 2) bothGenerationsStarted.resolve();
+      await releaseGenerations.promise;
+      return editedContent;
+    });
+
+    const jsonGeneration = postJson<{ error: string }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    const streamGeneration = postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    await bothGenerationsStarted.promise;
+
+    const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-generation-aba-"));
+    mkdirSync(join(nextRoot, "src"), { recursive: true });
+    writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+    await openProject(nextRoot, { command: "echo test-server-ready" });
+    await getJson("/api/status");
+    await openProject(root, { command: "echo test-server-ready" });
+    await getJson("/api/status");
+
+    releaseGenerations.resolve();
+    const [jsonResult, streamResult] = await Promise.all([
+      jsonGeneration,
+      streamGeneration,
+    ]);
+
+    expect(jsonResult.res.status).toBe(409);
+    expect(jsonResult.body.error).toBe(
+      "プロジェクトが切り替わったため中断しました"
+    );
+    expect(streamResult.events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      error: "プロジェクトが切り替わったため中断しました",
+    });
+    expect(__stores.proposalStore.size).toBe(0);
+    rmSync(nextRoot, { recursive: true, force: true });
+  });
+
   it("refines a previous pending proposal while keeping the disk file as the diff baseline", async () => {
     const firstProposed = editedContent.replace(
       "Saved successfully",
@@ -887,7 +935,7 @@ describe("edit proposal API", () => {
     expect(__stores.proposalStore.has(secondProposal.proposalId)).toBe(true);
   });
 
-  it("does not serialize concurrent apply operations for different files", async () => {
+  it("serializes concurrent apply operations globally across different files", async () => {
     const otherFilePath = join(root, "src", "Other.tsx");
     writeFileSync(otherFilePath, originalContent, "utf8");
     const firstContent = originalContent.replace(
@@ -944,11 +992,68 @@ describe("edit proposal API", () => {
       secondApply,
     ]);
 
-    expect(completedBeforeRelease).toBe(true);
+    expect(completedBeforeRelease).toBe(false);
     expect(firstResult.res.status).toBe(200);
     expect(secondResult.res.status).toBe(200);
     expect(readFileSync(filePath, "utf8")).toBe(firstContent);
     expect(readFileSync(otherFilePath, "utf8")).toBe(secondContent);
+  });
+
+  it("serializes undo then apply without resurrecting redo history", async () => {
+    const otherFilePath = join(root, "src", "Other.tsx");
+    writeFileSync(otherFilePath, originalContent, "utf8");
+    const firstProposal = await requestProposal();
+    claudeMock.complete.mockResolvedValueOnce(
+      originalContent.replace("Save now", "Other saved")
+    );
+    const secondProposal = await postJson<ProposalBody>(
+      "/api/edit/candidate",
+      {
+        file: otherFilePath,
+        descriptor: descriptorFor(otherFilePath),
+        instruction: "Change the other button label.",
+      }
+    );
+    await postJson("/api/edit/apply", {
+      proposalId: firstProposal.proposalId,
+    });
+
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const undoWriteStarted = deferred();
+    const releaseUndoWrite = deferred();
+    let blockedWrite = false;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (!blockedWrite && String(args[0]).startsWith(`${filePath}.tmp-`)) {
+        blockedWrite = true;
+        undoWriteStarted.resolve();
+        await releaseUndoWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    const undo = postJson<{ ok: true }>("/api/edit/undo", {});
+    await undoWriteStarted.promise;
+    const apply = postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondProposal.body.proposalId,
+    });
+    const applyCompletedEarly = await Promise.race([
+      apply.then(() => true),
+      delay(50).then(() => false),
+    ]);
+
+    expect(applyCompletedEarly).toBe(false);
+    releaseUndoWrite.resolve();
+    const [undoResult, applyResult] = await Promise.all([undo, apply]);
+
+    expect(undoResult.res.status).toBe(200);
+    expect(applyResult.res.status).toBe(200);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.historyLog.map((entry) => entry.kind)).toEqual([
+      "apply",
+      "undo",
+      "apply",
+    ]);
   });
 
   it("aborts apply when the project changes after reading the file", async () => {
@@ -989,6 +1094,9 @@ describe("edit proposal API", () => {
     expect(result.body.error).toBe(
       "プロジェクトが切り替わったため中断しました"
     );
+    expect(__stores.undoStack).toHaveLength(0);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.historyLog).toHaveLength(0);
     expect(readFileSync(oldFilePath, "utf8")).toBe(originalContent);
     rmSync(oldRoot, { recursive: true, force: true });
   });
@@ -1138,6 +1246,8 @@ describe("edit proposal API", () => {
     expect(res.status).toBe(409);
     expect(body.error).toBe("この提案は現在処理中です。");
     expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.historyLog).toHaveLength(1);
     expect(readFileSync(filePath, "utf8")).toBe(editedContent);
   });
 
@@ -1178,7 +1288,9 @@ describe("edit proposal API", () => {
     expect(result.body.error).toBe(
       "プロジェクトが切り替わったため中断しました"
     );
-    expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.undoStack).toHaveLength(0);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.historyLog).toHaveLength(0);
     expect(readFileSync(oldFilePath, "utf8")).toBe(editedContent);
     rmSync(oldRoot, { recursive: true, force: true });
   });
