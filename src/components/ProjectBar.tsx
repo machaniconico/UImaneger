@@ -72,48 +72,62 @@ export function ProjectBar({
   }
 
   return (
-    <div className="flex flex-col gap-2 border-b border-neutral-800 bg-neutral-900 px-3 py-3 text-sm text-neutral-200">
+    <div className="flex flex-col gap-2.5 border-b border-neutral-800 bg-surface px-3 py-3 text-sm text-neutral-200">
       <div className="flex items-center justify-between">
-        <span className="font-semibold text-blue-400">UImaneger</span>
-        <span className="text-xs">
+        <div className="flex items-center gap-2">
+          <div className="grid h-4 w-4 grid-cols-2 gap-0.5">
+            <span className="rounded-[2px] bg-accent-400" />
+            <span className="rounded-[2px] bg-accent-600" />
+            <span className="rounded-[2px] bg-accent-600" />
+            <span className="rounded-[2px] bg-accent-400" />
+          </div>
+          <span className="font-semibold tracking-tight text-neutral-100">UImaneger</span>
+        </div>
+        <span className="text-[10px] font-medium">
           {hasKey ? (
-            <span className="text-green-400">● API key OK</span>
+            <span className="inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2 py-0.5 text-green-400 ring-1 ring-inset ring-green-500/20">
+              <span className="h-1.5 w-1.5 rounded-full bg-green-400" /> API key OK
+            </span>
           ) : (
-            <span className="text-red-400">● key 未設定</span>
+            <span className="inline-flex items-center gap-1 rounded-full bg-red-500/10 px-2 py-0.5 text-red-400 ring-1 ring-inset ring-red-500/20">
+              <span className="h-1.5 w-1.5 rounded-full bg-red-400" /> key 未設定
+            </span>
           )}
         </span>
       </div>
 
-      <input
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
-          if (e.key === "Enter") openOrClone();
-        }}
-        aria-label="ローカルパスまたはGitHub URL"
-        placeholder="ローカルパス または GitHub URL"
-        className="w-full rounded border border-neutral-700 bg-neutral-800 px-2 py-1 outline-none focus:border-blue-500"
-      />
-      <button
-        onClick={openOrClone}
-        disabled={busy}
-        className="w-full rounded bg-blue-600 px-3 py-1 font-medium hover:bg-blue-500 disabled:opacity-50"
-      >
-        {busy ? "起動中…" : isRepo ? "Clone & 起動" : "開く"}
-      </button>
+      <div className="flex overflow-hidden rounded-lg border border-neutral-700 bg-raised focus-within:border-accent-500 focus-within:ring-1 focus-within:ring-accent-500/40">
+        <input
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+            if (e.key === "Enter") openOrClone();
+          }}
+          aria-label="ローカルパスまたはGitHub URL"
+          placeholder="ローカルパス または GitHub URL"
+          className="min-w-0 flex-1 bg-transparent px-2.5 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-500"
+        />
+        <button
+          onClick={openOrClone}
+          disabled={busy}
+          className="shrink-0 border-l border-neutral-700 bg-accent-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-500 disabled:opacity-50"
+        >
+          {busy ? "起動中…" : isRepo ? "Clone & 起動" : "開く"}
+        </button>
+      </div>
 
       {info?.running && (
         <>
-          <div className="flex gap-2">
+          <div className="flex items-center gap-2">
             <button
               onClick={() => setSelectMode(!selectMode)}
               aria-pressed={selectMode}
               disabled={busy}
-              className={`flex-1 rounded px-3 py-1 font-medium ${
+              className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium ${
                 selectMode
-                  ? "bg-amber-500 text-black"
-                  : "bg-neutral-700 hover:bg-neutral-600"
+                  ? "animate-pulse bg-accent-600 text-white shadow-sm shadow-accent-500/30 motion-reduce:animate-none"
+                  : "bg-raised text-neutral-300 hover:bg-neutral-700 hover:text-white"
               }`}
             >
               {selectMode ? "選択中…" : "要素を選択"}
@@ -121,12 +135,12 @@ export function ProjectBar({
             <button
               onClick={stop}
               disabled={busy}
-              className="rounded bg-neutral-700 px-3 py-1 hover:bg-neutral-600"
+              className="rounded-md border border-neutral-700 px-2.5 py-1 text-[11px] text-neutral-400 hover:border-neutral-600 hover:bg-raised hover:text-neutral-200"
             >
               停止
             </button>
           </div>
-          <span className="truncate text-xs text-neutral-400">
+          <span className="truncate px-0.5 text-[10px] text-neutral-500">
             {info.name} · {info.framework}
           </span>
         </>
