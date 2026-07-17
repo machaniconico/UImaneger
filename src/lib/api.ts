@@ -134,25 +134,30 @@ async function editStream(
     }
   };
 
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-    let boundary = buffer.search(/\r?\n\r?\n/);
-    while (boundary >= 0) {
-      const frame = buffer.slice(0, boundary);
-      const separator = buffer.slice(boundary).match(/^(?:\r?\n){2}/)?.[0] ?? "\n\n";
-      buffer = buffer.slice(boundary + separator.length);
-      processFrame(frame);
-      boundary = buffer.search(/\r?\n\r?\n/);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      let boundary = buffer.search(/\r?\n\r?\n/);
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        const separator =
+          buffer.slice(boundary).match(/^(?:\r?\n){2}/)?.[0] ?? "\n\n";
+        buffer = buffer.slice(boundary + separator.length);
+        processFrame(frame);
+        boundary = buffer.search(/\r?\n\r?\n/);
+      }
+      if (result || done) break;
     }
-    if (done) break;
-  }
 
-  if (buffer.trim()) processFrame(buffer);
-  if (!result) {
-    throw new Error("編集ストリームが完了しましたが、最終結果を受信できませんでした");
+    if (!result && buffer.trim()) processFrame(buffer);
+    if (!result) {
+      throw new Error("編集ストリームが完了しましたが、最終結果を受信できませんでした");
+    }
+    return result;
+  } finally {
+    await reader.cancel().catch(() => {});
   }
-  return result;
 }
 
 export const api = {

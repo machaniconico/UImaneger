@@ -551,7 +551,7 @@ api.post("/files/write", async (c) => {
     return c.json({ error: "path と content は文字列である必要があります。" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
   try {
-    await atomicWrite(resolve(path), content);
+    await withFileLock(path, () => atomicWrite(resolve(path), content));
     return c.json({ ok: true });
   } catch (e) {
     return serverError(c, e);
@@ -668,9 +668,12 @@ api.post("/edit/stream", (c) => {
         onProgress: ({ chars, tail }) =>
           send({ type: "progress", chars, tail }),
       });
-      send({ type: "result", ...result.body });
+      send({
+        type: "result",
+        ...(result.status === 200 ? result.body : { ok: false, ...result.body }),
+      });
     } catch (e) {
-      send({ type: "result", ...serverErrorPayload(c, e) });
+      send({ type: "result", ok: false, ...serverErrorPayload(c, e) });
     }
     await writes;
   });
@@ -727,11 +730,28 @@ async function buildProposalForFile(
   }
   const original = decoded.text;
   pruneProposals();
-  const previous = options.previousProposalId
-    ? proposalStore.get(options.previousProposalId)
+  const hasPreviousProposalId = options.previousProposalId !== undefined;
+  const previous = hasPreviousProposalId
+    ? proposalStore.get(options.previousProposalId!)
     : undefined;
+  if (
+    hasPreviousProposalId &&
+    (!previous || resolve(previous.file) !== resolve(file))
+  ) {
+    return {
+      ok: false,
+      file,
+      relFile,
+      line,
+      confidence,
+      error:
+        "追い込み元の提案が見つかりませんでした（期限切れの可能性）。もう一度通常の指示からやり直してください。",
+    };
+  }
   const isRefinement = Boolean(
-    previous && resolve(previous.file) === resolve(file)
+    previous &&
+      resolve(previous.file) === resolve(file) &&
+      originalBytes.equals(previous.originalBytes)
   );
   const promptContent = previous && isRefinement ? previous.proposed : original;
   const prompt = buildEditPrompt(

@@ -138,6 +138,8 @@ export function Chat({
   async function send() {
     const text = instruction.trim();
     if (!text || !selected || busy) return;
+    const previousProposal = proposal;
+    const previousEditDescriptor = editDescriptor;
     setInstruction("");
     setLastInstruction(text);
     setEditDescriptor(selected);
@@ -153,8 +155,7 @@ export function Chat({
     setBusy(true);
     setGeneration({ stage: "resolving" });
     try {
-      handleProposal(
-        await api.editStream(
+      const result = await api.editStream(
           {
             descriptor: selected,
             instruction: text,
@@ -176,11 +177,16 @@ export function Chat({
                 tail,
               })),
           }
-        ),
-        text
       );
+      handleProposal(result, text);
+      if (!result.ok) {
+        setProposal(previousProposal);
+        if (previousProposal) setEditDescriptor(previousEditDescriptor);
+      }
     } catch (e: any) {
       setInstruction(text);
+      setProposal(previousProposal);
+      if (previousProposal) setEditDescriptor(previousEditDescriptor);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
       setGeneration(null);
@@ -313,6 +319,7 @@ export function Chat({
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       const target = event.target as HTMLElement | null;
       const isTextInput = Boolean(
         target &&
@@ -330,7 +337,7 @@ export function Chat({
         return;
       }
       if (isTextInput) return;
-      if (isModifierEnter && proposal?.diff) {
+      if (isModifierEnter && selected && proposal?.diff) {
         event.preventDefault();
         void apply();
       } else if (

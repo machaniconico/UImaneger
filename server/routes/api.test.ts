@@ -440,6 +440,70 @@ describe("edit proposal API", () => {
     expect(readFileSync(filePath, "utf8")).toBe(refinedProposed);
   });
 
+  it("falls back to the current disk content when the refinement baseline bytes changed", async () => {
+    const firstProposed = editedContent.replace(
+      "Saved successfully",
+      "First pending version"
+    );
+    claudeMock.complete.mockResolvedValueOnce(firstProposed);
+    const first = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    const firstResult = first.events.at(-1)!;
+    const interveningContent = originalContent.replace(
+      "const label = \"Save now\";",
+      "const label = \"Changed on disk\";"
+    );
+    writeFileSync(filePath, interveningContent, "utf8");
+    claudeMock.complete.mockResolvedValueOnce(
+      interveningContent.replace("Changed on disk", "Fresh proposal")
+    );
+
+    const second = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Make it more prominent.",
+      previousProposalId: firstResult.proposalId,
+    });
+    const secondPrompt = String(claudeMock.complete.mock.calls[1][0]);
+
+    expect(secondPrompt).toContain("Changed on disk");
+    expect(secondPrompt).not.toContain("First pending version");
+    expect(secondPrompt).not.toContain(
+      "現在の作業版（ユーザーの前回の指示を反映済み）"
+    );
+    expect(second.events.at(-1)).toMatchObject({ type: "result", ok: true });
+  });
+
+  it("returns an explicit error when a supplied refinement proposal is missing", async () => {
+    const { events } = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Make it more prominent.",
+      previousProposalId: "missing-proposal",
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      error:
+        "追い込み元の提案が見つかりませんでした（期限切れの可能性）。もう一度通常の指示からやり直してください。",
+    });
+    expect(claudeMock.streamComplete).not.toHaveBeenCalled();
+  });
+
+  it("includes ok:false in validation failure stream results", async () => {
+    const { events } = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "",
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      error: "指示が空です",
+    });
+  });
+
   it("ends the stream with a result when source resolution finds no file", async () => {
     const { events } = await postSse("/api/edit/stream", {
       descriptor: {
@@ -472,6 +536,7 @@ describe("edit proposal API", () => {
 
       expect(events.at(-1)).toEqual({
         type: "result",
+        ok: false,
         error: "stream failed",
       });
     } finally {
