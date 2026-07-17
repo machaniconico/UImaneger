@@ -16,6 +16,7 @@ import type { DomDescriptor, EditProposal, ProjectInfo } from "../lib/types";
 
 vi.mock("../lib/api", () => ({
   api: {
+    getModels: vi.fn(),
     status: vi.fn(),
     edit: vi.fn(),
     editStream: vi.fn(),
@@ -65,6 +66,15 @@ async function sendInstruction(user: ReturnType<typeof userEvent.setup>, text: s
 describe("Chat", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.getModels).mockResolvedValue({
+      models: [
+        { id: "claude-opus-4-8", label: "Opus 4.8", note: "高品質(既定)" },
+        { id: "claude-sonnet-5", label: "Sonnet 5", note: "バランス・高速" },
+        { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "最速・最安" },
+      ],
+      default: "claude-opus-4-8",
+    });
     vi.mocked(api.status).mockReturnValue(new Promise<never>(() => {}));
   });
   afterEach(cleanup);
@@ -78,6 +88,58 @@ describe("Chat", () => {
     expect(log.getAttribute("aria-relevant")).toBe("additions");
   });
 
+  it("モデル選択肢を表示し、選択を保存して編集リクエストへ送る", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    const select = await screen.findByRole("combobox", { name: "編集モデル" });
+    expect(
+      screen.getByRole("option", { name: "Opus 4.8 · 高品質(既定)" })
+    ).not.toBeNull();
+    expect(
+      screen.getByRole("option", { name: "Sonnet 5 · バランス・高速" })
+    ).not.toBeNull();
+    expect(
+      screen.getByRole("option", { name: "Haiku 4.5 · 最速・最安" })
+    ).not.toBeNull();
+
+    await user.selectOptions(select, "claude-sonnet-5");
+    expect(localStorage.getItem("uim:edit-model")).toBe("claude-sonnet-5");
+    await sendInstruction(user, "赤くして");
+
+    expect(api.editStream).toHaveBeenCalledWith(
+      { descriptor, instruction: "赤くして", model: "claude-sonnet-5" },
+      expect.any(Object)
+    );
+  });
+
+  it("保存済みモデルが無効ならサーバー既定値へ戻す", async () => {
+    localStorage.setItem("uim:edit-model", "claude-unknown");
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    const select = (await screen.findByRole("combobox", {
+      name: "編集モデル",
+    })) as HTMLSelectElement;
+    expect(select.value).toBe("claude-opus-4-8");
+    expect(localStorage.getItem("uim:edit-model")).toBe("claude-opus-4-8");
+  });
+
+  it("モデル一覧の取得失敗時は選択欄を隠してサーバー既定値を使う", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getModels).mockRejectedValue(new Error("models unavailable"));
+    vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+
+    expect(screen.queryByRole("combobox", { name: "編集モデル" })).toBeNull();
+    expect(api.editStream).toHaveBeenCalledWith(
+      { descriptor, instruction: "赤くして" },
+      expect.any(Object)
+    );
+  });
+
   it("指示送信 → api.editStream が EditProposal を返し DiffView に差分表示(まだ applyEdit は呼ばれない)", async () => {
     const user = userEvent.setup();
     vi.mocked(api.editStream).mockResolvedValue(goodProposal());
@@ -86,7 +148,11 @@ describe("Chat", () => {
     await sendInstruction(user, "赤くして");
 
     expect(api.editStream).toHaveBeenCalledWith(
-      { descriptor, instruction: "赤くして" },
+      {
+        descriptor,
+        instruction: "赤くして",
+        model: "claude-opus-4-8",
+      },
       expect.objectContaining({
         onStage: expect.any(Function),
         onProgress: expect.any(Function),
@@ -106,6 +172,7 @@ describe("Chat", () => {
   it("Ctrl+Enter 送信では textarea の既定改行を抑止して送信する", async () => {
     vi.mocked(api.editStream).mockResolvedValue(goodProposal());
     render(<Chat selected={descriptor} hasKey={true} />);
+    await screen.findByRole("combobox", { name: "編集モデル" });
 
     const textarea = screen.getByRole("textbox", {
       name: "編集指示",
@@ -122,7 +189,11 @@ describe("Chat", () => {
     expect(preventDefault).toHaveBeenCalled();
     await waitFor(() =>
       expect(api.editStream).toHaveBeenCalledWith(
-        { descriptor, instruction: "赤くして" },
+        {
+          descriptor,
+          instruction: "赤くして",
+          model: "claude-opus-4-8",
+        },
         expect.any(Object)
       )
     );
@@ -175,6 +246,7 @@ describe("Chat", () => {
         descriptor,
         instruction: "もっと大きく",
         previousProposalId: "pending-1",
+        model: "claude-opus-4-8",
       },
       expect.any(Object)
     );

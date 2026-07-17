@@ -53,6 +53,18 @@ export interface EditStreamBody {
   descriptor: DomDescriptor;
   instruction: string;
   previousProposalId?: string;
+  model?: string;
+}
+
+export interface EditModel {
+  id: string;
+  label: string;
+  note: string;
+}
+
+export interface ModelsResp {
+  models: EditModel[];
+  default: string;
 }
 
 export interface EditStreamHandlers {
@@ -161,6 +173,8 @@ async function editStream(
 }
 
 export const api = {
+  getModels: (): Promise<ModelsResp> =>
+    fetch("/api/models").then((r) => parseJson<ModelsResp>(r)),
   status: (): Promise<StatusResp> =>
     fetch("/api/status").then((r) => parseJson<StatusResp>(r)),
   open: (path: string, runCommand?: string) =>

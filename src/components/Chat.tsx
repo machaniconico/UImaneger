@@ -5,6 +5,7 @@ import type {
   EditProposal,
 } from "../lib/types.ts";
 import { api } from "../lib/api.ts";
+import type { EditModel } from "../lib/api.ts";
 import { DiffView } from "./DiffView.tsx";
 import { Candidates } from "./Candidates.tsx";
 
@@ -49,6 +50,9 @@ export function Chat({
   const [lastInstruction, setLastInstruction] = useState("");
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
+  const [editModels, setEditModels] = useState<EditModel[]>([]);
+  const [editModel, setEditModel] = useState("");
+  const editModelRef = useRef("");
   const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [generation, setGeneration] = useState<{
@@ -74,6 +78,34 @@ export function Chat({
     const el = logRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [msgs, busy, proposal, candidates]);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getModels()
+      .then(({ models, default: defaultModel }) => {
+        if (!alive) return;
+        const stored = localStorage.getItem("uim:edit-model");
+        const selectedModel =
+          stored && models.some((model) => model.id === stored)
+            ? stored
+            : defaultModel;
+        localStorage.setItem("uim:edit-model", selectedModel);
+        editModelRef.current = selectedModel;
+        setEditModels(models);
+        setEditModel(selectedModel);
+      })
+      .catch(() => {
+        if (alive) {
+          editModelRef.current = "";
+          setEditModels([]);
+          setEditModel("");
+        }
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -156,27 +188,28 @@ export function Chat({
     setGeneration({ stage: "resolving" });
     try {
       const result = await api.editStream(
-          {
-            descriptor: selected,
-            instruction: text,
-            ...(previousProposalId ? { previousProposalId } : {}),
-          },
-          {
-            onStage: ({ stage, file }) =>
-              setGeneration((current) => ({
-                stage,
-                file,
-                chars: stage === "generating" ? current?.chars : undefined,
-                tail: stage === "generating" ? current?.tail : undefined,
-              })),
-            onProgress: ({ chars, tail }) =>
-              setGeneration((current) => ({
-                stage: "generating",
-                file: current?.file,
-                chars,
-                tail,
-              })),
-          }
+        {
+          descriptor: selected,
+          instruction: text,
+          ...(previousProposalId ? { previousProposalId } : {}),
+          ...(editModelRef.current ? { model: editModelRef.current } : {}),
+        },
+        {
+          onStage: ({ stage, file }) =>
+            setGeneration((current) => ({
+              stage,
+              file,
+              chars: stage === "generating" ? current?.chars : undefined,
+              tail: stage === "generating" ? current?.tail : undefined,
+            })),
+          onProgress: ({ chars, tail }) =>
+            setGeneration((current) => ({
+              stage: "generating",
+              file: current?.file,
+              chars,
+              tail,
+            })),
+        }
       );
       handleProposal(result, text);
       if (!result.ok) {
@@ -355,7 +388,28 @@ export function Chat({
   return (
     <div className="flex h-full flex-col bg-neutral-950 text-neutral-200">
       <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2 text-sm font-semibold">
-        <span>自然言語で編集</span>
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="shrink-0">自然言語で編集</span>
+          {editModels.length > 0 && editModel && (
+            <select
+              aria-label="編集モデル"
+              value={editModel}
+              onChange={(event) => {
+                const model = event.target.value;
+                editModelRef.current = model;
+                setEditModel(model);
+                localStorage.setItem("uim:edit-model", model);
+              }}
+              className="h-5 min-w-0 max-w-28 rounded-md border border-neutral-700 bg-neutral-900 px-1.5 text-xs font-normal text-neutral-300 outline-none transition-colors duration-150 hover:border-neutral-600 focus:border-accent-500 focus:ring-1 focus:ring-accent-500/30"
+            >
+              {editModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.label} · {model.note}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
         <div className="flex items-center gap-1">
           {undoDepth > 0 && (
             <button
