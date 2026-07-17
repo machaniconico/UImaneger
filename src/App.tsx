@@ -101,6 +101,11 @@ export function App() {
             key={info?.root ?? "none"}
             selected={selected}
             hasKey={hasKey}
+            selectionModeActive={selectMode}
+            onDeselect={() => {
+              setSelected(null);
+              setSelectMode(false);
+            }}
           />
         </div>
         <HistoryPanel />

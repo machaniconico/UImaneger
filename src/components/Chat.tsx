@@ -17,6 +17,8 @@ interface Msg {
 interface Props {
   selected: DomDescriptor | null;
   hasKey: boolean;
+  selectionModeActive?: boolean;
+  onDeselect?: () => void;
 }
 
 function descriptorLabel(d: DomDescriptor) {
@@ -33,7 +35,12 @@ function sameDescriptor(a: DomDescriptor, b: DomDescriptor) {
   );
 }
 
-export function Chat({ selected, hasKey }: Props) {
+export function Chat({
+  selected,
+  hasKey,
+  selectionModeActive = false,
+  onDeselect,
+}: Props) {
   const [instruction, setInstruction] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [busy, setBusy] = useState(false);
@@ -43,6 +50,13 @@ export function Chat({ selected, hasKey }: Props) {
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
   const logRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [generation, setGeneration] = useState<{
+    stage: "resolving" | "generating";
+    file?: string;
+    chars?: number;
+    tail?: string;
+  } | null>(null);
   // 提案/候補を生成した時点の要素を固定保持 (その後 selected が変わっても誤マッチを防ぐ)
   const [editDescriptor, setEditDescriptor] = useState<DomDescriptor | null>(
     null
@@ -127,16 +141,49 @@ export function Chat({ selected, hasKey }: Props) {
     setInstruction("");
     setLastInstruction(text);
     setEditDescriptor(selected);
+    const previousProposalId =
+      proposal?.proposalId &&
+      editDescriptor &&
+      sameDescriptor(editDescriptor, selected)
+        ? proposal.proposalId
+        : undefined;
     setProposal(null);
     setCandidates([]);
     log({ role: "user", text });
     setBusy(true);
+    setGeneration({ stage: "resolving" });
     try {
-      handleProposal(await api.edit(selected, text), text);
+      handleProposal(
+        await api.editStream(
+          {
+            descriptor: selected,
+            instruction: text,
+            ...(previousProposalId ? { previousProposalId } : {}),
+          },
+          {
+            onStage: ({ stage, file }) =>
+              setGeneration((current) => ({
+                stage,
+                file,
+                chars: stage === "generating" ? current?.chars : undefined,
+                tail: stage === "generating" ? current?.tail : undefined,
+              })),
+            onProgress: ({ chars, tail }) =>
+              setGeneration((current) => ({
+                stage: "generating",
+                file: current?.file,
+                chars,
+                tail,
+              })),
+          }
+        ),
+        text
+      );
     } catch (e: any) {
       setInstruction(text);
       log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
     } finally {
+      setGeneration(null);
       setBusy(false);
     }
   }
@@ -264,6 +311,40 @@ export function Chat({ selected, hasKey }: Props) {
     }
   }
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTextInput = Boolean(
+        target &&
+          (target instanceof HTMLInputElement ||
+            target instanceof HTMLTextAreaElement ||
+            target.isContentEditable)
+      );
+      const isModifierEnter =
+        event.key === "Enter" && (event.metaKey || event.ctrlKey);
+
+      if (isModifierEnter && target === textareaRef.current) {
+        event.preventDefault();
+        if (instruction.trim()) void send();
+        else if (proposal?.diff) void apply();
+        return;
+      }
+      if (isTextInput) return;
+      if (isModifierEnter && proposal?.diff) {
+        event.preventDefault();
+        void apply();
+      } else if (
+        event.key === "Escape" &&
+        (selectionModeActive || selected)
+      ) {
+        event.preventDefault();
+        onDeselect?.();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  });
+
   return (
     <div className="flex h-full flex-col bg-neutral-950 text-neutral-200">
       <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2 text-sm font-semibold">
@@ -353,11 +434,26 @@ export function Chat({ selected, hasKey }: Props) {
             </div>
           ))}
         </div>
-        {busy && (
+        {generation ? (
+          <div role="status" className="text-neutral-500">
+            <div>
+              {generation.stage === "resolving"
+                ? "解決中…"
+                : `生成中: ${generation.file ?? ""}${
+                    generation.chars != null
+                      ? ` (${generation.chars}文字)`
+                      : ""
+                  }`}
+            </div>
+            <div className="h-4 truncate font-mono text-xs text-neutral-600">
+              {generation.tail ?? ""}
+            </div>
+          </div>
+        ) : busy ? (
           <div role="status" className="text-neutral-500">
             処理中…
           </div>
-        )}
+        ) : null}
 
         {hasPendingSuggestion && editDescriptor && (
           <div className="rounded border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-400">
@@ -393,15 +489,15 @@ export function Chat({ selected, hasKey }: Props) {
             ANTHROPIC_API_KEY を .env に設定してください
           </div>
         )}
+        {proposal?.diff && (
+          <div className="mb-1 text-xs text-neutral-500">
+            続けて指示すると提案を追い込めます（例: もっと大きく）
+          </div>
+        )}
         <textarea
+          ref={textareaRef}
           value={instruction}
           onChange={(e) => setInstruction(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-              e.preventDefault();
-              send();
-            }
-          }}
           aria-label="編集指示"
           placeholder={
             selected
