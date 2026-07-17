@@ -180,6 +180,28 @@ describe("Chat", () => {
     );
   });
 
+  it.each([
+    ["ok:false", () => Promise.resolve({ ok: false, error: "refinement failed" })],
+    ["exception", () => Promise.reject(new Error("refinement failed"))],
+  ])("追い込みが %s で失敗しても前の提案を復元する", async (_case, fail) => {
+    const user = userEvent.setup();
+    vi.mocked(api.editStream)
+      .mockResolvedValueOnce(goodProposal({ proposalId: "pending-1" }))
+      .mockImplementationOnce(() => fail() as Promise<EditProposal>);
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByText("+added line");
+    await sendInstruction(user, "もっと大きく");
+
+    expect(await screen.findByText(/refinement failed/)).not.toBeNull();
+    expect(screen.getByText("+added line")).not.toBeNull();
+    expect(
+      screen.getByText('提案対象: <button #btn> "Click me"')
+    ).not.toBeNull();
+    expect(screen.getByRole("button", { name: "承認して適用" })).not.toBeNull();
+  });
+
   it("Cmd+Enter で保留中の提案を適用する", async () => {
     const user = userEvent.setup();
     vi.mocked(api.editStream).mockResolvedValue(goodProposal());
@@ -194,6 +216,35 @@ describe("Chat", () => {
     fireEvent.keyDown(document, { key: "Enter", metaKey: true });
 
     await waitFor(() => expect(api.applyEdit).toHaveBeenCalledWith("p1"));
+  });
+
+  it("IME composition 中の Cmd+Enter では保留中の提案を適用しない", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByRole("button", { name: "承認して適用" });
+    fireEvent.keyDown(document, {
+      key: "Enter",
+      metaKey: true,
+      isComposing: true,
+    });
+
+    expect(api.applyEdit).not.toHaveBeenCalled();
+  });
+
+  it("選択解除後の Cmd+Enter では保留中の提案を適用しない", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+    const { rerender } = render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByRole("button", { name: "承認して適用" });
+    rerender(<Chat selected={null} hasKey={true} />);
+    fireEvent.keyDown(document, { key: "Enter", metaKey: true });
+
+    expect(api.applyEdit).not.toHaveBeenCalled();
   });
 
   it("承認クリックで api.applyEdit が呼ばれ、成功メッセージが出る", async () => {

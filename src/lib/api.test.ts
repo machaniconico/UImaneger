@@ -63,6 +63,33 @@ describe("api.editStream", () => {
     );
   });
 
+  it("result 受信後は transport EOF を待たず reader を cancel する", async () => {
+    const encoder = new TextEncoder();
+    const cancel = vi.fn();
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          encoder.encode(
+            'data: {"type":"result","ok":true,"proposalId":"p1","diff":"+x"}\n\n'
+          )
+        );
+      },
+      cancel,
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response(stream, { status: 200 }))
+    );
+
+    await expect(
+      api.editStream(
+        { descriptor, instruction: "赤くして" },
+        { onStage: vi.fn(), onProgress: vi.fn() }
+      )
+    ).resolves.toMatchObject({ ok: true, proposalId: "p1" });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it("result イベントなしで終了した場合は明確な日本語エラーにする", async () => {
     const encoder = new TextEncoder();
     const stream = new ReadableStream<Uint8Array>({

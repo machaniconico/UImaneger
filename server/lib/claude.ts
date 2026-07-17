@@ -83,11 +83,13 @@ export async function streamComplete(
 
   let accumulated = "";
   let lastProgressAt = 0;
+  let lastReported: string | undefined;
   stream.on("text", (delta) => {
     accumulated += delta;
     const now = Date.now();
     if (onProgress && now - lastProgressAt >= 150) {
       lastProgressAt = now;
+      lastReported = accumulated;
       onProgress({
         chars: accumulated.length,
         tail: accumulated.slice(-120),
@@ -96,6 +98,12 @@ export async function streamComplete(
   });
 
   const final = await stream.finalMessage();
+  if (onProgress && lastReported !== accumulated) {
+    onProgress({
+      chars: accumulated.length,
+      tail: accumulated.slice(-120),
+    });
+  }
   return extractText(final.content, final.stop_reason, opts.allowTruncated);
 }
 

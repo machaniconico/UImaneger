@@ -254,6 +254,27 @@ describe("streamComplete", () => {
     now.mockRestore();
   });
 
+  it("emits the final accumulated progress when the last delta was throttled", async () => {
+    mockStream(
+      ["first", " final"],
+      message([{ type: "text", text: "first final" }], "end_turn")
+    );
+    const now = vi
+      .spyOn(Date, "now")
+      .mockReturnValueOnce(1000)
+      .mockReturnValueOnce(1050);
+    const onProgress = vi.fn();
+
+    await streamComplete("prompt", {}, onProgress);
+
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    expect(onProgress).toHaveBeenLastCalledWith({
+      chars: 11,
+      tail: "first final",
+    });
+    now.mockRestore();
+  });
+
   it("rejects truncated final messages unless explicitly allowed", async () => {
     mockStream(
       ["partial"],
