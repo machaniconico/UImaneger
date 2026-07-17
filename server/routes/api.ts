@@ -41,6 +41,7 @@ interface ProposalEntry {
   relFile: string;
   line?: number;
   confidence: Confidence;
+  instruction: string;
   createdAt: number;
   hadBom: boolean;
 }
@@ -55,19 +56,37 @@ interface UndoEntry {
   proposalId: string;
 }
 
+interface HistoryEntry {
+  id: string;
+  relFile: string;
+  summary?: string;
+  instruction?: string;
+  appliedAt: string;
+  kind: "apply" | "undo" | "redo";
+}
+
 const PROPOSAL_TTL_MS = 30 * 60 * 1000;
 const PROPOSAL_MAX = 100;
 const UNDO_MAX = 50;
+const HISTORY_MAX = 100;
 
 const proposalStore = new Map<string, ProposalEntry>();
 const undoStack: UndoEntry[] = [];
+const redoStack: UndoEntry[] = [];
+const historyLog: HistoryEntry[] = [];
 
 /** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
 const inFlight = new Set<string>();
 /** apply/undo の read-compare-write を対象ファイル単位で直列化するキュー。 */
 const fileLocks = new Map<string, Promise<void>>();
 // テスト/検証用途にストアを公開 (本番はプロセス内メモリ)
-export const __stores = { proposalStore, undoStack, inFlight };
+export const __stores = {
+  proposalStore,
+  undoStack,
+  redoStack,
+  inFlight,
+  historyLog,
+};
 let storesRoot: string | null = null;
 
 function sanitizeForLog(value: unknown): string {
@@ -103,6 +122,8 @@ function ensureStoresForCurrentRoot(): void {
   if (root === storesRoot) return;
   proposalStore.clear();
   undoStack.splice(0);
+  redoStack.splice(0);
+  historyLog.splice(0);
   inFlight.clear();
   storesRoot = root;
 }
@@ -281,6 +302,18 @@ function pushUndo(entry: UndoEntry): void {
   while (undoStack.length > UNDO_MAX) undoStack.shift();
 }
 
+/** redo スタックへ積みつつ件数上限(UNDO_MAX)を維持。古いものから破棄。 */
+function pushRedo(entry: UndoEntry): void {
+  redoStack.push(entry);
+  while (redoStack.length > UNDO_MAX) redoStack.shift();
+}
+
+/** 編集履歴へ記録しつつ件数上限(HISTORY_MAX)を維持。古いものから破棄。 */
+function pushHistory(entry: HistoryEntry): void {
+  historyLog.push(entry);
+  while (historyLog.length > HISTORY_MAX) historyLog.shift();
+}
+
 /**
  * root 配下かを realpath で判定(シンボリックリンク経由のトラバーサルを防止)。
  * ファイルが未存在の場合は親ディレクトリを realpath して判定する。
@@ -374,6 +407,8 @@ api.get("/status", (c) => {
     hasKey: hasKey(),
     logs: getLogs().slice(-50),
     undoDepth: undoStack.length,
+    redoDepth: redoStack.length,
+    historyCount: historyLog.length,
   });
 });
 
@@ -755,6 +790,7 @@ async function buildProposalForFile(
     relFile,
     line,
     confidence,
+    instruction,
     createdAt: Date.now(),
     hadBom: decoded.hadBom,
   });
@@ -874,6 +910,15 @@ api.post("/edit/apply", async (c) => {
         appliedContent,
         proposalId,
       });
+      redoStack.splice(0);
+      pushHistory({
+        id: randomUUID(),
+        relFile: p.relFile,
+        summary: `${p.relFile} を適用しました。`,
+        instruction: p.instruction,
+        appliedAt: new Date().toISOString(),
+        kind: "apply",
+      });
       proposalStore.delete(proposalId);
       return c.json({
         ok: true,
@@ -947,12 +992,20 @@ api.post("/edit/undo", async (c) => {
         );
       }
       await atomicWrite(entry.file, entry.previousContent);
+      pushRedo(entry);
+      pushHistory({
+        id: randomUUID(),
+        relFile: entry.relFile,
+        appliedAt: new Date().toISOString(),
+        kind: "undo",
+      });
       return c.json({
         ok: true,
         file: entry.file,
         relFile: entry.relFile,
         summary: `${entry.relFile} の適用を取り消しました。`,
         undoDepth: undoStack.length,
+        redoDepth: redoStack.length,
       });
     });
   } catch (e) {
@@ -961,6 +1014,77 @@ api.post("/edit/undo", async (c) => {
   } finally {
     inFlight.delete(entry.proposalId);
   }
+});
+
+/** 最後に取り消した適用をやり直す。 */
+api.post("/edit/redo", async (c) => {
+  ensureStoresForCurrentRoot();
+  const root = getRoot();
+  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+  const entry = redoStack.pop();
+  if (!entry)
+    return c.json({ error: "やり直せる取り消しがありません。" }, 404);
+  if (inFlight.has(entry.proposalId)) {
+    redoStack.push(entry);
+    return c.json({ error: "この提案は現在処理中です。" }, 409);
+  }
+  inFlight.add(entry.proposalId);
+  if (!inRoot(root, entry.file)) {
+    redoStack.push(entry);
+    inFlight.delete(entry.proposalId);
+    return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+  }
+  try {
+    return await withFileLock(entry.file, async () => {
+      const currentBytes = await readFile(entry.file);
+      if (getRoot() !== root) {
+        redoStack.push(entry);
+        return c.json(
+          { error: "プロジェクトが切り替わったため中断しました" },
+          409
+        );
+      }
+      if (
+        Buffer.compare(
+          currentBytes,
+          Buffer.from(entry.previousContent, "utf8")
+        ) !== 0
+      ) {
+        redoStack.push(entry);
+        return c.json(
+          { error: "取り消し後にファイルが変更されているためやり直せません。" },
+          409
+        );
+      }
+      await atomicWrite(entry.file, entry.appliedContent);
+      pushUndo(entry);
+      pushHistory({
+        id: randomUUID(),
+        relFile: entry.relFile,
+        appliedAt: new Date().toISOString(),
+        kind: "redo",
+      });
+      return c.json({
+        ok: true,
+        file: entry.file,
+        relFile: entry.relFile,
+        summary: `${entry.relFile} をやり直しました。`,
+        undoDepth: undoStack.length,
+        redoDepth: redoStack.length,
+      });
+    });
+  } catch (e) {
+    redoStack.push(entry);
+    return serverError(c, e, entry.relFile);
+  } finally {
+    inFlight.delete(entry.proposalId);
+  }
+});
+
+/** 編集履歴を新しい順で返す。 */
+api.get("/edit/history", (c) => {
+  ensureStoresForCurrentRoot();
+  return c.json({ history: [...historyLog].reverse() });
 });
 
 function buildEditPrompt(

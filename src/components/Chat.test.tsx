@@ -22,6 +22,8 @@ vi.mock("../lib/api", () => ({
     applyEdit: vi.fn(),
     rejectEdit: vi.fn(),
     undoEdit: vi.fn(),
+    redoEdit: vi.fn(),
+    editHistory: vi.fn(),
   },
 }));
 
@@ -118,6 +120,13 @@ describe("Chat", () => {
 
   it("承認クリックで api.applyEdit が呼ばれ、成功メッセージが出る", async () => {
     const user = userEvent.setup();
+    vi.mocked(api.status).mockResolvedValueOnce({
+      info: null,
+      hasKey: true,
+      logs: [],
+      undoDepth: 1,
+      redoDepth: 2,
+    });
     vi.mocked(api.edit).mockResolvedValue(goodProposal());
     vi.mocked(api.applyEdit).mockResolvedValue({
       ok: true,
@@ -125,6 +134,9 @@ describe("Chat", () => {
       undoDepth: 2,
     });
     render(<Chat selected={descriptor} hasKey={true} />);
+    expect(
+      await screen.findByRole("button", { name: /redo \(2\)/ })
+    ).not.toBeNull();
 
     await sendInstruction(user, "赤くして");
     await screen.findByText("承認して適用");
@@ -135,6 +147,7 @@ describe("Chat", () => {
     expect(
       await screen.findByRole("button", { name: /undo \(2\)/ })
     ).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /redo/ })).toBeNull();
   });
 
   // ★最重要: apply 失敗時の回帰テスト(Codex確認済みの修正)
@@ -245,6 +258,7 @@ describe("Chat", () => {
       ok: true,
       relFile: "src/App.tsx",
       undoDepth: 1,
+      redoDepth: 1,
     });
     render(<Chat selected={descriptor} hasKey={true} />);
 
@@ -258,6 +272,33 @@ describe("Chat", () => {
     expect(api.undoEdit).toHaveBeenCalled();
     expect(await screen.findByText(/元に戻しました/)).not.toBeNull();
     expect(await screen.findByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
+    expect(await screen.findByRole("button", { name: /redo \(1\)/ })).not.toBeNull();
+  });
+
+  it("redo ボタンクリックで api.redoEdit を呼び、サーバの深さを反映する", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.status).mockResolvedValueOnce({
+      info: null,
+      hasKey: true,
+      logs: [],
+      undoDepth: 1,
+      redoDepth: 2,
+    });
+    vi.mocked(api.redoEdit).mockResolvedValue({
+      ok: true,
+      relFile: "src/App.tsx",
+      undoDepth: 2,
+      redoDepth: 1,
+    });
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    const redoBtn = await screen.findByRole("button", { name: /redo \(2\)/ });
+    await user.click(redoBtn);
+
+    expect(api.redoEdit).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/やり直しました/)).not.toBeNull();
+    expect(await screen.findByRole("button", { name: /undo \(2\)/ })).not.toBeNull();
+    expect(await screen.findByRole("button", { name: /redo \(1\)/ })).not.toBeNull();
   });
 
   it("api.undoEdit が ok:false を返したとき status を再取得して undoDepth を更新する", async () => {

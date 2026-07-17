@@ -6,6 +6,7 @@ import { BeforePreview } from "./components/BeforePreview.tsx";
 import { AfterPreview } from "./components/AfterPreview.tsx";
 import { Chat } from "./components/Chat.tsx";
 import { StatusPanel } from "./components/StatusPanel.tsx";
+import { HistoryPanel } from "./components/HistoryPanel.tsx";
 
 const STATUS_RETRY_DELAYS_MS = [500, 1000, 2000];
 
@@ -102,6 +103,7 @@ export function App() {
             hasKey={hasKey}
           />
         </div>
+        <HistoryPanel />
         <StatusPanel />
       </aside>
 

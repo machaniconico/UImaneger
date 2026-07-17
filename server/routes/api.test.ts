@@ -264,6 +264,8 @@ beforeEach(async () => {
   );
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
+  __stores.redoStack.splice(0);
+  __stores.historyLog.splice(0);
   __stores.inFlight.clear();
 
   root = mkdtempSync(join(tmpdir(), "uim-api-"));
@@ -277,6 +279,8 @@ beforeEach(async () => {
 afterEach(async () => {
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
+  __stores.redoStack.splice(0);
+  __stores.historyLog.splice(0);
   __stores.inFlight.clear();
   resetFsPromiseMocks();
   await stopProject();
@@ -870,6 +874,98 @@ describe("edit proposal API", () => {
     expect(res.status).toBe(200);
     expect(body).toMatchObject({ ok: true, relFile: "src/App.tsx" });
     expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+  });
+
+  it("round-trips apply, undo, and redo while reporting stack depths", async () => {
+    const proposal = await requestProposal();
+
+    const applied = await postJson<{ ok: true; undoDepth: number }>(
+      "/api/edit/apply",
+      { proposalId: proposal.proposalId }
+    );
+    expect(applied.res.status).toBe(200);
+    expect(applied.body.undoDepth).toBe(1);
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+
+    const statusAfterApply = await getJson<{
+      undoDepth: number;
+      redoDepth: number;
+    }>("/api/status");
+    expect(statusAfterApply.body).toMatchObject({
+      undoDepth: 1,
+      redoDepth: 0,
+    });
+
+    const undone = await postJson<{
+      ok: true;
+      undoDepth: number;
+      redoDepth: number;
+    }>("/api/edit/undo", {});
+    expect(undone.res.status).toBe(200);
+    expect(undone.body).toMatchObject({ undoDepth: 0, redoDepth: 1 });
+    expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+
+    const redone = await postJson<{
+      ok: true;
+      undoDepth: number;
+      redoDepth: number;
+    }>("/api/edit/redo", {});
+    expect(redone.res.status).toBe(200);
+    expect(redone.body).toMatchObject({ undoDepth: 1, redoDepth: 0 });
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+  });
+
+  it("keeps the redo entry when the file changed after undo", async () => {
+    const proposal = await requestProposal();
+    await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    await postJson("/api/edit/undo", {});
+    const drifted = originalContent.replace("Save now", "Changed later");
+    writeFileSync(filePath, drifted, "utf8");
+
+    const redone = await postJson<{ error: string }>("/api/edit/redo", {});
+
+    expect(redone.res.status).toBe(409);
+    expect(redone.body.error).toMatch(/変更|やり直/);
+    expect(__stores.redoStack).toHaveLength(1);
+    expect(readFileSync(filePath, "utf8")).toBe(drifted);
+  });
+
+  it("clears the redo stack after a new apply", async () => {
+    const firstProposal = await requestProposal();
+    await postJson("/api/edit/apply", {
+      proposalId: firstProposal.proposalId,
+    });
+    await postJson("/api/edit/undo", {});
+    expect(__stores.redoStack).toHaveLength(1);
+
+    const secondProposal = await requestProposal();
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondProposal.proposalId,
+    });
+
+    expect(applied.res.status).toBe(200);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+  });
+
+  it("returns apply, undo, and redo history in newest-first order", async () => {
+    const proposal = await requestProposal();
+    await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    await postJson("/api/edit/undo", {});
+    await postJson("/api/edit/redo", {});
+
+    const history = await getJson<{
+      history: Array<{ kind: string; relFile: string }>;
+    }>("/api/edit/history");
+
+    expect(history.res.status).toBe(200);
+    expect(history.body.history).toHaveLength(3);
+    expect(history.body.history.map(({ kind, relFile }) => ({ kind, relFile })))
+      .toEqual([
+        { kind: "redo", relFile: "src/App.tsx" },
+        { kind: "undo", relFile: "src/App.tsx" },
+        { kind: "apply", relFile: "src/App.tsx" },
+      ]);
   });
 
   it("refuses to undo while the same proposal is already in flight", async () => {
