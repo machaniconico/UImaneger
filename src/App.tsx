@@ -78,9 +78,9 @@ export function App() {
   }
 
   return (
-    <div className="flex h-full bg-neutral-900 text-neutral-200">
+    <div className="flex h-full bg-base text-neutral-200">
       {/* 左: GUI 操作パネル */}
-      <aside className="flex w-[340px] shrink-0 flex-col border-r border-neutral-800">
+      <aside className="flex w-[340px] shrink-0 flex-col border-r border-neutral-800 bg-surface">
         <ProjectBar
           info={info}
           hasKey={hasKey}

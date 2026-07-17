@@ -8,6 +8,12 @@ const kindIcon: Record<HistoryEntry["kind"], string> = {
   redo: "↪",
 };
 
+const kindColor: Record<HistoryEntry["kind"], string> = {
+  apply: "text-green-400",
+  undo: "text-amber-400",
+  redo: "text-cyan-400",
+};
+
 function fileName(path: string) {
   return path.split(/[\\/]/).pop() || path;
 }
@@ -42,7 +48,7 @@ export function HistoryPanel() {
         if (event.currentTarget.open) refresh();
       }}
     >
-      <summary className="cursor-pointer font-semibold text-neutral-300">
+      <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-neutral-400 transition-colors duration-150 hover:text-neutral-300">
         編集履歴
       </summary>
       <div className="mt-2 max-h-36 space-y-1 overflow-y-auto">
@@ -50,8 +56,8 @@ export function HistoryPanel() {
           <div className="text-neutral-600">まだ編集はありません</div>
         ) : (
           history.map((entry) => (
-            <div key={entry.id} className="flex items-start gap-1.5">
-              <span className="shrink-0 text-neutral-300">
+            <div key={entry.id} className="flex items-start gap-1.5 rounded px-1 py-0.5 transition-colors duration-150 hover:bg-neutral-900">
+              <span className={`shrink-0 font-semibold ${kindColor[entry.kind]}`}>
                 {kindIcon[entry.kind]}
               </span>
               <div className="min-w-0 flex-1">

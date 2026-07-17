@@ -274,7 +274,7 @@ export function Chat({ selected, hasKey }: Props) {
               type="button"
               onClick={undo}
               disabled={busy}
-              className="cursor-pointer rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50"
+              className="cursor-pointer rounded-md border border-neutral-700 bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300 transition-colors duration-150 hover:border-neutral-600 hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50"
             >
               ↩ undo ({undoDepth})
             </button>
@@ -284,7 +284,7 @@ export function Chat({ selected, hasKey }: Props) {
               type="button"
               onClick={redo}
               disabled={busy}
-              className="cursor-pointer rounded bg-neutral-800 px-2 py-0.5 text-xs hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50"
+              className="cursor-pointer rounded-md border border-neutral-700 bg-neutral-800 px-2 py-0.5 text-xs text-neutral-300 transition-colors duration-150 hover:border-neutral-600 hover:bg-neutral-700 disabled:cursor-default disabled:opacity-50"
             >
               ↪ redo ({redoDepth})
             </button>
@@ -295,10 +295,21 @@ export function Chat({ selected, hasKey }: Props) {
       {/* 選択中の要素 */}
       <div className="border-b border-neutral-800 px-3 py-2 text-xs">
         {selected ? (
-          <div className="space-y-1">
-            <div className="text-blue-400">
-              &lt;{selected.tag}
-              {selected.id ? ` #${selected.id}` : ""}&gt;
+          <div className="space-y-1.5 rounded-lg border border-neutral-800 bg-neutral-900 p-2.5 shadow-sm">
+            <div className="flex items-center justify-between gap-2">
+              <div className="truncate font-mono text-accent-300">
+                &lt;{selected.tag}
+                {selected.id ? ` #${selected.id}` : ""}&gt;
+              </div>
+              <span
+                className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                  selected.source
+                    ? "bg-green-500/10 text-green-400 ring-1 ring-inset ring-green-500/20"
+                    : "bg-cyan-500/10 text-cyan-400 ring-1 ring-inset ring-cyan-500/20"
+                }`}
+              >
+                {selected.source ? "層A" : "層B"}
+              </span>
             </div>
             {selected.textSnippet && (
               <div className="truncate text-neutral-400">
@@ -310,7 +321,7 @@ export function Chat({ selected, hasKey }: Props) {
                 .{selected.classes.join(" .")}
               </div>
             )}
-            <div className="text-neutral-600">
+            <div className="text-[10px] text-neutral-500">
               {selected.source
                 ? `層A: ${selected.source.fileName
                     .split(/[\\/]/)
@@ -341,12 +352,12 @@ export function Chat({ selected, hasKey }: Props) {
               key={i}
               className={
                 m.role === "user"
-                  ? "rounded bg-neutral-800 px-2 py-1"
+                  ? "ml-8 rounded-lg rounded-br-sm bg-neutral-800 px-2.5 py-1.5 text-neutral-200"
                   : m.ok === true
-                  ? "text-green-400"
+                  ? "mr-8 rounded-lg rounded-bl-sm bg-green-500/10 px-2.5 py-1.5 text-green-400"
                   : m.ok === false
-                  ? "text-red-400"
-                  : "text-neutral-500"
+                  ? "mr-8 rounded-lg rounded-bl-sm bg-red-500/10 px-2.5 py-1.5 text-red-400"
+                  : "mr-8 rounded-lg rounded-bl-sm bg-neutral-900 px-2.5 py-1.5 text-neutral-400"
               }
             >
               {m.text}
@@ -354,13 +365,20 @@ export function Chat({ selected, hasKey }: Props) {
           ))}
         </div>
         {busy && (
-          <div role="status" className="text-neutral-500">
-            処理中…
+          <div role="status" className="mr-8 flex items-center gap-1 rounded-lg rounded-bl-sm bg-neutral-900 px-2.5 py-2 text-neutral-500">
+            <span className="sr-only">処理中…</span>
+            {[0, 1, 2].map((index) => (
+              <span
+                key={index}
+                className="h-1.5 w-1.5 animate-bounce rounded-full bg-neutral-500 motion-reduce:animate-none"
+                style={{ animationDelay: `${index * 120}ms` }}
+              />
+            ))}
           </div>
         )}
 
         {hasPendingSuggestion && editDescriptor && (
-          <div className="rounded border border-neutral-800 bg-neutral-900 px-2 py-1 text-xs text-neutral-400">
+          <div className="rounded-lg border border-neutral-800 bg-neutral-900 px-2.5 py-2 text-xs text-neutral-400">
             <div>提案対象: {descriptorLabel(editDescriptor)}</div>
             {descriptorMismatch && (
               <div className="mt-1 text-amber-300">
@@ -393,32 +411,34 @@ export function Chat({ selected, hasKey }: Props) {
             ANTHROPIC_API_KEY を .env に設定してください
           </div>
         )}
-        <textarea
-          value={instruction}
-          onChange={(e) => setInstruction(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-              e.preventDefault();
-              send();
+        <div className="overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 transition-colors duration-150 focus-within:border-accent-500 focus-within:ring-2 focus-within:ring-accent-500/30">
+          <textarea
+            value={instruction}
+            onChange={(e) => setInstruction(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                send();
+              }
+            }}
+            aria-label="編集指示"
+            placeholder={
+              selected
+                ? "例: この見出しを大きく赤くして / 余白を広げて / 角を丸く"
+                : "先に要素を選択"
             }
-          }}
-          aria-label="編集指示"
-          placeholder={
-            selected
-              ? "例: この見出しを大きく赤くして / 余白を広げて / 角を丸く"
-              : "先に要素を選択"
-          }
-          disabled={!selected || busy}
-          rows={3}
-          className="w-full resize-none rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm outline-none focus:border-blue-500 disabled:opacity-50"
-        />
-        <button
-          onClick={send}
-          disabled={!selected || busy || !instruction.trim()}
-          className="mt-1 w-full rounded bg-blue-600 py-1 text-sm font-medium hover:bg-blue-500 disabled:opacity-50"
-        >
-          差分を生成 (⌘/Ctrl+Enter)
-        </button>
+            disabled={!selected || busy}
+            rows={3}
+            className="w-full resize-none border-0 bg-transparent px-2.5 py-2 text-sm outline-none disabled:opacity-50"
+          />
+          <button
+            onClick={send}
+            disabled={!selected || busy || !instruction.trim()}
+            className="w-full border-t border-accent-500/30 bg-accent-600 py-1.5 text-sm font-medium text-white transition-colors duration-150 hover:bg-accent-500 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-70"
+          >
+            差分を生成 (⌘/Ctrl+Enter)
+          </button>
+        </div>
       </div>
     </div>
   );
