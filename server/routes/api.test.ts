@@ -31,6 +31,7 @@ const claudeMock = vi.hoisted(() => {
 
   return {
     complete: vi.fn(),
+    streamComplete: vi.fn(),
     TruncatedError,
   };
 });
@@ -46,6 +47,7 @@ const fsPromisesMock = vi.hoisted(() => ({
 
 vi.mock("../lib/claude.ts", () => ({
   complete: claudeMock.complete,
+  streamComplete: claudeMock.streamComplete,
   hasKey: () => true,
   stripCodeFence: (text: string) => {
     const m = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)^```/m);
@@ -184,6 +186,22 @@ async function getJson<T = Record<string, unknown>>(
   };
 }
 
+async function postSse(
+  path: string,
+  body: unknown
+): Promise<{ res: Response; events: Array<Record<string, unknown>> }> {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  const events = [...text.matchAll(/^data: ?(.*)$/gm)].map((match) =>
+    JSON.parse(match[1])
+  );
+  return { res, events };
+}
+
 async function requestProposal(proposed = editedContent): Promise<ProposalBody> {
   claudeMock.complete.mockResolvedValueOnce(proposed);
   const { res, body } = await postJson<ProposalBody>("/api/edit", {
@@ -235,6 +253,15 @@ function delay(ms: number): Promise<void> {
 beforeEach(async () => {
   resetFsPromiseMocks();
   claudeMock.complete.mockReset();
+  claudeMock.streamComplete.mockReset();
+  claudeMock.streamComplete.mockImplementation(
+    (
+      prompt: string,
+      opts: unknown,
+      onProgress?: (info: { chars: number; tail: string }) => void
+    ) =>
+      claudeMock.complete(prompt, opts, onProgress)
+  );
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
   __stores.inFlight.clear();
@@ -325,6 +352,129 @@ describe("project security helpers", () => {
 });
 
 describe("edit proposal API", () => {
+  it("streams resolving, generating, progress, and a successful result", async () => {
+    claudeMock.complete.mockImplementationOnce(
+      async (
+        _prompt: string,
+        _opts: unknown,
+        onProgress?: (info: { chars: number; tail: string }) => void
+      ) => {
+        onProgress?.({ chars: 42, tail: "generated tail" });
+        return editedContent;
+      }
+    );
+
+    const { res, events } = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(events.map((event) => event.type)).toEqual([
+      "stage",
+      "stage",
+      "progress",
+      "result",
+    ]);
+    expect(events[0]).toEqual({ type: "stage", stage: "resolving" });
+    expect(events[1]).toEqual({
+      type: "stage",
+      stage: "generating",
+      file: "src/App.tsx",
+    });
+    expect(events[2]).toEqual({
+      type: "progress",
+      chars: 42,
+      tail: "generated tail",
+    });
+    expect(events[3]).toMatchObject({
+      type: "result",
+      ok: true,
+      relFile: "src/App.tsx",
+    });
+    expect(typeof events[3].proposalId).toBe("string");
+  });
+
+  it("refines a previous pending proposal while keeping the disk file as the diff baseline", async () => {
+    const firstProposed = editedContent.replace(
+      "Saved successfully",
+      "First pending version"
+    );
+    const refinedProposed = editedContent.replace(
+      "Saved successfully",
+      "Refined pending version"
+    );
+    claudeMock.complete.mockResolvedValueOnce(firstProposed);
+    const first = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    const firstResult = first.events.at(-1)!;
+
+    claudeMock.complete.mockResolvedValueOnce(refinedProposed);
+    const second = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Make it more prominent.",
+      previousProposalId: firstResult.proposalId,
+    });
+    const secondResult = second.events.at(-1)!;
+    const secondPrompt = String(claudeMock.complete.mock.calls[1][0]);
+
+    expect(secondPrompt).toContain("First pending version");
+    expect(secondPrompt).toContain(
+      "現在の作業版（ユーザーの前回の指示を反映済み）"
+    );
+    expect(secondResult).toMatchObject({ type: "result", ok: true });
+    expect(String(secondResult.diff)).toContain("Save now");
+    expect(String(secondResult.diff)).toContain("Refined pending version");
+    expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondResult.proposalId,
+    });
+    expect(applied.res.status).toBe(200);
+    expect(readFileSync(filePath, "utf8")).toBe(refinedProposed);
+  });
+
+  it("ends the stream with a result when source resolution finds no file", async () => {
+    const { events } = await postSse("/api/edit/stream", {
+      descriptor: {
+        tag: "definitely-absent-tag",
+        classes: ["uim-no-match-unique"],
+        attrs: {},
+        domPath: "",
+      },
+      instruction: "Change this element.",
+    });
+
+    expect(events.map((event) => event.type)).toEqual(["stage", "result"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      confidence: "low",
+      candidates: [],
+    });
+    expect(claudeMock.streamComplete).not.toHaveBeenCalled();
+  });
+
+  it("ends the stream with the server error result shape when generation throws", async () => {
+    claudeMock.complete.mockRejectedValueOnce(new Error("stream failed"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { events } = await postSse("/api/edit/stream", {
+        descriptor: descriptorFor(filePath),
+        instruction: "Change the button label.",
+      });
+
+      expect(events.at(-1)).toEqual({
+        type: "result",
+        error: "stream failed",
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("creates a proposal with a unified diff without changing the file", async () => {
     const proposal = await requestProposal();
 

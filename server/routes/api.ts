@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { streamSSE } from "hono/streaming";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
@@ -7,7 +8,12 @@ import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
 import { env } from "../lib/env.ts";
-import { hasKey, complete, stripCodeFence, TruncatedError } from "../lib/claude.ts";
+import {
+  hasKey,
+  streamComplete,
+  stripCodeFence,
+  TruncatedError,
+} from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
 import {
@@ -72,7 +78,7 @@ function sanitizeForLog(value: unknown): string {
   return s.replace(/sk-ant-[A-Za-z0-9_-]+/g, "[REDACTED]");
 }
 
-function serverError(c: Context, e: unknown, relFile?: string) {
+function serverErrorPayload(c: Context, e: unknown, relFile?: string) {
   const err = e as { name?: string; message?: string; status?: unknown };
   console.error(
     JSON.stringify({
@@ -85,7 +91,11 @@ function serverError(c: Context, e: unknown, relFile?: string) {
       status: err?.status,
     })
   );
-  return c.json({ error: sanitizeForLog((e as Error)?.message ?? e) }, 500);
+  return { error: sanitizeForLog((e as Error)?.message ?? e) };
+}
+
+function serverError(c: Context, e: unknown, relFile?: string) {
+  return c.json(serverErrorPayload(c, e, relFile), 500);
 }
 
 function ensureStoresForCurrentRoot(): void {
@@ -513,63 +523,122 @@ api.post("/files/write", async (c) => {
   }
 });
 
-api.post("/edit", async (c) => {
+interface EditRequestBody {
+  descriptor: DomDescriptor;
+  instruction: string;
+  previousProposalId?: string;
+}
+
+interface EditFlowHooks {
+  onResolving?: () => void;
+  onGenerating?: (relFile: string) => void;
+  onProgress?: (info: { chars: number; tail: string }) => void;
+}
+
+type EditFlowResponse = {
+  status: 200 | 400 | 403;
+  body: Record<string, unknown>;
+};
+
+async function runEditFlow(
+  request: EditRequestBody,
+  hooks: EditFlowHooks = {}
+): Promise<EditFlowResponse> {
   ensureStoresForCurrentRoot();
   const root = getRoot();
-  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+  if (!root)
+    return { status: 400, body: { error: "プロジェクト未オープン" } };
   if (!hasKey())
-    return c.json(
-      { error: "ANTHROPIC_API_KEY 未設定。.env に設定してください。" },
-      400
-    );
+    return {
+      status: 400,
+      body: { error: "ANTHROPIC_API_KEY 未設定。.env に設定してください。" },
+    };
 
-  const { descriptor: rawDescriptor, instruction } = await c.req.json<{
-    descriptor: DomDescriptor;
-    instruction: string;
-  }>();
+  const {
+    descriptor: rawDescriptor,
+    instruction,
+    previousProposalId,
+  } = request;
   if (!instruction?.trim())
-    return c.json({ error: "指示が空です" }, 400);
+    return { status: 400, body: { error: "指示が空です" } };
   const descErr = validateDescriptor(rawDescriptor);
-  if (descErr) return c.json({ error: descErr }, 400);
+  if (descErr) return { status: 400, body: { error: descErr } };
   const descriptor = remapBeforeSource(root, normalizeDescriptor(rawDescriptor));
 
-  try {
-    // 1. ソース解決 (層A/B)
-    const resolved = await resolveSource(root, descriptor);
-    if (!resolved.file) {
-      return c.json({
+  hooks.onResolving?.();
+  const resolved = await resolveSource(root, descriptor);
+  if (!resolved.file) {
+    return {
+      status: 200,
+      body: {
         ok: false,
         error:
           "対象のソース箇所を特定できませんでした。要素のテキストやclass/idが手がかりに乏しい可能性があります。",
         confidence: "low",
         candidates: resolved.candidates,
-      });
-    }
-    if (!inRoot(root, resolved.file))
-      return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
+      },
+    };
+  }
+  if (!inRoot(root, resolved.file))
+    return { status: 403, body: { error: "解決先がプロジェクト範囲外" } };
 
-    // 2. 提案生成 (ファイルはまだ書かない)
-    const result = await buildProposalForFile(
-      root,
-      resolved.file,
-      resolved.line,
-      descriptor,
-      instruction,
-      resolved.confidence
-    );
+  const relFile = relative(root, resolved.file);
+  hooks.onGenerating?.(relFile);
+  const result = await buildProposalForFile(
+    root,
+    resolved.file,
+    resolved.line,
+    descriptor,
+    instruction,
+    resolved.confidence,
+    { onProgress: hooks.onProgress, previousProposalId }
+  );
 
-    // 3. 低確度/複数候補時は candidates を同梱
-    const includeCandidates =
-      resolved.confidence === "low" ||
-      (Array.isArray(resolved.candidates) && resolved.candidates.length > 1);
-    return c.json(
-      includeCandidates
-        ? { ...result, candidates: resolved.candidates }
-        : result
-    );
+  const includeCandidates =
+    resolved.confidence === "low" ||
+    (Array.isArray(resolved.candidates) && resolved.candidates.length > 1);
+  return {
+    status: 200,
+    body: includeCandidates
+      ? { ...result, candidates: resolved.candidates }
+      : result,
+  };
+}
+
+api.post("/edit", async (c) => {
+  try {
+    const request = await c.req.json<EditRequestBody>();
+    const result = await runEditFlow(request);
+    return c.json(result.body, result.status);
   } catch (e) {
     return serverError(c, e);
   }
+});
+
+api.post("/edit/stream", (c) => {
+  return streamSSE(c, async (stream) => {
+    let writes = Promise.resolve();
+    const send = (event: Record<string, unknown>): void => {
+      writes = writes.then(() =>
+        stream.writeSSE({ data: JSON.stringify(event) })
+      );
+    };
+
+    try {
+      const request = await c.req.json<EditRequestBody>();
+      const result = await runEditFlow(request, {
+        onResolving: () => send({ type: "stage", stage: "resolving" }),
+        onGenerating: (file) =>
+          send({ type: "stage", stage: "generating", file }),
+        onProgress: ({ chars, tail }) =>
+          send({ type: "progress", chars, tail }),
+      });
+      send({ type: "result", ...result.body });
+    } catch (e) {
+      send({ type: "result", ...serverErrorPayload(c, e) });
+    }
+    await writes;
+  });
 });
 
 /**
@@ -583,7 +652,11 @@ async function buildProposalForFile(
   line: number | undefined,
   descriptor: DomDescriptor,
   instruction: string,
-  confidence: Confidence
+  confidence: Confidence,
+  options: {
+    onProgress?: (info: { chars: number; tail: string }) => void;
+    previousProposalId?: string;
+  } = {}
 ): Promise<
   | {
       ok: true;
@@ -618,10 +691,29 @@ async function buildProposalForFile(
     };
   }
   const original = decoded.text;
-  const prompt = buildEditPrompt(relFile, original, descriptor, line, instruction);
+  pruneProposals();
+  const previous = options.previousProposalId
+    ? proposalStore.get(options.previousProposalId)
+    : undefined;
+  const isRefinement = Boolean(
+    previous && resolve(previous.file) === resolve(file)
+  );
+  const promptContent = previous && isRefinement ? previous.proposed : original;
+  const prompt = buildEditPrompt(
+    relFile,
+    promptContent,
+    descriptor,
+    line,
+    instruction,
+    isRefinement
+  );
   let raw: string;
   try {
-    raw = await complete(prompt, { maxTokens: 16000 });
+    raw = await streamComplete(
+      prompt,
+      { maxTokens: 64000, adaptive: true },
+      options.onProgress
+    );
   } catch (e) {
     if (e instanceof TruncatedError) {
       return {
@@ -876,7 +968,8 @@ function buildEditPrompt(
   content: string,
   d: DomDescriptor,
   line: number | undefined,
-  instruction: string
+  instruction: string,
+  isRefinement = false
 ): string {
   return `あなたは熟練のフロントエンド開発者です。ユーザーが画面上の要素を選び、自然言語で変更を指示しました。
 対象ファイルを編集し、**ファイル全体を1つのコードブロックで** 返してください。説明文は不要です。
@@ -897,7 +990,11 @@ ${instruction}
 - 既存のコードスタイル/インデント/フレームワーク作法に合わせる。
 - ファイル全体を完全な形で返す(省略やプレースホルダ禁止)。
 
-# 現在のファイル内容
+# ${
+    isRefinement
+      ? "現在の作業版（ユーザーの前回の指示を反映済み）"
+      : "現在のファイル内容"
+  }
 \`\`\`
 ${content}
 \`\`\``;
