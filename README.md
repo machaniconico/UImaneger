@@ -23,6 +23,8 @@ bolt.new のローカル版 + プレビュー上で要素を選んで自然言�
 
 ## 使い方
 
+前提: Node.js 22.12 以上 25 未満、npm 10 以上。
+
 ```bash
 npm install
 cp .env.example .env   # ANTHROPIC_API_KEY を設定
@@ -55,11 +57,14 @@ npm run dev            # エディタUI(:5173) + サーバ(:5174)
 
 ```bash
 npm run typecheck   # 型チェック
+npm run policy      # 依存固定・lockfile 同期などのリリース前チェック
 npm test            # selftest(runner/resolver) + vitest(ユニット/統合)
+npm run test:ci     # CI と同じく非推奨API警告を失敗扱いで検証
 npm run build       # 本番ビルド
+npm run verify      # policy → typecheck → test:ci → build
 ```
 
 - テスト: `scripts/*-selftest.mjs`(FW検出/ソース解決の純関数)+ `server/**/*.test.ts`・`src/**/*.test.tsx`(vitest)。編集パイプライン(`/api/edit`→apply/undo)は Claude 呼び出しを mock した統合テストで検証。
-- CI: `.github/workflows/ci.yml` が push/PR で `npm ci → typecheck → test → build` を実行(job 名 `test`)。Node 24 固定(`.ts` 直接 import の型除去が Node 22.6+ 前提)。
+- CI: `.github/workflows/ci.yml` が push/PR で `npm ci → npm run verify` を実行(job 名 `test`)。Node 24 固定。
 
 > 実APIキーを使ったエンドツーエンドの編集確認(ブラウザで要素選択→指示→反映)は、`.env` に `ANTHROPIC_API_KEY` を設定して手元で行ってください(CIでは mock のため未検証)。

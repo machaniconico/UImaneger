@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ProjectInfo } from "../lib/types.ts";
-import { api } from "../lib/api.ts";
+import { api, getErrorMessage } from "../lib/api.ts";
 
 interface Props {
   info: ProjectInfo | null;
@@ -49,8 +49,8 @@ export function ProjectBar({
       } else {
         onInfo(res.info ?? null);
       }
-    } catch (e: any) {
-      onError(String(e.message || e));
+    } catch (e) {
+      onError(getErrorMessage(e));
       await reconcileInfo();
     } finally {
       setBusy(false);
@@ -64,8 +64,8 @@ export function ProjectBar({
     try {
       const res = await api.stop();
       onInfo(res.info);
-    } catch (e: any) {
-      onError(String(e.message || e));
+    } catch (e) {
+      onError(getErrorMessage(e));
     } finally {
       setBusy(false);
     }

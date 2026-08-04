@@ -434,7 +434,7 @@ describe("F1 — runCommand override", () => {
       framework: "custom-fw",
     });
 
-    expect(info.runCommand).toBe("sh -c printf ready");
+    expect(info.runCommand).toBe("printf ready");
     expect(info.framework).toBe("custom-fw");
     expect(startTargetMock).toHaveBeenCalledTimes(2);
     expect(startTargetMock).toHaveBeenNthCalledWith(

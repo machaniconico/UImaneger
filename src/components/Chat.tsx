@@ -4,7 +4,7 @@ import type {
   DomDescriptor,
   EditProposal,
 } from "../lib/types.ts";
-import { api } from "../lib/api.ts";
+import { api, getErrorMessage } from "../lib/api.ts";
 import { DiffView } from "./DiffView.tsx";
 import { Candidates } from "./Candidates.tsx";
 
@@ -120,9 +120,9 @@ export function Chat({ selected, hasKey }: Props) {
     setBusy(true);
     try {
       handleProposal(await api.edit(selected, text), text);
-    } catch (e: any) {
+    } catch (e) {
       setInstruction(text);
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
       setBusy(false);
     }
@@ -137,8 +137,8 @@ export function Chat({ selected, hasKey }: Props) {
         await api.editCandidate(c, desc, lastInstruction),
         lastInstruction
       );
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
       setBusy(false);
     }
@@ -163,8 +163,8 @@ export function Chat({ selected, hasKey }: Props) {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "適用失敗") });
         // proposal を保持したまま → 再試行可能
       }
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       // proposal を保持したまま → 再試行可能
     } finally {
       setBusy(false);
@@ -209,8 +209,8 @@ export function Chat({ selected, hasKey }: Props) {
           });
         }
       }
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshUndoDepth().catch((statusError) => {
         console.error(statusError);
       });

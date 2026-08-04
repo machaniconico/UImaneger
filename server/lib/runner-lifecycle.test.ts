@@ -206,10 +206,22 @@ describe("startTarget", () => {
   itIfLoopback("killAllChildrenSync kills a live detached target registered by startTarget", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "uim-runner-live-"));
     try {
-      const target = await startTarget(tmp, 0, {
-        command:
-          "node -e \"require('http').createServer((_req,res)=>res.end('ok')).listen(0,'127.0.0.1',function(){console.log('Listening on '+this.address().port)})\"",
+      writeFileSync(
+        join(tmp, "live-server.cjs"),
+        [
+          "const http = require('node:http');",
+          "const port = Number(process.env.PORT);",
+          "http.createServer((_req, res) => res.end('ok')).listen(port, '127.0.0.1', function () {",
+          "  console.log('Listening on ' + this.address().port);",
+          "});",
+          "",
+        ].join("\n")
+      );
+      const port = await findFreePort(6200);
+      const target = await startTarget(tmp, port, {
+        command: "node live-server.cjs",
       });
+      expect(target.port).toBe(port);
       expect(await isListening(target.port)).toBe(true);
 
       killAllChildrenSync();

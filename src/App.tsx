@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import type { DomDescriptor, ProjectInfo } from "./lib/types.ts";
-import { api } from "./lib/api.ts";
+import { api, getErrorMessage } from "./lib/api.ts";
 import { ProjectBar } from "./components/ProjectBar.tsx";
 import { BeforePreview } from "./components/BeforePreview.tsx";
 import { AfterPreview } from "./components/AfterPreview.tsx";
 import { Chat } from "./components/Chat.tsx";
+import { GitPanel } from "./components/GitPanel.tsx";
 import { StatusPanel } from "./components/StatusPanel.tsx";
 
 const STATUS_RETRY_DELAYS_MS = [500, 1000, 2000];
@@ -49,7 +50,7 @@ export function App() {
           if (!alive) return;
         }
       }
-      if (alive) setError(String((lastError as any)?.message || lastError));
+      if (alive) setError(getErrorMessage(lastError));
     }
 
     loadStatus();
@@ -102,6 +103,7 @@ export function App() {
             hasKey={hasKey}
           />
         </div>
+        <GitPanel info={info} />
         <StatusPanel />
       </aside>
 

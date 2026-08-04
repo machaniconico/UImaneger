@@ -8,6 +8,8 @@ import type { ProjectInfo } from "../lib/types";
 
 vi.mock("../lib/api", () => ({
   api: { open: vi.fn(), clone: vi.fn(), stop: vi.fn(), status: vi.fn() },
+  getErrorMessage: (error: unknown) =>
+    error instanceof Error && error.message ? error.message : String(error),
 }));
 
 const runningInfo: ProjectInfo = {

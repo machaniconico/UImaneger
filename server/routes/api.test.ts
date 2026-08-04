@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -16,6 +17,7 @@ import {
   __stores,
   isSafeGitRepoUrl,
   isTrustedRunCommandHost,
+  JSON_BODY_MAX_BYTES,
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
@@ -184,6 +186,22 @@ async function getJson<T = Record<string, unknown>>(
   };
 }
 
+async function postRaw<T = Record<string, unknown>>(
+  path: string,
+  body: string,
+  contentType = "application/json"
+): Promise<JsonResponse<T>> {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": contentType },
+    body,
+  });
+  return {
+    res,
+    body: (await res.json()) as T,
+  };
+}
+
 async function requestProposal(proposed = editedContent): Promise<ProposalBody> {
   claudeMock.complete.mockResolvedValueOnce(proposed);
   const { res, body } = await postJson<ProposalBody>("/api/edit", {
@@ -230,6 +248,37 @@ function deferred<T = void>() {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function gitAvailable(): boolean {
+  try {
+    return spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function runGit(args: string[], cwd = root): ReturnType<typeof spawnSync> {
+  return spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+      GIT_CONFIG_SYSTEM: process.platform === "win32" ? "NUL" : "/dev/null",
+    },
+  });
+}
+
+function initGitRepo(dir: string): boolean {
+  const commands = [
+    ["init"],
+    ["config", "user.name", "test"],
+    ["config", "user.email", "test@example.com"],
+    ["add", "."],
+    ["commit", "-m", "init"],
+  ];
+  return commands.every((args) => runGit(args, dir).status === 0);
 }
 
 beforeEach(async () => {
@@ -321,6 +370,36 @@ describe("project security helpers", () => {
     expect(result.body.error).toBe(
       "runCommand の実行にはローカルからのアクセスが必要です"
     );
+  });
+
+  it("returns a JSON 400 for malformed JSON request bodies", async () => {
+    const result = await postRaw<{ error: string }>(
+      "/api/files/write",
+      "{not-json"
+    );
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe("JSON body が不正です");
+  });
+
+  it("returns a JSON 400 for non-object JSON request bodies", async () => {
+    const result = await postRaw<{ error: string }>(
+      "/api/files/write",
+      "null"
+    );
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe("JSON body はオブジェクトである必要があります");
+  });
+
+  it("returns a JSON 413 for oversized JSON request bodies", async () => {
+    const result = await postRaw<{ error: string }>(
+      "/api/files/write",
+      `{"content":"${"x".repeat(JSON_BODY_MAX_BYTES)}"}`
+    );
+
+    expect(result.res.status).toBe(413);
+    expect(result.body.error).toContain("JSON body が大きすぎます");
   });
 });
 
@@ -1056,5 +1135,51 @@ describe("edit proposal API", () => {
     );
     expect("summary" in proposal.body).toBe(false);
     expect(__stores.proposalStore.size).toBe(0);
+  });
+});
+
+describe("git API", () => {
+  it("rejects non-string commit messages", async () => {
+    const result = await postJson<{ error: string }>("/api/git/commit", {
+      message: 42,
+    });
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe(
+      "commit message は文字列である必要があります"
+    );
+  });
+
+  it("returns 409 when there is nothing to commit", async (ctx) => {
+    if (!gitAvailable() || !initGitRepo(root)) {
+      ctx.skip();
+      return;
+    }
+
+    const result = await postJson<{ error: string }>("/api/git/commit", {
+      message: "No changes",
+    });
+
+    expect(result.res.status).toBe(409);
+    expect(result.body.error).toBe("コミットする変更がありません");
+  });
+
+  it("commits working-tree changes after staging them", async (ctx) => {
+    if (!gitAvailable() || !initGitRepo(root)) {
+      ctx.skip();
+      return;
+    }
+    writeFileSync(filePath, editedContent, "utf8");
+
+    const result = await postJson<{ ok: true }>("/api/git/commit", {
+      message: "Apply edit",
+    });
+
+    expect(result.res.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+    expect(String(runGit(["log", "-1", "--pretty=%B"]).stdout).trim()).toBe(
+      "Apply edit"
+    );
+    expect(String(runGit(["status", "--porcelain"]).stdout).trim()).toBe("");
   });
 });

@@ -5,14 +5,49 @@ import type {
   ProjectInfo,
 } from "./types.ts";
 
+export class ApiError extends Error {
+  readonly status: number;
+  readonly statusText: string;
+  readonly serverError: string;
+  readonly bodyText: string;
+
+  constructor(
+    message: string,
+    options: {
+      status: number;
+      statusText: string;
+      serverError?: string;
+      bodyText?: string;
+    }
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = options.status;
+    this.statusText = options.statusText;
+    this.serverError = options.serverError ?? "";
+    this.bodyText = options.bodyText ?? "";
+  }
+}
+
+export function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string") return error;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
+}
+
 /** Response が HTTP エラーなら例外を投げ、成功なら JSON を返す。 */
 async function parseJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let serverError = "";
+    let bodyText = "";
     try {
-      const body = await res.text();
+      bodyText = await res.text();
       try {
-        const j = JSON.parse(body);
+        const j = JSON.parse(bodyText);
         serverError = j && typeof j.error === "string" ? j.error : "";
       } catch {
         // JSON でない、または error フィールドがない場合は status のみを表示する
@@ -20,8 +55,15 @@ async function parseJson<T>(res: Response): Promise<T> {
     } catch {
       // ボディ読み取り失敗は status のみを表示する
     }
-    if (serverError) throw new Error(serverError);
-    throw new Error(`HTTP ${res.status}`);
+    throw new ApiError(
+      serverError || `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`,
+      {
+        status: res.status,
+        statusText: res.statusText,
+        serverError,
+        bodyText,
+      }
+    );
   }
   try {
     return (await res.json()) as T;
@@ -44,6 +86,10 @@ export interface StatusResp {
   hasKey: boolean;
   logs: string[];
   undoDepth?: number;
+}
+
+export interface GitStatusResp {
+  changes: string[];
 }
 
 export const api = {
@@ -93,4 +139,8 @@ export const api = {
       "/api/edit/undo",
       {}
     ),
+  gitStatus: (): Promise<GitStatusResp> =>
+    fetch("/api/git/status").then((r) => parseJson<GitStatusResp>(r)),
+  gitCommit: (message: string) =>
+    post<{ ok: boolean }>("/api/git/commit", { message }),
 };

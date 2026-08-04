@@ -4,7 +4,6 @@
 import { describe, it, expect, vi } from "vitest";
 import http from "node:http";
 import net from "node:net";
-import { EventEmitter } from "node:events";
 import { findFreePort, isListening, sleep } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
 
@@ -320,87 +319,43 @@ describeIfLoopback("ProxyHandle.close", () => {
 describeIfLoopback("proxy upstream response errors", () => {
   it("returns 502 when the upstream response errors before proxy headers are sent", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const upstream = http.createServer((req) => {
+      req.socket.destroy(new Error("synthetic upstream reset"));
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
     let handle: ProxyHandle | null = null;
     try {
-      vi.resetModules();
-      vi.doMock("http-proxy", () => ({
-        default: {
-          createProxyServer: () => {
-            const proxy = Object.assign(new EventEmitter(), {
-              close: vi.fn(),
-              web: (req: http.IncomingMessage, res: http.ServerResponse) => {
-                const proxyRes = Object.assign(new EventEmitter(), {
-                  statusCode: 200,
-                  headers: { "content-type": "text/html; charset=utf-8" },
-                });
-                proxy.emit("proxyRes", proxyRes, req, res);
-                setImmediate(() => {
-                  proxyRes.emit(
-                    "error",
-                    new Error("synthetic upstream reset")
-                  );
-                });
-              },
-              ws: vi.fn(),
-            });
-            return proxy;
-          },
-        },
-      }));
-      const { startProxy: startProxyWithMock } = await import("./proxy.ts");
-      const proxyPort = await findFreePort(50_000);
-      handle = await startProxyWithMock(9, proxyPort);
+      handle = await startProxy(upstreamPort, proxyPort);
 
       const response = await requestViaProxy(proxyPort);
 
       expect(response.statusCode).toBe(502);
       expect(response.body.toString("utf8")).toContain(
-        "synthetic upstream reset"
+        "UImaneger proxy error"
       );
     } finally {
       if (handle) await handle.close().catch(() => {});
-      vi.doUnmock("http-proxy");
-      vi.resetModules();
+      await closeServer(upstream).catch(() => {});
       consoleSpy.mockRestore();
     }
   });
 
   it("destroys the client response when the upstream response errors after proxy headers are sent", async () => {
     const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.flushHeaders();
+      res.write("partial body");
+      setTimeout(() => {
+        res.socket?.destroy(new Error("synthetic upstream reset"));
+      }, 10);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
     let handle: ProxyHandle | null = null;
     try {
-      vi.resetModules();
-      vi.doMock("http-proxy", () => ({
-        default: {
-          createProxyServer: () => {
-            const proxy = Object.assign(new EventEmitter(), {
-              close: vi.fn(),
-              web: (req: http.IncomingMessage, res: http.ServerResponse) => {
-                const proxyRes = Object.assign(new EventEmitter(), {
-                  statusCode: 200,
-                  headers: { "content-type": "text/plain" },
-                  pipe: (dest: http.ServerResponse) => {
-                    dest.write("partial body");
-                    return dest;
-                  },
-                });
-                proxy.emit("proxyRes", proxyRes, req, res);
-                setImmediate(() => {
-                  proxyRes.emit(
-                    "error",
-                    new Error("synthetic upstream reset")
-                  );
-                });
-              },
-              ws: vi.fn(),
-            });
-            return proxy;
-          },
-        },
-      }));
-      const { startProxy: startProxyWithMock } = await import("./proxy.ts");
-      const proxyPort = await findFreePort(50_000);
-      handle = await startProxyWithMock(9, proxyPort);
+      handle = await startProxy(upstreamPort, proxyPort);
 
       const response = await requestViaProxyAllowAbort(proxyPort);
 
@@ -408,8 +363,7 @@ describeIfLoopback("proxy upstream response errors", () => {
       expect(response.aborted).toBe(true);
     } finally {
       if (handle) await handle.close().catch(() => {});
-      vi.doUnmock("http-proxy");
-      vi.resetModules();
+      await closeServer(upstream).catch(() => {});
       consoleSpy.mockRestore();
     }
   });

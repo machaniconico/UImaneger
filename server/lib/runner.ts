@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import net from "node:net";
@@ -10,6 +10,7 @@ export interface RunnerPlan {
   /** ポートをコマンド側で固定できるか (false の場合は stdout から検出) */
   knownPort: boolean;
   env?: Record<string, string>;
+  shell?: boolean;
 }
 
 /**
@@ -283,10 +284,11 @@ export function detectRunner(
   if (override?.command) {
     return {
       framework: override.framework || "custom",
-      command: "sh",
-      args: ["-c", override.command],
-      knownPort: false, // override の場合はポートを stdout から拾う
+      command: override.command,
+      args: [],
+      knownPort: port > 0,
       env: { PORT: String(port) },
+      shell: true,
     };
   }
   return detectRunnerFromFacts(readFacts(root), port);
@@ -310,10 +312,20 @@ function registerChild(proc: ChildProcess): void {
   proc.once("close", unregister);
 }
 
+function taskkill(pid: number, force: boolean): boolean {
+  const args = ["/pid", String(pid), "/t"];
+  if (force) args.push("/f");
+  const result = spawnSync("taskkill", args, { stdio: "ignore" });
+  return result.status === 0;
+}
+
 export function killAllChildrenSync(): void {
   for (const proc of Array.from(liveChildren)) {
     liveChildren.delete(proc);
     if (typeof proc.pid === "number" && proc.pid > 0) {
+      if (process.platform === "win32" && taskkill(proc.pid, true)) {
+        continue;
+      }
       try {
         process.kill(-proc.pid, "SIGKILL");
         continue;
@@ -337,6 +349,9 @@ export function signalGroup(
   signal: NodeJS.Signals = "SIGTERM"
 ): void {
   if (typeof proc.pid === "number" && proc.pid > 0) {
+    if (process.platform === "win32" && taskkill(proc.pid, signal === "SIGKILL")) {
+      return;
+    }
     try {
       process.kill(-proc.pid, signal);
       return;
@@ -473,7 +488,7 @@ export async function startTarget(
   const proc = spawn(plan.command, plan.args, {
     cwd: root,
     env: { ...process.env, ...plan.env, FORCE_COLOR: "0" },
-    shell: false,
+    shell: plan.shell ?? false,
     detached: true,
   });
   registerChild(proc);

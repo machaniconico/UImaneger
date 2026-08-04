@@ -23,6 +23,8 @@ vi.mock("../lib/api", () => ({
     rejectEdit: vi.fn(),
     undoEdit: vi.fn(),
   },
+  getErrorMessage: (error: unknown) =>
+    error instanceof Error && error.message ? error.message : String(error),
 }));
 
 const descriptor: DomDescriptor = {

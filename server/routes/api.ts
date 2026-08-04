@@ -52,6 +52,9 @@ interface UndoEntry {
 const PROPOSAL_TTL_MS = 30 * 60 * 1000;
 const PROPOSAL_MAX = 100;
 const UNDO_MAX = 50;
+export const JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
+const DEFAULT_COMMIT_MESSAGE = "UImaneger edit";
+const COMMIT_MESSAGE_MAX_CHARS = 500;
 
 const proposalStore = new Map<string, ProposalEntry>();
 const undoStack: UndoEntry[] = [];
@@ -86,6 +89,70 @@ function serverError(c: Context, e: unknown, relFile?: string) {
     })
   );
   return c.json({ error: sanitizeForLog((e as Error)?.message ?? e) }, 500);
+}
+
+async function readJsonBody<T extends Record<string, unknown>>(
+  c: Context
+): Promise<T | Response> {
+  const raw = await readJsonText(c);
+  if (raw instanceof Response) return raw;
+  try {
+    const body = JSON.parse(raw) as unknown;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return c.json({ error: "JSON body はオブジェクトである必要があります" }, 400);
+    }
+    return body as T;
+  } catch {
+    return c.json({ error: "JSON body が不正です" }, 400);
+  }
+}
+
+function jsonBodyTooLarge(c: Context): Response {
+  return c.json(
+    { error: `JSON body が大きすぎます (${JSON_BODY_MAX_BYTES} bytes まで)` },
+    413
+  );
+}
+
+async function readJsonText(c: Context): Promise<string | Response> {
+  const contentLength = c.req.header("content-length");
+  if (contentLength !== undefined) {
+    const parsed = Number(contentLength);
+    if (!Number.isSafeInteger(parsed) || parsed < 0) {
+      return c.json({ error: "Content-Length が不正です" }, 400);
+    }
+    if (parsed > JSON_BODY_MAX_BYTES) return jsonBodyTooLarge(c);
+  }
+
+  const stream = c.req.raw.body;
+  if (!stream) return "";
+
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.byteLength;
+      if (received > JSON_BODY_MAX_BYTES) {
+        await reader.cancel().catch(() => {});
+        return jsonBodyTooLarge(c);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 function ensureStoresForCurrentRoot(): void {
@@ -125,6 +192,10 @@ async function withFileLock<T>(
 function isWithinPath(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child));
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function portableRelative(parent: string, child: string): string {
+  return relative(parent, child).replace(/\\/g, "/");
 }
 
 export function isSafeGitRepoUrl(repo: unknown): repo is string {
@@ -168,6 +239,39 @@ export function isTrustedRunCommandHost(
 
 function hasRunCommand(runCommand: unknown): boolean {
   return runCommand !== undefined;
+}
+
+function normalizeCommitMessage(
+  message: unknown
+): { ok: true; message: string } | { ok: false; error: string } {
+  if (message !== undefined && typeof message !== "string") {
+    return { ok: false, error: "commit message は文字列である必要があります" };
+  }
+  const trimmed =
+    typeof message === "string" ? message.trim().replace(/\r\n?/g, "\n") : "";
+  const normalized = trimmed || DEFAULT_COMMIT_MESSAGE;
+  if (normalized.length > COMMIT_MESSAGE_MAX_CHARS) {
+    return {
+      ok: false,
+      error: `commit message は ${COMMIT_MESSAGE_MAX_CHARS} 文字以内にしてください`,
+    };
+  }
+  if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/.test(normalized)) {
+    return { ok: false, error: "commit message に制御文字は使えません" };
+  }
+  return { ok: true, message: normalized };
+}
+
+async function hasStagedGitChanges(root: string): Promise<boolean> {
+  try {
+    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code"], {
+      cwd: root,
+    });
+    return false;
+  } catch (e) {
+    if (Number((e as { code?: unknown }).code) === 1) return true;
+    throw e;
+  }
 }
 
 export async function atomicWrite(
@@ -368,10 +472,12 @@ api.get("/status", (c) => {
 });
 
 api.post("/project/open", async (c) => {
-  const { path, runCommand } = await c.req.json<{
+  const body = await readJsonBody<{
     path: string;
     runCommand?: string;
-  }>();
+  }>(c);
+  if (body instanceof Response) return body;
+  const { path, runCommand } = body;
   if (
     hasRunCommand(runCommand) &&
     !isTrustedRunCommandHost(c.req.header("host"))
@@ -392,10 +498,12 @@ api.post("/project/open", async (c) => {
 });
 
 api.post("/project/clone", async (c) => {
-  const { repo, runCommand } = await c.req.json<{
+  const body = await readJsonBody<{
     repo: string;
     runCommand?: string;
-  }>();
+  }>(c);
+  if (body instanceof Response) return body;
+  const { repo, runCommand } = body;
   if (
     hasRunCommand(runCommand) &&
     !isTrustedRunCommandHost(c.req.header("host"))
@@ -500,7 +608,9 @@ api.get("/files/read", async (c) => {
 
 api.post("/files/write", async (c) => {
   const root = getRoot();
-  const { path, content } = await c.req.json<{ path: string; content: string }>();
+  const body = await readJsonBody<{ path: string; content: string }>(c);
+  if (body instanceof Response) return body;
+  const { path, content } = body;
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   if (typeof path !== "string" || typeof content !== "string")
     return c.json({ error: "path と content は文字列である必要があります。" }, 400);
@@ -523,10 +633,12 @@ api.post("/edit", async (c) => {
       400
     );
 
-  const { descriptor: rawDescriptor, instruction } = await c.req.json<{
+  const body = await readJsonBody<{
     descriptor: DomDescriptor;
     instruction: string;
-  }>();
+  }>(c);
+  if (body instanceof Response) return body;
+  const { descriptor: rawDescriptor, instruction } = body;
   if (!instruction?.trim())
     return c.json({ error: "指示が空です" }, 400);
   const descErr = validateDescriptor(rawDescriptor);
@@ -604,7 +716,7 @@ async function buildProposalForFile(
       error: string;
     }
 > {
-  const relFile = relative(root, file);
+  const relFile = portableRelative(root, file);
   const originalBytes = await readFile(file);
   const decoded = decodeEditableUtf8(originalBytes);
   if (!decoded.ok) {
@@ -686,12 +798,14 @@ api.post("/edit/candidate", async (c) => {
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
 
-  const { file, line, descriptor: rawDescriptor, instruction } = await c.req.json<{
+  const body = await readJsonBody<{
     file: string;
     line?: number;
     descriptor?: DomDescriptor;
     instruction: string;
-  }>();
+  }>(c);
+  if (body instanceof Response) return body;
+  const { file, line, descriptor: rawDescriptor, instruction } = body;
   if (typeof file !== "string" || !file)
     return c.json({ error: "file が必要です" }, 400);
   if (!instruction?.trim())
@@ -737,7 +851,9 @@ api.post("/edit/apply", async (c) => {
   ensureStoresForCurrentRoot();
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
-  const { proposalId } = await c.req.json<{ proposalId: string }>();
+  const body = await readJsonBody<{ proposalId: string }>(c);
+  if (body instanceof Response) return body;
+  const { proposalId } = body;
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
 
@@ -802,7 +918,9 @@ api.post("/edit/apply", async (c) => {
 /** 提案を破棄。 */
 api.post("/edit/reject", async (c) => {
   ensureStoresForCurrentRoot();
-  const { proposalId } = await c.req.json<{ proposalId: string }>();
+  const body = await readJsonBody<{ proposalId: string }>(c);
+  if (body instanceof Response) return body;
+  const { proposalId } = body;
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
   if (inFlight.has(proposalId))
@@ -919,11 +1037,18 @@ api.get("/git/status", async (c) => {
 
 api.post("/git/commit", async (c) => {
   const root = getRoot();
-  const { message } = await c.req.json<{ message: string }>();
+  const body = await readJsonBody<{ message: string }>(c);
+  if (body instanceof Response) return body;
+  const { message } = body;
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+  const commitMessage = normalizeCommitMessage(message);
+  if (!commitMessage.ok) return c.json({ error: commitMessage.error }, 400);
   try {
     await pExecFile("git", ["add", "-A"], { cwd: root });
-    await pExecFile("git", ["commit", "-m", message || "UImaneger edit"], {
+    if (!(await hasStagedGitChanges(root))) {
+      return c.json({ error: "コミットする変更がありません" }, 409);
+    }
+    await pExecFile("git", ["commit", "-m", commitMessage.message], {
       cwd: root,
     });
     return c.json({ ok: true });
