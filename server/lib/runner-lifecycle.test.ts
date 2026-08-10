@@ -11,6 +11,7 @@ import {
   findFreePort,
   startTarget,
   sleep,
+  killGroup,
   killAllChildrenSync,
 } from "./runner.ts";
 
@@ -188,8 +189,11 @@ describe("startTarget", () => {
       );
       process.env.PATH = join(tmp, "missing-bin");
 
+      const port = await findFreePort(30_000);
       const start = Date.now();
-      await expect(startTarget(tmp, 3000)).rejects.toThrow(/起動できません/);
+      await expect(startTarget(tmp, port)).rejects.toThrow(
+        /(起動できません|起動に失敗)/
+      );
       const elapsed = Date.now() - start;
       expect(elapsed).toBeLessThan(10_000);
     } finally {
@@ -202,6 +206,66 @@ describe("startTarget", () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   }, 20_000);
+
+  itIfLoopback("starts an auto-detected Vite target through the platform command shim", async () => {
+    const root = join(process.cwd(), "examples", "sample-app");
+    const port = await findFreePort(30_100);
+    const target = await startTarget(root, port);
+    try {
+      const host = target.host === "::1" ? "[::1]" : target.host ?? "127.0.0.1";
+      const response = await fetch(`http://${host}:${target.port}`);
+      expect(response.status).toBe(200);
+      expect(target.plan.framework).toBe("Vite");
+    } finally {
+      await killGroup(target.proc);
+    }
+  }, 30_000);
+
+  itIfLoopback("accepts a generic server that listens on PORT without logging it", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-silent-"));
+    const port = await findFreePort(30_200);
+    writeFileSync(
+      join(tmp, "package.json"),
+      JSON.stringify({ scripts: { dev: "node silent-server.cjs" } })
+    );
+    writeFileSync(
+      join(tmp, "silent-server.cjs"),
+      [
+        'const http = require("node:http");',
+        "const server = http.createServer((_req, res) => res.end('ok'));",
+        'server.listen(Number(process.env.PORT), "127.0.0.1");',
+      ].join("\n")
+    );
+
+    let target;
+    try {
+      target = await startTarget(tmp, port);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("ok");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  itIfLoopback("serves static projects without downloading an external package", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-static-"));
+    writeFileSync(join(tmp, "index.html"), "<!doctype html><h1>Static preview</h1>");
+    writeFileSync(join(tmp, ".env"), "SECRET=not-for-http");
+    const port = await findFreePort(30_300);
+    const target = await startTarget(tmp, port);
+    try {
+      const host = target.host === "::1" ? "[::1]" : target.host ?? "127.0.0.1";
+      const response = await fetch(`http://${host}:${target.port}/`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("Static preview");
+      expect((await fetch(`http://${host}:${target.port}/.env`)).status).toBe(404);
+      expect(target.plan.command).toBe(process.execPath);
+    } finally {
+      await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   itIfLoopback("killAllChildrenSync kills a live detached target registered by startTarget", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "uim-runner-live-"));

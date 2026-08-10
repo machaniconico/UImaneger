@@ -163,7 +163,11 @@ async function _startProject(): Promise<ProjectInfo> {
 
   // --- プロキシ起動: after ---
   const afterProxyPort = await findFreePort(6100);
-  session.proxyAfter = await startProxy(targetAfter.port, afterProxyPort);
+  session.proxyAfter = await startProxy(
+    targetAfter.port,
+    afterProxyPort,
+    targetAfter.host
+  );
   session.proxy = session.proxyAfter; // legacy alias
 
   // --- プロキシ起動: before ---
@@ -174,7 +178,8 @@ async function _startProject(): Promise<ProjectInfo> {
       const beforeProxyPort = await findFreePort(6110);
       session.proxyBefore = await startProxy(
         session.targetBefore.port,
-        beforeProxyPort
+        beforeProxyPort,
+        session.targetBefore.host
       );
     } catch (e) {
       console.warn("[UImaneger] before proxy 起動失敗:", e);

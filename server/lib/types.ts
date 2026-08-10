@@ -9,6 +9,23 @@ export interface DomDescriptor {
   rect?: { x: number; y: number; width: number; height: number };
   /** 層A: フレームワークが source 位置を出せた場合のみ */
   source?: { fileName: string; lineNumber: number; columnNumber?: number };
+  /** Vue の公開されていない実行時メタデータから得た補助情報。 */
+  vue?: {
+    framework: string;
+    name: string;
+    props?: Record<string, string | number | boolean | null>;
+  };
+  /** Svelte の実行時メタデータから得た補助情報。 */
+  svelte?: {
+    framework: string;
+    source?: {
+      fileName?: string;
+      lineNumber?: number;
+      columnNumber?: number;
+    };
+  };
+  /** data-testid など、ソース検索に使える安定属性。 */
+  hints?: Record<string, string>;
 }
 
 export interface ResolveResult {

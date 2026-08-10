@@ -7,6 +7,20 @@ export interface DomDescriptor {
   domPath: string;
   rect?: { x: number; y: number; width: number; height: number };
   source?: { fileName: string; lineNumber: number; columnNumber?: number };
+  vue?: {
+    framework: string;
+    name: string;
+    props?: Record<string, string | number | boolean | null>;
+  };
+  svelte?: {
+    framework: string;
+    source?: {
+      fileName?: string;
+      lineNumber?: number;
+      columnNumber?: number;
+    };
+  };
+  hints?: Record<string, string>;
 }
 
 export type GitMode = "worktree" | "snapshot" | "none";

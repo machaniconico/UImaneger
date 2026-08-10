@@ -121,7 +121,7 @@ function isPidAlive(pid: number): boolean {
 
 /**
  * 作業ツリー(root/node_modules)を dir/node_modules へ symlink する。
- * すでに存在する場合や symlink 失敗(Windows等)は何もしない。
+ * Windowsでは管理者権限を要求しにくいjunction、それ以外はdirectory symlinkを使う。
  */
 function linkNodeModules(root: string, dir: string): void {
   const rootNm = join(root, "node_modules");
@@ -129,7 +129,7 @@ function linkNodeModules(root: string, dir: string): void {
   const dirNm = join(dir, "node_modules");
   if (existsSync(dirNm)) return;
   try {
-    symlinkSync(rootNm, dirNm, "dir");
+    symlinkSync(rootNm, dirNm, process.platform === "win32" ? "junction" : "dir");
   } catch {
     // symlink 不可環境では静かに無視。before 起動時に install が必要になる可能性がある。
   }

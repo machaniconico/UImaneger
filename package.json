@@ -19,12 +19,13 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/runner-selftest.mjs && node scripts/resolver-selftest.mjs && vitest run",
     "test:ci": "node --throw-deprecation scripts/runner-selftest.mjs && node --throw-deprecation scripts/resolver-selftest.mjs && node --throw-deprecation node_modules/vitest/vitest.mjs run",
+    "sbom": "npm sbom --sbom-format cyclonedx > compliance/sbom.cdx.json",
     "verify": "npm run policy && npm run typecheck && npm run test:ci && npm run build"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.106.0",
-    "@hono/node-server": "2.0.6",
-    "hono": "4.12.27",
+    "@hono/node-server": "2.1.0",
+    "hono": "4.13.1",
     "tsx": "4.22.4"
   },
   "devDependencies": {
@@ -36,7 +37,7 @@
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
     "@vitejs/plugin-react": "6.0.3",
-    "concurrently": "10.0.3",
+    "concurrently": "10.0.4",
     "jsdom": "29.1.1",
     "react": "19.2.7",
     "react-dom": "19.2.7",

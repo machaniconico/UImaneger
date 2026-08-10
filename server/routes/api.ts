@@ -2,10 +2,11 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { env } from "../lib/env.ts";
 import { hasKey, complete, stripCodeFence, TruncatedError } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
@@ -20,6 +21,12 @@ import {
   stopProject,
 } from "../lib/state.ts";
 import type { DomDescriptor } from "../lib/types.ts";
+import {
+  detectPackageManager,
+  hasInstalledDependencies,
+  packageInstallPlan,
+  prepareCommandInvocation,
+} from "../lib/package-manager.ts";
 
 const pExecFile = promisify(execFile);
 export const api = new Hono();
@@ -55,6 +62,11 @@ const UNDO_MAX = 50;
 export const JSON_BODY_MAX_BYTES = 2 * 1024 * 1024;
 const DEFAULT_COMMIT_MESSAGE = "UImaneger edit";
 const COMMIT_MESSAGE_MAX_CHARS = 500;
+const RUN_COMMAND_MAX_CHARS = 2_000;
+const INSTRUCTION_MAX_CHARS = 20_000;
+const GIT_CLONE_TIMEOUT_MS = 120_000;
+const GIT_OPERATION_TIMEOUT_MS = 30_000;
+const PACKAGE_INSTALL_TIMEOUT_MS = 300_000;
 
 const proposalStore = new Map<string, ProposalEntry>();
 const undoStack: UndoEntry[] = [];
@@ -215,9 +227,7 @@ export function isSafeGitRepoUrl(repo: unknown): repo is string {
     return (
       Boolean(url.hostname) &&
       !url.hostname.startsWith("-") &&
-      (url.protocol === "https:" ||
-        url.protocol === "git:" ||
-        url.protocol === "ssh:")
+      (url.protocol === "https:" || url.protocol === "ssh:")
     );
   } catch {
     return false;
@@ -229,16 +239,94 @@ export function isTrustedRunCommandHost(
 ): boolean {
   const raw = host?.trim().toLowerCase();
   if (!raw || raw.includes("/") || raw.includes("@")) return false;
-  const hostname = raw.split(":")[0];
+  let hostname: string;
+  try {
+    const parsed = new URL(`http://${raw}`);
+    if (parsed.username || parsed.password || parsed.pathname !== "/") return false;
+    hostname = parsed.hostname.replace(/^\[|\]$/g, "");
+  } catch {
+    return false;
+  }
   return (
     hostname === "localhost" ||
     hostname === "127.0.0.1" ||
+    hostname === "::1" ||
     hostname.endsWith(".localhost")
   );
 }
 
-function hasRunCommand(runCommand: unknown): boolean {
-  return runCommand !== undefined;
+export function isLoopbackBindHost(
+  rawHost: string | undefined = process.env.UIM_HOST
+): boolean {
+  const host = rawHost?.trim().toLowerCase() || "127.0.0.1";
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+function normalizeRunCommand(
+  value: unknown
+):
+  | { ok: true; command: string | undefined }
+  | { ok: false; error: string } {
+  if (value === undefined) return { ok: true, command: undefined };
+  if (typeof value !== "string") {
+    return { ok: false, error: "runCommand は文字列である必要があります" };
+  }
+  const command = value.trim();
+  if (!command) return { ok: false, error: "runCommand が空です" };
+  if (command.length > RUN_COMMAND_MAX_CHARS) {
+    return {
+      ok: false,
+      error: `runCommand は ${RUN_COMMAND_MAX_CHARS} 文字以内にしてください`,
+    };
+  }
+  if (/[\u0000-\u001F\u007F]/.test(command)) {
+    return { ok: false, error: "runCommand に制御文字は使えません" };
+  }
+  return { ok: true, command };
+}
+
+function normalizeInstruction(
+  value: unknown
+): { ok: true; instruction: string } | { ok: false; error: string } {
+  if (typeof value !== "string") {
+    return { ok: false, error: "指示は文字列である必要があります" };
+  }
+  const instruction = value.trim();
+  if (!instruction) return { ok: false, error: "指示が空です" };
+  if (instruction.length > INSTRUCTION_MAX_CHARS) {
+    return {
+      ok: false,
+      error: `指示は ${INSTRUCTION_MAX_CHARS} 文字以内にしてください`,
+    };
+  }
+  if (instruction.includes("\0")) {
+    return { ok: false, error: "指示にNUL文字は使えません" };
+  }
+  return { ok: true, instruction };
+}
+
+function runCommandAccessAllowed(host: string | undefined): boolean {
+  return isLoopbackBindHost() && isTrustedRunCommandHost(host);
+}
+
+function cloneDirectoryName(repo: string): string {
+  let pathname = repo;
+  const scpLike = repo.match(/^git@[^:]+:(.+)$/);
+  if (scpLike) pathname = scpLike[1];
+  else {
+    try {
+      pathname = new URL(repo).pathname;
+    } catch {
+      // isSafeGitRepoUrl 済みのため通常は到達しない。
+    }
+  }
+  const slug = basename(pathname)
+    .replace(/\.git$/i, "")
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "repo";
+  const fingerprint = createHash("sha256").update(repo).digest("hex").slice(0, 10);
+  return `${slug}-${fingerprint}`;
 }
 
 function normalizeCommitMessage(
@@ -266,6 +354,9 @@ async function hasStagedGitChanges(root: string): Promise<boolean> {
   try {
     await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code"], {
       cwd: root,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: GIT_OPERATION_TIMEOUT_MS,
+      windowsHide: true,
     });
     return false;
   } catch (e) {
@@ -291,13 +382,22 @@ export async function atomicWrite(
 function remapBeforeSource(root: string, d: DomDescriptor): DomDescriptor {
   const source = d.source;
   const fileName = source?.fileName;
-  if (!fileName || !isAbsolute(fileName)) return d;
+  if (!fileName) return d;
+  let localFile = fileName;
+  if (fileName.startsWith("file:")) {
+    try {
+      localFile = fileURLToPath(fileName);
+    } catch {
+      return d;
+    }
+  }
+  if (!isAbsolute(localFile)) return d;
   const before = getBefore();
-  if (!before?.dir || !isWithinPath(before.dir, fileName)) return d;
+  if (!before?.dir || !isWithinPath(before.dir, localFile)) return d;
   return {
     ...d,
     source: {
-      fileName: join(root, relative(resolve(before.dir), resolve(fileName))),
+      fileName: join(root, relative(resolve(before.dir), resolve(localFile))),
       lineNumber: source.lineNumber,
       columnNumber: source.columnNumber,
     },
@@ -425,6 +525,13 @@ function validateDescriptor(d: unknown): string | null {
     (typeof o.attrs !== "object" || o.attrs === null || Array.isArray(o.attrs))
   )
     return "descriptor.attrs はオブジェクトである必要があります。";
+  if (
+    o.attrs &&
+    !Object.values(o.attrs as Record<string, unknown>).every(
+      (value) => typeof value === "string"
+    )
+  )
+    return "descriptor.attrs の値は文字列である必要があります。";
   if (o.textSnippet !== undefined && typeof o.textSnippet !== "string")
     return "descriptor.textSnippet は文字列である必要があります。";
   if (o.domPath !== undefined && typeof o.domPath !== "string")
@@ -477,20 +584,32 @@ api.post("/project/open", async (c) => {
     runCommand?: string;
   }>(c);
   if (body instanceof Response) return body;
-  const { path, runCommand } = body;
-  if (
-    hasRunCommand(runCommand) &&
-    !isTrustedRunCommandHost(c.req.header("host"))
-  ) {
+  const { path } = body;
+  const normalizedCommand = normalizeRunCommand(body.runCommand);
+  if (!normalizedCommand.ok) {
+    return c.json({ error: normalizedCommand.error }, 400);
+  }
+  const runCommand = normalizedCommand.command;
+  if (runCommand && !runCommandAccessAllowed(c.req.header("host"))) {
     return c.json(
       { error: "runCommand の実行にはローカルからのアクセスが必要です" },
       403
     );
   }
-  if (!path || !existsSync(path))
-    return c.json({ error: `パスが存在しません: ${path}` }, 400);
+  if (typeof path !== "string" || !path.trim()) {
+    return c.json({ error: "path は空でない文字列である必要があります" }, 400);
+  }
+  let projectPath: string;
   try {
-    const info = await openAndStart(resolve(path), { command: runCommand });
+    projectPath = resolve(path);
+    if (!statSync(projectPath).isDirectory()) {
+      return c.json({ error: `ディレクトリではありません: ${path}` }, 400);
+    }
+  } catch {
+    return c.json({ error: `パスが存在しません: ${path}` }, 400);
+  }
+  try {
+    const info = await openAndStart(projectPath, { command: runCommand });
     return c.json({ info });
   } catch (e) {
     return serverError(c, e);
@@ -503,11 +622,13 @@ api.post("/project/clone", async (c) => {
     runCommand?: string;
   }>(c);
   if (body instanceof Response) return body;
-  const { repo, runCommand } = body;
-  if (
-    hasRunCommand(runCommand) &&
-    !isTrustedRunCommandHost(c.req.header("host"))
-  ) {
+  const { repo } = body;
+  const normalizedCommand = normalizeRunCommand(body.runCommand);
+  if (!normalizedCommand.ok) {
+    return c.json({ error: normalizedCommand.error }, 400);
+  }
+  const runCommand = normalizedCommand.command;
+  if (runCommand && !runCommandAccessAllowed(c.req.header("host"))) {
     return c.json(
       { error: "runCommand の実行にはローカルからのアクセスが必要です" },
       403
@@ -520,8 +641,7 @@ api.post("/project/clone", async (c) => {
   try {
     const wsDir = resolve(env.workspacesDir);
     await mkdir(wsDir, { recursive: true });
-    const name = basename(repo).replace(/\.git$/, "") || "repo";
-    const dest = join(wsDir, name);
+    const dest = join(wsDir, cloneDirectoryName(repo));
     if (!existsSync(dest)) {
       await pExecFile(
         "git",
@@ -536,25 +656,64 @@ api.post("/project/clone", async (c) => {
           dest,
         ],
         {
-          env: { ...process.env, GIT_ALLOW_PROTOCOL: "https:git:ssh:http" },
+          cwd: wsDir,
+          env: {
+            ...process.env,
+            GIT_ALLOW_PROTOCOL: "https:ssh",
+            GIT_TERMINAL_PROMPT: "0",
+          },
           maxBuffer: 8 * 1024 * 1024,
+          timeout: GIT_CLONE_TIMEOUT_MS,
+          windowsHide: true,
         }
       );
+    } else {
+      if (!existsSync(join(dest, ".git"))) {
+        throw new Error(`Clone先が既に存在しますがGitリポジトリではありません: ${dest}`);
+      }
+      const { stdout } = await pExecFile(
+        "git",
+        ["remote", "get-url", "origin"],
+        {
+          cwd: dest,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          timeout: 15_000,
+          windowsHide: true,
+        }
+      );
+      if (stdout.trim() !== repo) {
+        throw new Error(`Clone先のoriginが要求URLと一致しません: ${dest}`);
+      }
     }
-    // 依存があれば install (node プロジェクト)
-    if (
-      existsSync(join(dest, "package.json")) &&
-      !existsSync(join(dest, "node_modules"))
-    ) {
-      await pExecFile("npm", ["install", "--ignore-scripts"], {
-        cwd: dest,
-        maxBuffer: 32 * 1024 * 1024,
-      }).catch((e: any) => {
-        installError = String(e?.stderr || e?.message || e)
-          .split("\n")
-          .slice(-8)
-          .join("\n");
-      });
+    // packageManager/lockfileを尊重し、cloneしたコードのlifecycle scriptは実行しない。
+    if (existsSync(join(dest, "package.json"))) {
+      const packageManager = detectPackageManager(dest);
+      const installPlan = packageInstallPlan(packageManager);
+      const installInvocation = prepareCommandInvocation(
+        installPlan.command,
+        installPlan.args
+      );
+      if (!hasInstalledDependencies(dest, packageManager.name)) {
+        await pExecFile(installInvocation.command, installInvocation.args, {
+          cwd: dest,
+          shell: installInvocation.shell,
+          env: {
+            ...process.env,
+            CI: "1",
+            YARN_ENABLE_SCRIPTS: "false",
+          },
+          maxBuffer: 32 * 1024 * 1024,
+          timeout: PACKAGE_INSTALL_TIMEOUT_MS,
+          windowsHide: true,
+        }).catch((e: any) => {
+          installError = `${packageManager.name}: ${String(
+            e?.stderr || e?.message || e
+          )}`
+            .split("\n")
+            .slice(-8)
+            .join("\n");
+        });
+      }
     }
     const info = await openAndStart(dest, { command: runCommand });
     return c.json(
@@ -638,9 +797,11 @@ api.post("/edit", async (c) => {
     instruction: string;
   }>(c);
   if (body instanceof Response) return body;
-  const { descriptor: rawDescriptor, instruction } = body;
-  if (!instruction?.trim())
-    return c.json({ error: "指示が空です" }, 400);
+  const { descriptor: rawDescriptor } = body;
+  const normalizedInstruction = normalizeInstruction(body.instruction);
+  if (!normalizedInstruction.ok)
+    return c.json({ error: normalizedInstruction.error }, 400);
+  const instruction = normalizedInstruction.instruction;
   const descErr = validateDescriptor(rawDescriptor);
   if (descErr) return c.json({ error: descErr }, 400);
   const descriptor = remapBeforeSource(root, normalizeDescriptor(rawDescriptor));
@@ -660,6 +821,15 @@ api.post("/edit", async (c) => {
     if (!inRoot(root, resolved.file))
       return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
 
+    if (resolved.confidence === "low") {
+      return c.json({
+        ok: false,
+        error: "対象箇所を一意に特定できませんでした。候補を確認して選択してください。",
+        confidence: "low",
+        candidates: resolved.candidates,
+      });
+    }
+
     // 2. 提案生成 (ファイルはまだ書かない)
     const result = await buildProposalForFile(
       root,
@@ -670,10 +840,9 @@ api.post("/edit", async (c) => {
       resolved.confidence
     );
 
-    // 3. 低確度/複数候補時は candidates を同梱
+    // 3. 複数候補時は candidates を同梱 (low は上で選択必須として返却済み)
     const includeCandidates =
-      resolved.confidence === "low" ||
-      (Array.isArray(resolved.candidates) && resolved.candidates.length > 1);
+      Array.isArray(resolved.candidates) && resolved.candidates.length > 1;
     return c.json(
       includeCandidates
         ? { ...result, candidates: resolved.candidates }
@@ -805,11 +974,16 @@ api.post("/edit/candidate", async (c) => {
     instruction: string;
   }>(c);
   if (body instanceof Response) return body;
-  const { file, line, descriptor: rawDescriptor, instruction } = body;
+  const { file, line, descriptor: rawDescriptor } = body;
   if (typeof file !== "string" || !file)
     return c.json({ error: "file が必要です" }, 400);
-  if (!instruction?.trim())
-    return c.json({ error: "指示が空です" }, 400);
+  const normalizedInstruction = normalizeInstruction(body.instruction);
+  if (!normalizedInstruction.ok)
+    return c.json({ error: normalizedInstruction.error }, 400);
+  const instruction = normalizedInstruction.instruction;
+  if (line !== undefined && (!Number.isInteger(line) || line < 1)) {
+    return c.json({ error: "line は1以上の整数である必要があります" }, 400);
+  }
   if (rawDescriptor !== undefined) {
     const descErr = validateDescriptor(rawDescriptor);
     if (descErr) return c.json({ error: descErr }, 400);
@@ -1028,6 +1202,9 @@ api.get("/git/status", async (c) => {
   try {
     const { stdout } = await pExecFile("git", ["status", "--porcelain"], {
       cwd: root,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: GIT_OPERATION_TIMEOUT_MS,
+      windowsHide: true,
     });
     return c.json({ changes: stdout.split("\n").filter(Boolean) });
   } catch (e) {
@@ -1044,13 +1221,25 @@ api.post("/git/commit", async (c) => {
   const commitMessage = normalizeCommitMessage(message);
   if (!commitMessage.ok) return c.json({ error: commitMessage.error }, 400);
   try {
-    await pExecFile("git", ["add", "-A"], { cwd: root });
+    await pExecFile("git", ["add", "-A"], {
+      cwd: root,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: GIT_OPERATION_TIMEOUT_MS,
+      windowsHide: true,
+    });
     if (!(await hasStagedGitChanges(root))) {
       return c.json({ error: "コミットする変更がありません" }, 409);
     }
-    await pExecFile("git", ["commit", "-m", commitMessage.message], {
-      cwd: root,
-    });
+    await pExecFile(
+      "git",
+      ["commit", "--no-gpg-sign", "-m", commitMessage.message],
+      {
+        cwd: root,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        timeout: GIT_OPERATION_TIMEOUT_MS,
+        windowsHide: true,
+      }
+    );
     return c.json({ ok: true });
   } catch (e) {
     return serverError(c, e);

@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { resolve, relative, isAbsolute, join } from "node:path";
 import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import type { DomDescriptor, ResolveResult } from "./types.ts";
 import { complete, hasKey, stripCodeFence } from "./claude.ts";
 
@@ -63,8 +64,9 @@ const IGNORE_DIRS = new Set([
 ]);
 // テキストとして検索する拡張子 (バイナリ回避)
 const TEXT_EXT =
-  /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|html?|css|scss|sass|less|md|mdx|json|ya?ml|php|rb|erb|py|go|java|kt|rs|c|h|cpp|cs|swift|ex|exs|txt|hbs|ejs|pug|twig|blade\.php)$/i;
-const AUTHORING_EXT = /\.(tsx?|jsx?|vue|svelte|astro|html?)$/i;
+  /\.(tsx?|jsx?|mjs|cjs|vue|svelte|astro|html?|css|scss|sass|less|md|mdx|json|ya?ml|php|rb|erb|py|go|java|kt|rs|c|h|cpp|cs|swift|ex|exs|txt|hbs|ejs|pug|twig|cshtml|vbhtml|razor|jsp|jspx|tag|ftl|mustache|liquid|njk|nunjucks|heex|leex|haml|slim|jinja2?|tmpl|templ)$/i;
+const AUTHORING_EXT =
+  /\.(tsx?|jsx?|vue|svelte|astro|html?|mdx|php|erb|hbs|ejs|pug|twig|cshtml|vbhtml|razor|jsp|jspx|tag|ftl|mustache|liquid|njk|nunjucks|heex|leex|haml|slim|jinja2?|tmpl|templ)$/i;
 const NODE_GREP_FILE_CAP = 6000; // 暴走防止
 const NODE_GREP_MAX_FILE_SIZE = 1.5 * 1024 * 1024;
 const NODE_GREP_TOTAL_BYTES_CAP = 200 * 1024 * 1024;
@@ -382,6 +384,8 @@ export type TermKind =
   | "textFull"
   | "textPartial"
   | "id"
+  | "attribute"
+  | "component"
   | "classSpecific"
   | "classGeneric";
 
@@ -417,18 +421,37 @@ export function splitWords(text: string): string[] {
 /** descriptor → kind 付き term 一覧 (検索順序を保つ) */
 export function buildTerms(d: DomDescriptor): { term: string; kind: TermKind }[] {
   const out: { term: string; kind: TermKind }[] = [];
-  if (d.textSnippet && d.textSnippet.trim().length >= 4) {
-    out.push({ term: d.textSnippet.trim(), kind: "textFull" });
+  const seen = new Set<string>();
+  const add = (value: unknown, kind: TermKind) => {
+    if (typeof value !== "string") return;
+    const term = value.trim();
+    if (!isSearchableTerm(term) || term.length > 200 || seen.has(term)) return;
+    seen.add(term);
+    out.push({ term, kind });
+  };
+
+  const text = d.textSnippet?.trim() ?? "";
+  if (text.length >= 4 || hasCJK(text)) add(text, "textFull");
+  add(d.id, "id");
+
+  const stableAttributes = new Set([
+    "data-testid",
+    "data-test",
+    "data-cy",
+    "data-component",
+    "data-source",
+    "aria-label",
+    "name",
+    "title",
+  ]);
+  for (const [name, value] of Object.entries(d.attrs ?? {})) {
+    if (stableAttributes.has(name.toLowerCase())) add(value, "attribute");
   }
-  if (d.id && d.id.length >= 3) {
-    out.push({ term: d.id, kind: "id" });
-  }
+  for (const value of Object.values(d.hints ?? {})) add(value, "attribute");
+  add(d.vue?.name, "component");
+
   for (const c of d.classes) {
-    if (!c || c.length < 3) continue;
-    out.push({
-      term: c,
-      kind: isGenericClass(c) ? "classGeneric" : "classSpecific",
-    });
+    add(c, isGenericClass(c) ? "classGeneric" : "classSpecific");
   }
   return out;
 }
@@ -436,6 +459,8 @@ export function buildTerms(d: DomDescriptor): { term: string; kind: TermKind }[]
 const KIND_WEIGHT: Record<TermKind, number> = {
   textFull: 100,
   id: 80,
+  attribute: 70,
+  component: 65,
   textPartial: 40,
   classSpecific: 30,
   classGeneric: 2,
@@ -474,7 +499,11 @@ export function scoreCandidate(
 export function hasRareTerm(matched: ScoredTerm[]): boolean {
   return matched.some(
     (m) =>
-      (m.kind === "textFull" || m.kind === "id" || m.kind === "textPartial") &&
+      (m.kind === "textFull" ||
+        m.kind === "id" ||
+        m.kind === "attribute" ||
+        m.kind === "component" ||
+        m.kind === "textPartial") &&
       m.hits <= 10
   );
 }
@@ -523,6 +552,18 @@ async function rgSearch(
         "!**/.git/**",
         "-g",
         "!**/build/**",
+        "-g",
+        "!**/.next/**",
+        "-g",
+        "!**/.svelte-kit/**",
+        "-g",
+        "!**/.nuxt/**",
+        "-g",
+        "!**/vendor/**",
+        "-g",
+        "!**/coverage/**",
+        "-g",
+        "!**/.cache/**",
         "--",
         term,
         root,
@@ -571,6 +612,18 @@ async function rgCount(root: string, term: string): Promise<number> {
         "!**/.git/**",
         "-g",
         "!**/build/**",
+        "-g",
+        "!**/.next/**",
+        "-g",
+        "!**/.svelte-kit/**",
+        "-g",
+        "!**/.nuxt/**",
+        "-g",
+        "!**/vendor/**",
+        "-g",
+        "!**/coverage/**",
+        "-g",
+        "!**/.cache/**",
         "--",
         term,
         root,
@@ -626,6 +679,48 @@ function topScoreTiedAcrossFiles(candidates: CandidateAgg[]): boolean {
 
 function countFileLines(content: string): number {
   return content.length === 0 ? 0 : content.split(/\r\n|\r|\n/).length;
+}
+
+function sourceFileCandidates(root: string, fileName: string): string[] {
+  const raw = fileName.trim();
+  if (!raw) return [];
+  const candidates: string[] = [];
+  const add = (value: string) => {
+    const absolute = resolve(value);
+    if (!candidates.includes(absolute)) candidates.push(absolute);
+  };
+
+  let pathValue = raw;
+  try {
+    const url = new URL(raw);
+    if (url.protocol === "file:") {
+      add(fileURLToPath(url));
+    } else if (url.protocol === "http:" || url.protocol === "https:") {
+      pathValue = decodeURIComponent(url.pathname);
+    } else if (
+      url.protocol === "webpack:" ||
+      url.protocol === "webpack-internal:"
+    ) {
+      pathValue = decodeURIComponent(url.pathname);
+    }
+  } catch {
+    pathValue = raw;
+  }
+
+  pathValue = pathValue.replace(/^\/@fs\//, "").replace(/[?#].*$/, "");
+  if (isAbsolute(pathValue)) add(pathValue);
+  const relativePath = pathValue
+    .replace(/^[/\\]+/, "")
+    .replace(/^\.\//, "");
+  if (relativePath) add(join(root, relativePath));
+  return candidates;
+}
+
+function findSourceFile(root: string, fileName: string): string | null {
+  for (const candidate of sourceFileCandidates(root, fileName)) {
+    if (existsSync(candidate) && withinRoot(root, candidate)) return candidate;
+  }
+  return null;
 }
 
 function clampLine(line: number, totalLines: number): number {
@@ -841,8 +936,8 @@ export async function resolveSource(
     typeof sourceLine === "number" &&
     Number.isFinite(sourceLine)
   ) {
-    const f = resolve(d.source.fileName);
-    if (existsSync(f) && withinRoot(root, f)) {
+    const f = findSourceFile(root, d.source.fileName);
+    if (f) {
       try {
         const content = await readFile(f, "utf8");
         const totalLines = countFileLines(content);
@@ -914,9 +1009,10 @@ export async function resolveSource(
   let confidence: ResolveResult["confidence"];
   if (ambiguousTopTie) confidence = "low";
   else if (single && bestRare && isAuthoringFile(best.file)) confidence = "high";
-  else if (single) confidence = "medium";
+  else if (single && isAuthoringFile(best.file)) confidence = "medium";
   else if (bestRare && best.score > 0) confidence = "medium";
   else confidence = "low";
+  if (!isAuthoringFile(best.file)) confidence = "low";
   if (downgradedSource && confidence === "high") confidence = "medium";
 
   // 候補のプレビュー配列 (上位10件)
@@ -1001,7 +1097,7 @@ ${list}
       return {
         file: c.file,
         line: c.line,
-        confidence: "medium",
+        confidence: isAuthoringFile(c.file) ? "medium" : "low",
         candidates: previewList,
       };
     }

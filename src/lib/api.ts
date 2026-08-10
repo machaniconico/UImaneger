@@ -101,7 +101,7 @@ export const api = {
       runCommand,
     }),
   clone: (repo: string, runCommand?: string) =>
-    post<{ info?: ProjectInfo; error?: string }>("/api/project/clone", {
+    post<{ info?: ProjectInfo; error?: string; warning?: string }>("/api/project/clone", {
       repo,
       runCommand,
     }),

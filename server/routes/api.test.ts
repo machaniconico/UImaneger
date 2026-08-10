@@ -12,11 +12,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   api,
   __stores,
   isSafeGitRepoUrl,
   isTrustedRunCommandHost,
+  isLoopbackBindHost,
   JSON_BODY_MAX_BYTES,
 } from "./api.ts";
 import * as state from "../lib/state.ts";
@@ -309,7 +311,7 @@ describe("project security helpers", () => {
   it("accepts only safe git clone URL formats", () => {
     expect(isSafeGitRepoUrl("https://github.com/example/repo.git")).toBe(true);
     expect(isSafeGitRepoUrl("ssh://git@github.com/example/repo.git")).toBe(true);
-    expect(isSafeGitRepoUrl("git://github.com/example/repo.git")).toBe(true);
+    expect(isSafeGitRepoUrl("git://github.com/example/repo.git")).toBe(false);
     expect(isSafeGitRepoUrl("git@github.com:example/repo.git")).toBe(true);
 
     expect(isSafeGitRepoUrl("ext::sh -c id")).toBe(false);
@@ -323,12 +325,70 @@ describe("project security helpers", () => {
     expect(isTrustedRunCommandHost("localhost")).toBe(true);
     expect(isTrustedRunCommandHost("localhost:5173")).toBe(true);
     expect(isTrustedRunCommandHost("127.0.0.1:8787")).toBe(true);
+    expect(isTrustedRunCommandHost("[::1]:8787")).toBe(true);
     expect(isTrustedRunCommandHost("app.localhost:8787")).toBe(true);
 
     expect(isTrustedRunCommandHost(undefined)).toBe(false);
     expect(isTrustedRunCommandHost("")).toBe(false);
     expect(isTrustedRunCommandHost("example.com")).toBe(false);
     expect(isTrustedRunCommandHost("localhost.example.com")).toBe(false);
+    expect(isTrustedRunCommandHost("[::1].example.com:8787")).toBe(false);
+  });
+
+  it("allows custom commands only when the server itself is loopback-bound", () => {
+    expect(isLoopbackBindHost(undefined)).toBe(true);
+    expect(isLoopbackBindHost("127.0.0.1")).toBe(true);
+    expect(isLoopbackBindHost("::1")).toBe(true);
+    expect(isLoopbackBindHost("0.0.0.0")).toBe(false);
+    expect(isLoopbackBindHost("192.168.1.10")).toBe(false);
+  });
+
+  it("rejects a custom command on a non-loopback bind even with a local Host header", async () => {
+    const previous = process.env.UIM_HOST;
+    process.env.UIM_HOST = "0.0.0.0";
+    try {
+      const result = await postJson<{ error: string }>(
+        "/api/project/open",
+        { path: root, runCommand: "npm run dev" },
+        { host: "localhost:5174" }
+      );
+      expect(result.res.status).toBe(403);
+      expect(result.body.error).toContain("ローカル");
+    } finally {
+      if (previous === undefined) delete process.env.UIM_HOST;
+      else process.env.UIM_HOST = previous;
+    }
+  });
+
+  it.each([
+    ["number", 42],
+    ["object", { command: "npm run dev" }],
+    ["empty", "   "],
+    ["multiline", "npm run dev\necho unsafe"],
+    ["oversized", "x".repeat(2_001)],
+  ])("rejects an invalid %s runCommand", async (_label, runCommand) => {
+    const result = await postJson<{ error: string }>("/api/project/open", {
+      path: root,
+      runCommand,
+    });
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toContain("runCommand");
+  });
+
+  it("rejects non-string and non-directory project paths", async () => {
+    const invalidType = await postJson<{ error: string }>("/api/project/open", {
+      path: 42,
+    });
+    expect(invalidType.res.status).toBe(400);
+    expect(invalidType.body.error).toContain("path");
+
+    const fileInsteadOfDirectory = await postJson<{ error: string }>(
+      "/api/project/open",
+      { path: filePath }
+    );
+    expect(fileInsteadOfDirectory.res.status).toBe(400);
+    expect(fileInsteadOfDirectory.body.error).toContain("ディレクトリ");
   });
 
   it("rejects unsafe clone URLs before invoking git", async () => {
@@ -404,6 +464,54 @@ describe("project security helpers", () => {
 });
 
 describe("edit proposal API", () => {
+  it("rejects non-string edit instructions", async () => {
+    const result = await postJson<{ error: string }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: { text: "change it" },
+    });
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toContain("文字列");
+    expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid candidate line numbers", async () => {
+    const result = await postJson<{ error: string }>("/api/edit/candidate", {
+      file: filePath,
+      line: 0,
+      descriptor: descriptorFor(filePath),
+      instruction: "Change it",
+    });
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toContain("line");
+    expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit candidate selection for a non-authoring text hit", async () => {
+    const messagesFile = join(root, "src", "messages.json");
+    writeFileSync(messagesFile, '{ "cta": "LocaleOnlyCheckoutLabel" }', "utf8");
+
+    const { res, body } = await postJson<{
+      ok: false;
+      confidence: string;
+      candidates: { file: string }[];
+    }>("/api/edit", {
+      descriptor: {
+        tag: "button",
+        classes: [],
+        attrs: {},
+        textSnippet: "LocaleOnlyCheckoutLabel",
+        domPath: "button",
+      },
+      instruction: "Make it red.",
+    });
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(false);
+    expect(body.confidence).toBe("low");
+    expect(body.candidates[0]?.file).toBe(messagesFile);
+    expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
   it("creates a proposal with a unified diff without changing the file", async () => {
     const proposal = await requestProposal();
 
@@ -553,6 +661,33 @@ describe("edit proposal API", () => {
       claudeMock.complete.mockResolvedValueOnce(editedContent);
       const { res, body } = await postJson<ProposalBody>("/api/edit", {
         descriptor: descriptorFor(beforeFile),
+        instruction: "Change the button label.",
+      });
+
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.file).toBe(filePath);
+      expect(body.relFile).toBe("src/App.tsx");
+    } finally {
+      getBeforeSpy.mockRestore();
+      rmSync(beforeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("remaps before-preview file URLs back to the real project root", async () => {
+    const beforeDir = mkdtempSync(join(tmpdir(), "uim-before-url-route-"));
+    const beforeFile = join(beforeDir, relative(root, filePath));
+    mkdirSync(dirname(beforeFile), { recursive: true });
+    writeFileSync(beforeFile, originalContent, "utf8");
+    const getBeforeSpy = vi.spyOn(state, "getBefore").mockReturnValue({
+      dir: beforeDir,
+      root,
+      mode: "snapshot",
+    });
+    try {
+      claudeMock.complete.mockResolvedValueOnce(editedContent);
+      const { res, body } = await postJson<ProposalBody>("/api/edit", {
+        descriptor: descriptorFor(pathToFileURL(beforeFile).href),
         instruction: "Change the button label.",
       });
 
@@ -1162,7 +1297,7 @@ describe("git API", () => {
 
     expect(result.res.status).toBe(409);
     expect(result.body.error).toBe("コミットする変更がありません");
-  });
+  }, 15_000);
 
   it("commits working-tree changes after staging them", async (ctx) => {
     if (!gitAvailable() || !initGitRepo(root)) {
@@ -1181,5 +1316,5 @@ describe("git API", () => {
       "Apply edit"
     );
     expect(String(runGit(["status", "--porcelain"]).stdout).trim()).toBe("");
-  });
+  }, 15_000);
 });

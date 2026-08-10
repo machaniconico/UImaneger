@@ -4,6 +4,7 @@
 import { describe, it, expect, vi } from "vitest";
 import http from "node:http";
 import net from "node:net";
+import { gzipSync } from "node:zlib";
 import { findFreePort, isListening, sleep } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
 
@@ -121,6 +122,7 @@ function upgradeViaProxy(proxyPort: number): Promise<net.Socket> {
 type ProxyTestResponse = {
   statusCode: number;
   headers: http.IncomingHttpHeaders;
+  rawHeaders: string[];
   body: Buffer;
 };
 
@@ -142,6 +144,7 @@ function requestViaProxy(
           resolve({
             statusCode: res.statusCode || 0,
             headers: res.headers,
+            rawHeaders: res.rawHeaders,
             body: Buffer.concat(chunks),
           });
         });
@@ -377,7 +380,8 @@ describeIfLoopback("proxy transport fidelity", () => {
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "x-frame-options": "DENY",
-        "content-security-policy": "frame-ancestors https://evil.com",
+        "content-security-policy":
+          "default-src 'self'; img-src data:; frame-ancestors https://evil.com",
       });
       res.end("<html><body>framed</body></html>");
     });
@@ -390,10 +394,53 @@ describeIfLoopback("proxy transport fidelity", () => {
       const response = await requestViaProxy(proxyPort);
 
       expect(response.headers["x-frame-options"]).toBeUndefined();
-      expect(response.headers["content-security-policy"]).toBe(expectedCsp);
+      expect(response.headers["content-security-policy"]).toContain(expectedCsp);
+      expect(response.headers["content-security-policy"]).toContain(
+        "default-src 'self'"
+      );
+      expect(response.headers["content-security-policy"]).toContain("img-src data:");
+      expect(response.headers["content-security-policy"]).toContain(
+        "script-src 'self'"
+      );
       expect(response.headers["content-security-policy"]).not.toContain(
         "evil.com"
       );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("preserves multiple CSP policies as separate response headers", async () => {
+    const upstream = http.createServer((_req, res) => {
+      res.setHeader("content-type", "text/html; charset=utf-8");
+      res.setHeader("content-security-policy", [
+        "default-src 'self'",
+        "img-src 'self'",
+      ]);
+      res.end("<html><body>policies</body></html>");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      const policies: string[] = [];
+      for (let i = 0; i < response.rawHeaders.length; i += 2) {
+        if (response.rawHeaders[i]?.toLowerCase() === "content-security-policy") {
+          policies.push(response.rawHeaders[i + 1] ?? "");
+        }
+      }
+
+      expect(policies).toHaveLength(2);
+      expect(policies.every((policy) => policy.includes("frame-ancestors"))).toBe(
+        true
+      );
+      expect(policies[0]).toContain("default-src 'self'");
+      expect(policies[0]).toContain("script-src 'self'");
+      expect(policies[1]).toContain("img-src 'self'");
     } finally {
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});
@@ -419,7 +466,32 @@ describeIfLoopback("proxy transport fidelity", () => {
 
       expect(response.statusCode).toBe(302);
       expect(response.headers.location).toBe(
-        `http://127.0.0.1:${proxyPort}/next?from=target#frag`
+        `http://localhost:${proxyPort}/next?from=target#frag`
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("rewrites localhost aliases that point at the target port", async () => {
+    let upstreamPort = 0;
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(302, {
+        "content-type": "text/plain",
+        location: `http://localhost:${upstreamPort}/canonical`,
+      });
+      res.end("redirect");
+    });
+    upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      expect(response.headers.location).toBe(
+        `http://localhost:${proxyPort}/canonical`
       );
     } finally {
       if (handle) await handle.close().catch(() => {});
@@ -447,7 +519,7 @@ describeIfLoopback("proxy transport fidelity", () => {
 
       expect(response.statusCode).toBe(302);
       expect(response.headers.location).toBe(
-        `http://127.0.0.1:${proxyPort}/html-next`
+        `http://localhost:${proxyPort}/html-next`
       );
       expect(body).toContain("data-uim-inspector");
     } finally {
@@ -489,7 +561,40 @@ describeIfLoopback("proxy transport fidelity", () => {
     }
   });
 
-  it("injects the inspector into application/xhtml+xml responses", async () => {
+  it("keeps XHTML byte-identical while allowing localhost iframe previews", async () => {
+    const xhtml = Buffer.from(
+      '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body>xhtml</body></html>',
+      "utf8"
+    );
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/xhtml+xml; charset=utf-8",
+        "content-length": String(xhtml.length),
+        "x-frame-options": "DENY",
+        "content-security-policy": "frame-ancestors https://example.com",
+      });
+      res.end(xhtml);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+      expect(response.body.equals(xhtml)).toBe(true);
+      expect(response.body.toString("utf8")).not.toContain("data-uim-inspector");
+      expect(response.headers["x-frame-options"]).toBeUndefined();
+      expect(response.headers["content-security-policy"]).toContain(
+        "http://localhost:*"
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("passes application/xhtml+xml through without invalid HTML script injection", async () => {
     const upstream = http.createServer((_req, res) => {
       res.writeHead(200, {
         "content-type": "application/xhtml+xml; charset=utf-8",
@@ -506,7 +611,58 @@ describeIfLoopback("proxy transport fidelity", () => {
       const body = response.body.toString("utf8");
 
       expect(body).toContain("xhtml");
-      expect(body).toContain("data-uim-inspector");
+      expect(body).not.toContain("data-uim-inspector");
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("passes encoded HTML through byte-identical when upstream ignores identity", async () => {
+    const encoded = gzipSync("<!doctype html><html><body>compressed</body></html>");
+    const upstream = http.createServer((_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "content-encoding": "gzip",
+        "content-length": String(encoded.byteLength),
+      });
+      res.end(encoded);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort);
+
+      expect(response.headers["content-encoding"]).toBe("gzip");
+      expect(response.body.equals(encoded)).toBe(true);
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("serves the inspector from the proxy origin without contacting upstream", async () => {
+    let upstreamRequests = 0;
+    const upstream = http.createServer((_req, res) => {
+      upstreamRequests++;
+      res.writeHead(404);
+      res.end();
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const response = await requestViaProxy(proxyPort, "/__uim/inspector.js");
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-type"]).toContain("application/javascript");
+      expect(response.body.toString("utf8")).toContain("__uimInspectorLoaded");
+      expect(upstreamRequests).toBe(0);
     } finally {
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});
@@ -617,6 +773,78 @@ describeIfLoopback("proxy transport fidelity", () => {
       expect(body.subarray(0, firstChunk.byteLength).equals(firstChunk)).toBe(
         true
       );
+    } finally {
+      if (!released) releaseRest();
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("streams declared UTF-8 HTML while still injecting the inspector", async () => {
+    const firstChunk = Buffer.from(
+      "<!doctype html><html><body>" + "a".repeat(2048)
+    );
+    const tail = Buffer.from("</body></html>");
+    let released = false;
+    let releaseRest!: () => void;
+    const restGate = new Promise<void>((resolve) => {
+      releaseRest = () => {
+        released = true;
+        resolve();
+      };
+    });
+    const upstream = http.createServer(async (_req, res) => {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.flushHeaders();
+      res.write(firstChunk);
+      await restGate;
+      res.end(tail);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort);
+      const chunks: Buffer[] = [];
+      let resolveFirstChunk!: (chunk: Buffer) => void;
+      const firstChunkSeen = new Promise<Buffer>((resolve) => {
+        resolveFirstChunk = resolve;
+      });
+      const done = new Promise<Buffer>((resolve, reject) => {
+        const req = http.request(
+          { host: "127.0.0.1", port: proxyPort, path: "/ssr" },
+          (res) => {
+            let first = true;
+            res.on("data", (chunk) => {
+              const value = Buffer.from(chunk);
+              chunks.push(value);
+              if (first) {
+                first = false;
+                resolveFirstChunk(value);
+              }
+            });
+            res.on("end", () => resolve(Buffer.concat(chunks)));
+            res.on("error", reject);
+          }
+        );
+        req.on("error", reject);
+        req.end();
+      });
+
+      const streamed = await Promise.race([
+        firstChunkSeen,
+        sleep(1_000).then(() => {
+          throw new Error("timed out waiting for streamed HTML chunk");
+        }),
+      ]);
+      expect(streamed.toString("utf8")).toContain("<!doctype html>");
+      expect(released).toBe(false);
+
+      releaseRest();
+      const body = (await done).toString("utf8");
+      expect(body).toContain("data-uim-inspector");
+      expect(body).toContain("</body></html>");
     } finally {
       if (!released) releaseRest();
       if (handle) await handle.close().catch(() => {});

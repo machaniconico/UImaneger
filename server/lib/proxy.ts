@@ -1,17 +1,19 @@
 import http from "node:http";
-import type { Duplex } from "node:stream";
+import { Transform, type Duplex, type TransformCallback } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INSPECTOR_PATH = join(__dirname, "..", "inspector-client.js");
+const INSPECTOR_ROUTE = "/__uim/inspector.js";
 const FRAME_ANCESTORS_CSP =
   "frame-ancestors 'self' http://localhost:* http://*.localhost:* http://127.0.0.1:* http://[::1]:*";
 const HTML_SNIFF_BYTES = 1024;
 
 let inspectorScript: string | null | undefined;
-function inspectorTag(): string {
+function getInspectorScript(): string | null {
   if (inspectorScript === undefined) {
     try {
       inspectorScript = readFileSync(INSPECTOR_PATH, "utf8");
@@ -19,8 +21,85 @@ function inspectorTag(): string {
       inspectorScript = null;
     }
   }
-  if (!inspectorScript) return "";
-  return `\n<script data-uim-inspector>${inspectorScript}</script>\n`;
+  return inspectorScript || null;
+}
+
+function inspectorTag(): string {
+  if (!getInspectorScript()) return "";
+  return `\n<script data-uim-inspector src="${INSPECTOR_ROUTE}"></script>\n`;
+}
+
+class HtmlInjectionTransform extends Transform {
+  private readonly decoder = new StringDecoder("utf8");
+  private pending = "";
+  private injected = false;
+
+  constructor(private readonly tag: string) {
+    super();
+  }
+
+  private emitAvailable(final: boolean): void {
+    if (this.injected) {
+      if (this.pending) this.push(this.pending);
+      this.pending = "";
+      return;
+    }
+
+    const match = /<\/body\s*>/i.exec(this.pending);
+    if (match?.index !== undefined) {
+      const end = match.index + match[0].length;
+      this.push(
+        this.pending.slice(0, match.index) +
+          this.tag +
+          this.pending.slice(match.index, end)
+      );
+      this.pending = this.pending.slice(end);
+      this.injected = true;
+      if (this.pending) this.push(this.pending);
+      this.pending = "";
+      return;
+    }
+
+    if (final) {
+      this.push(this.pending + this.tag);
+      this.pending = "";
+      this.injected = true;
+      return;
+    }
+
+    // 閉じタグがチャンクを跨いでも検出できる分だけ末尾を保持する。
+    const tailLength = 256;
+    if (this.pending.length > tailLength) {
+      this.push(this.pending.slice(0, -tailLength));
+      this.pending = this.pending.slice(-tailLength);
+    }
+  }
+
+  _transform(
+    chunk: Buffer | string,
+    _encoding: BufferEncoding,
+    callback: TransformCallback
+  ): void {
+    try {
+      this.pending += this.decoder.write(
+        Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      );
+      this.emitAvailable(false);
+      callback();
+    } catch (error) {
+      callback(error as Error);
+    }
+  }
+
+  _flush(callback: TransformCallback): void {
+    try {
+      this.pending += this.decoder.end();
+      this.emitAvailable(true);
+      callback();
+    } catch (error) {
+      callback(error as Error);
+    }
+  }
 }
 
 function mediaType(contentType: string): string {
@@ -29,7 +108,66 @@ function mediaType(contentType: string): string {
 
 function htmlContentType(contentType: string): boolean {
   const type = mediaType(contentType);
+  return type === "text/html";
+}
+
+function frameableDocumentType(contentType: string): boolean {
+  const type = mediaType(contentType);
   return type === "text/html" || type === "application/xhtml+xml";
+}
+
+function addSelfSource(directive: string): string {
+  const parts = directive.trim().split(/\s+/);
+  const name = parts.shift() || "script-src";
+  const sources = parts.filter((part) => part.toLowerCase() !== "'none'");
+  if (!sources.some((part) => part.toLowerCase() === "'self'")) {
+    sources.push("'self'");
+  }
+  return [name, ...sources].join(" ");
+}
+
+function rewriteCspPolicy(policy: string): string {
+  const directives = policy
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  let hasFrameAncestors = false;
+  let hasScriptDirective = false;
+  let hasDefaultSource = false;
+
+  const rewritten = directives.map((directive) => {
+    const name = directive.split(/\s+/, 1)[0].toLowerCase();
+    if (name === "frame-ancestors") {
+      hasFrameAncestors = true;
+      return FRAME_ANCESTORS_CSP;
+    }
+    if (name === "script-src" || name === "script-src-elem") {
+      hasScriptDirective = true;
+      return addSelfSource(directive);
+    }
+    if (name === "default-src") hasDefaultSource = true;
+    return directive;
+  });
+
+  if (!hasFrameAncestors) rewritten.push(FRAME_ANCESTORS_CSP);
+  if (!hasScriptDirective && hasDefaultSource) rewritten.push("script-src 'self'");
+  return rewritten.join("; ");
+}
+
+function rewriteCspHeader(
+  value: http.OutgoingHttpHeader | undefined
+): string | string[] {
+  if (Array.isArray(value)) return value.map(rewriteCspPolicy);
+  if (typeof value === "string") return rewriteCspPolicy(value);
+  return FRAME_ANCESTORS_CSP;
+}
+
+function setOutgoingHeader(
+  headers: http.OutgoingHttpHeaders,
+  name: string,
+  value: http.OutgoingHttpHeader
+): void {
+  (headers as Record<string, http.OutgoingHttpHeader | undefined>)[name] = value;
 }
 
 function charsetFromContentType(contentType: string): string | null {
@@ -93,8 +231,27 @@ function rewriteLocationValue(
   } catch {
     return value;
   }
-  if (url.host !== targetHost) return value;
-  return `http://127.0.0.1:${proxyPort}${url.pathname}${url.search}${url.hash}`;
+  if (url.protocol !== "http:" && url.protocol !== "https:") return value;
+  let target: URL;
+  try {
+    target = new URL(`http://${targetHost}`);
+  } catch {
+    return value;
+  }
+  const normalizeHost = (hostname: string) =>
+    hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  const loopbackAliases = new Set(["localhost", "127.0.0.1", "::1"]);
+  const sourceHost = normalizeHost(url.hostname);
+  const expectedHost = normalizeHost(target.hostname);
+  const sourcePort = Number(
+    url.port || (url.protocol === "https:" ? "443" : "80")
+  );
+  const expectedPort = Number(target.port || "80");
+  const sameHost =
+    sourceHost === expectedHost ||
+    (loopbackAliases.has(sourceHost) && loopbackAliases.has(expectedHost));
+  if (!sameHost || sourcePort !== expectedPort) return value;
+  return `http://localhost:${proxyPort}${url.pathname}${url.search}${url.hash}`;
 }
 
 function rewriteLocationHeader(
@@ -174,9 +331,10 @@ export interface ProxyHandle {
  */
 export function startProxy(
   targetPort: number,
-  proxyPort: number
+  proxyPort: number,
+  targetHostname: "127.0.0.1" | "::1" = "127.0.0.1"
 ): Promise<ProxyHandle> {
-  const targetHost = `127.0.0.1:${targetPort}`;
+  const targetHost = `${targetHostname === "::1" ? "[::1]" : targetHostname}:${targetPort}`;
   const sockets = new Set<Duplex>();
 
   function trackSocket<T extends Duplex>(socket: T): T {
@@ -192,12 +350,18 @@ export function startProxy(
   ): void {
     const ct = String(proxyRes.headers["content-type"] || "");
     const declaredHtml = htmlContentType(ct);
+    const declaredDocument = frameableDocumentType(ct);
     const mustSniff = ct.trim() === "";
+    const contentEncoding = String(
+      proxyRes.headers["content-encoding"] || ""
+    ).trim().toLowerCase();
+    const encoded = Boolean(contentEncoding && contentEncoding !== "identity");
 
     const headers = withoutHopByHopHeaders(proxyRes.headers);
-    // フレーム埋め込みは localhost ファミリの UImaneger UI に限定する。
-    delete headers["x-frame-options"];
-    headers["content-security-policy"] = FRAME_ANCESTORS_CSP;
+    const cspPolicies = proxyRes.headersDistinct?.["content-security-policy"];
+    if (cspPolicies?.length) {
+      setOutgoingHeader(headers, "content-security-policy", cspPolicies);
+    }
     // location は存在する時だけ書き換える。非リダイレクト応答(location 無し)で
     // undefined を代入すると res.writeHead が ERR_HTTP_INVALID_HEADER_VALUE を投げる。
     if (headers.location !== undefined) {
@@ -207,6 +371,19 @@ export function startProxy(
         proxyPort
       );
     }
+
+    const responseHeaders = (isHtml: boolean): http.OutgoingHttpHeaders => {
+      const next: http.OutgoingHttpHeaders = { ...headers };
+      if (!isHtml) return next;
+      // HTML 文書だけフレーム許可を補正する。既存 CSP の他ディレクティブは維持する。
+      delete next["x-frame-options"];
+      setOutgoingHeader(
+        next,
+        "content-security-policy",
+        rewriteCspHeader(next["content-security-policy"])
+      );
+      return next;
+    };
 
     // ターゲット dev server が応答中にリセットしても unhandled "error" に
     // 昇格しないように、分岐前に error ハンドラを取り付ける(HTML / pipe 両パス共通)。
@@ -247,8 +424,9 @@ export function startProxy(
 
     const sendBufferedResponse = (rawBody: Buffer, isHtml: boolean) => {
       if (upstreamErrored || res.destroyed || res.writableEnded) return;
+      const outgoingHeaders = responseHeaders(isHtml);
       if (!isHtml || !injectableCharset(ct)) {
-        res.writeHead(proxyRes.statusCode || 200, headers);
+        res.writeHead(proxyRes.statusCode || 200, outgoingHeaders);
         res.end(rawBody);
         return;
       }
@@ -256,69 +434,136 @@ export function startProxy(
       let body = rawBody.toString("utf8");
       const tag = inspectorTag();
       if (tag) {
-        if (body.includes("</body>")) {
-          body = body.replace("</body>", tag + "</body>");
+        if (/<\/body\s*>/i.test(body)) {
+          body = body.replace(/<\/body\s*>/i, `${tag}$&`);
         } else {
           body += tag;
         }
       }
-      delete headers["content-length"];
-      delete headers["content-encoding"];
-      delete headers["transfer-encoding"];
-      headers["content-length"] = String(Buffer.byteLength(body));
-      res.writeHead(proxyRes.statusCode || 200, headers);
+      delete outgoingHeaders["content-length"];
+      delete outgoingHeaders["content-encoding"];
+      delete outgoingHeaders["transfer-encoding"];
+      outgoingHeaders["content-length"] = String(Buffer.byteLength(body));
+      res.writeHead(proxyRes.statusCode || 200, outgoingHeaders);
       res.end(body);
     };
 
-    if (!declaredHtml && !mustSniff) {
-      res.writeHead(proxyRes.statusCode || 200, headers);
+    const streamHtmlResponse = (initialChunks: Buffer[] = []) => {
+      const outgoingHeaders = responseHeaders(true);
+      const tag = inspectorTag();
+      if (!tag || !injectableCharset(ct)) {
+        res.writeHead(proxyRes.statusCode || 200, outgoingHeaders);
+        for (const chunk of initialChunks) res.write(chunk);
+        proxyRes.pipe(res);
+        return;
+      }
+
+      delete outgoingHeaders["content-length"];
+      delete outgoingHeaders["content-encoding"];
+      delete outgoingHeaders["transfer-encoding"];
+      res.writeHead(proxyRes.statusCode || 200, outgoingHeaders);
+      const injector = new HtmlInjectionTransform(tag);
+      injector.on("error", onUpstreamError);
+      injector.pipe(res);
+      for (const chunk of initialChunks) injector.write(chunk);
+      proxyRes.pipe(injector);
+    };
+
+    const statusCode = proxyRes.statusCode || 200;
+    const bodyless =
+      _req.method === "HEAD" ||
+      statusCode === 204 ||
+      statusCode === 304 ||
+      (statusCode >= 100 && statusCode < 200);
+    if (bodyless || encoded) {
+      res.writeHead(statusCode, responseHeaders(declaredDocument));
+      proxyRes.pipe(res);
+      return;
+    }
+
+    if (declaredHtml) {
+      streamHtmlResponse();
+      return;
+    }
+
+    if (!mustSniff) {
+      res.writeHead(statusCode, responseHeaders(declaredDocument));
       proxyRes.pipe(res);
       return;
     }
 
     const chunks: Buffer[] = [];
-    if (mustSniff) {
-      let bufferingForHtml = false;
-      const streamBufferedThenPipe = () => {
-        proxyRes.pause();
-        proxyRes.off("data", onSniffData);
-        proxyRes.off("end", onSniffEnd);
-        res.writeHead(proxyRes.statusCode || 200, headers);
-        for (const chunk of chunks) {
-          res.write(chunk);
-        }
-        proxyRes.pipe(res);
-        proxyRes.resume();
-      };
-      function onSniffData(c: Buffer) {
-        chunks.push(Buffer.from(c));
-        if (bufferingForHtml) return;
-        const buffered = Buffer.concat(chunks);
-        const decision = sniffHtmlStart(buffered);
-        if (decision === "html") {
-          bufferingForHtml = true;
-          return;
-        }
-        if (decision === "non-html" || buffered.byteLength >= HTML_SNIFF_BYTES) {
-          streamBufferedThenPipe();
-        }
+    const streamBufferedThenPipe = () => {
+      proxyRes.pause();
+      proxyRes.off("data", onSniffData);
+      proxyRes.off("end", onSniffEnd);
+      res.writeHead(statusCode, responseHeaders(false));
+      for (const chunk of chunks) {
+        res.write(chunk);
       }
-      function onSniffEnd() {
-        const rawBody = Buffer.concat(chunks);
-        sendBufferedResponse(rawBody, sniffHtmlBody(rawBody));
+      proxyRes.pipe(res);
+      proxyRes.resume();
+    };
+    const streamBufferedAsHtml = () => {
+      proxyRes.pause();
+      proxyRes.off("data", onSniffData);
+      proxyRes.off("end", onSniffEnd);
+      streamHtmlResponse(chunks);
+      proxyRes.resume();
+    };
+    function onSniffData(c: Buffer) {
+      chunks.push(Buffer.from(c));
+      const buffered = Buffer.concat(chunks);
+      const decision = sniffHtmlStart(buffered);
+      if (decision === "html") {
+        streamBufferedAsHtml();
+        return;
       }
-      proxyRes.on("data", onSniffData);
-      proxyRes.on("end", onSniffEnd);
-      return;
+      if (decision === "non-html" || buffered.byteLength >= HTML_SNIFF_BYTES) {
+        streamBufferedThenPipe();
+      }
     }
-
-    proxyRes.on("data", (c) => chunks.push(Buffer.from(c)));
-    proxyRes.on("end", () => {
-      sendBufferedResponse(Buffer.concat(chunks), declaredHtml);
-    });
+    function onSniffEnd() {
+      const rawBody = Buffer.concat(chunks);
+      sendBufferedResponse(rawBody, sniffHtmlBody(rawBody));
+    }
+    proxyRes.on("data", onSniffData);
+    proxyRes.on("end", onSniffEnd);
   }
 
   const server = http.createServer((req, res) => {
+    let requestPath = "/";
+    try {
+      requestPath = new URL(req.url || "/", "http://localhost").pathname;
+    } catch {
+      // 不正な URL は upstream に委ねる。
+    }
+    if (requestPath === INSPECTOR_ROUTE) {
+      const script = getInspectorScript();
+      if (!script) {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Inspector script is unavailable");
+        return;
+      }
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, {
+          allow: "GET, HEAD",
+          "content-type": "text/plain; charset=utf-8",
+        });
+        res.end("Method Not Allowed");
+        return;
+      }
+      const length = Buffer.byteLength(script);
+      res.writeHead(200, {
+        "content-type": "application/javascript; charset=utf-8",
+        "content-length": String(length),
+        "cache-control": "no-store",
+        "x-content-type-options": "nosniff",
+      });
+      res.end(req.method === "HEAD" ? undefined : script);
+      return;
+    }
+
     const headers = withoutHopByHopHeaders(req.headers);
     headers.host = targetHost;
     // gzip を避けて本文を確実に書き換えられるように
@@ -326,7 +571,7 @@ export function startProxy(
 
     const proxyReq = http.request(
       {
-        host: "127.0.0.1",
+        host: targetHostname,
         port: targetPort,
         method: req.method,
         path: req.url,
@@ -350,7 +595,7 @@ export function startProxy(
     if (req.headers.upgrade) headers.upgrade = req.headers.upgrade;
 
     const proxyReq = http.request({
-      host: "127.0.0.1",
+      host: targetHostname,
       port: targetPort,
       method: req.method,
       path: req.url,
