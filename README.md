@@ -1,70 +1,91 @@
 # UImaneger
 
-ローカルで動く **リアルタイムプレビュー × 自然言語UI編集** アプリ。
-bolt.new のローカル版 + プレビュー上で要素を選んで自然言語でその場編集。
+ローカルで動く、リアルタイムプレビューと自然言語UI編集のツールです。対象プロジェクトを開発サーバで起動し、プレビュー上で選んだ要素に対する変更案を差分で確認してから適用できます。
 
-## できること
+## 主な機能
 
-- 既存プロジェクト(ローカルパス or GitHub URL)を開く
-- 3ペイン構成: **左=GUI操作 / 中央=編集前(HEAD) / 右=変更後(ライブ)**
-- プレビュー上の要素をクリック → 対応ソースを特定 → 自然言語で指示 → その場で反映
-- 編集は **差分プレビュー → 承認/却下/undo** のフロー
-- **あらゆる言語/FW対応**(3層解決): React は精密(`_debugSource`)、その他は ripgrep+LLM の特徴検索で言語非依存に特定
+- ローカルパスまたは Git リポジトリ URL を開く
+- 左に操作、中央に編集前、右に変更後を表示
+- 要素選択からソース候補を検索し、Claude API で変更案を生成
+- 差分の承認、却下、undo
+- npm、pnpm、Yarn、Bun のプロジェクト宣言または lockfile を尊重
+- IPv4/IPv6 ループバック、WebSocket/HMR、UTF-8 HTML ストリーミングに対応
 
-## 技術構成
+## 対応範囲
 
-- UIシェル: Vite + React + TypeScript + Tailwind
-- ローカルサーバ: Hono (`server/`)
-- プレビュー: 対象アプリを自身の serve コマンドで起動 → http-proxy で中継し inspector を注入
-- 編集前/変更後: git worktree で HEAD を別配信(git無しは degrade)
-- LLM: Claude API
+「自動起動」と「選択要素からのソース特定」は別の機能です。自動起動できても、常に正確な file:line を取得できるわけではありません。
 
-詳細は [SPEC.md](./SPEC.md) を参照。
+| 区分 | 対象 | 現在の検証状態 |
+|---|---|---|
+| 実プロセス検証済み | Vite + React の同梱サンプル、静的 HTML、汎用 Node `dev` script | Windows の CI 相当テストで起動と HTTP 応答を確認 |
+| 自動起動プラン検証済み | Next.js、Nuxt、React Router、Remix、SvelteKit、Astro、Angular、Vue CLI、Create React App | コマンド、port、package manager の判定を単体テストで確認 |
+| 自動起動プラン検証済み | Rails、Django、Laravel/PHP、Go、Spring Boot (Maven/Gradle)、ASP.NET Core、Phoenix | 強いプロジェクト指標と起動プランを単体テストで確認。各 runtime での実起動は環境別確認が必要 |
+| 手動コマンド | FastAPI/Flask の任意 entrypoint、Rust Web、Java の非 Spring 構成、独自サーバ、複数アプリの monorepo | 「起動設定」でコマンドを指定。`PORT` 環境変数が渡される |
 
-## 使い方
+自動判定は誤起動を避けるため、強いマーカーがある構成に限定しています。Go はルートの `package main` と `func main`、PHP は `index.php`、Django は標準的な `manage.py` を確認します。monorepo でルートに起動 script がない場合は、対象アプリのディレクトリをローカルパスとして開いてください。
 
-前提: Node.js 22.12 以上 25 未満、npm 10 以上。
+### ソース特定
+
+1. runtime から実在する project 内 source path と line が得られた場合は高確度で採用します。
+2. それ以外は text、id、固有 class、`data-testid`、`aria-label`、Vue component 名などを検索して候補を評価します。
+3. 曖昧な一致や JSON/CSS など非テンプレートファイルの一致は自動編集せず、候補選択を求めます。
+
+React の private `fiber._debugSource` は React/version/build 設定に依存し、React 19 での精密解決は保証しません。Vue/Svelte の runtime metadata も補助信号です。Angular 専用の精密アダプタは未実装です。
+
+対象テンプレートには TSX/JSX、Vue、Svelte、Astro、HTML、ERB、Blade/PHP、Razor/CSHTML、JSP、Twig、Jinja、Liquid、HEEx などを含みます。ビルド済み・minify 済み成果物から元ソースを完全に復元する機能ではありません。
+
+### プレビュー制約
+
+- Inspector 注入対象は identity encoding の UTF-8/ASCII `text/html` です。
+- `application/xhtml+xml`、非 UTF-8 HTML、upstream が圧縮を強制した HTML は壊さず中継しますが、要素選択は利用できません。
+- 既存 CSP は維持し、同一 origin の Inspector script を許可します。meta CSP、nonce + `strict-dynamic` など特に厳しいポリシーでは注入がブロックされる場合があります。
+- open Shadow DOM は選択できます。closed Shadow DOM と cross-origin の子 iframe 内部は対象外です。
+
+## セットアップ
+
+前提は Node.js 22.12 以上 25 未満、npm 10 以上です。対象プロジェクト側の runtime と依存関係は別途必要です。
 
 ```bash
 npm install
-cp .env.example .env   # ANTHROPIC_API_KEY を設定
-npm run dev            # エディタUI(:5173) + サーバ(:5174)
+npm run dev
 ```
 
-ブラウザで http://localhost:5173 を開き、ローカルパスか GitHub URL を入力。
+先に `.env.example` を `.env` へ複製してください。PowerShell では
+`Copy-Item .env.example .env`、bash では `cp .env.example .env` を使えます。
 
-### すぐ試す (同梱サンプル)
+`.env` に `ANTHROPIC_API_KEY` を設定し、ブラウザで [http://localhost:5173](http://localhost:5173) を開きます。同梱サンプルは次の絶対パスで開けます。
 
-お試し用の React アプリを同梱しています。プロジェクト入力欄に次のパスを入れて「開く」:
-
+```text
+<repository>/examples/sample-app
 ```
-<このリポジトリの絶対パス>/examples/sample-app
-```
 
-中央に「編集前」、右に「変更後」が表示されます。「要素を選択」→ 見出しやボタンをクリック →
-「この見出しを大きく赤く」などと入力すると、差分プレビュー → 承認で右側に即反映されます。
-(編集機能には `.env` の `ANTHROPIC_API_KEY` が必要です)
+Git clone 後の Node 依存導入は npm/pnpm/Yarn/Bun を検出し、lifecycle script を無効にして実行します。Ruby、Python、PHP、Go、Java、.NET、Elixir などの依存導入は自動化していません。
+Clone URL は HTTPS、SSH URL、scp-like `git@host:path` のみ受け付けます。平文の Git protocol、ローカル `file:`、Git ext transport は拒否します。
 
 ## セキュリティ
 
-ローカル単一ユーザー向けツールとして、安全側の既定で動作します。
+このアプリはローカル単一ユーザー向けです。認証付きの共有サービスではありません。
 
-- コントロールAPI(ファイル読み書き等)は **`127.0.0.1` のみにバインド**(プレビュープロキシと同様)。
-- `/api/*` は **Origin/Host allowlist** で保護し、`localhost` / `127.0.0.1` / `::1` / `*.localhost` 以外からのリクエストを 403 で拒否(LAN・CSRF・DNS-rebind 対策)。
-- LANからアクセスしたい場合のみ `UIM_HOST=0.0.0.0 npm run dev` で明示的にバインド先を変更できます(自己責任。信頼できるネットワークでのみ)。
+- コントロール API とプレビュープロキシは既定で `127.0.0.1` のみに bind します。
+- Origin/Host allowlist は `localhost`、`127.0.0.1`、`::1`、`*.localhost` に限定します。
+- 任意の起動コマンドは、サーバ自体もループバック bind の場合にだけ許可します。
+- Clone したプロジェクトの install script は無効化します。ただし開発サーバを起動すると、そのプロジェクトのコードが現在ユーザー権限で実行されます。信頼できるコードだけを開いてください。
+- 編集時は対象ファイル全体、指示、DOM の補助情報が Anthropic API へ送信されます。秘密、個人情報、契約上送信できないコードを対象にしないでください。
+- `UIM_HOST` による LAN 公開はサポート対象外です。認証やTLSなしで外部公開しないでください。
 
-## 開発
+## 開発と検証
 
 ```bash
-npm run typecheck   # 型チェック
-npm run policy      # 依存固定・lockfile 同期などのリリース前チェック
-npm test            # selftest(runner/resolver) + vitest(ユニット/統合)
-npm run test:ci     # CI と同じく非推奨API警告を失敗扱いで検証
-npm run build       # 本番ビルド
-npm run verify      # policy → typecheck → test:ci → build
+npm run policy
+npm run typecheck
+npm run test:ci
+npm run build
+npm run verify
+npm run sbom
+npm audit
 ```
 
-- テスト: `scripts/*-selftest.mjs`(FW検出/ソース解決の純関数)+ `server/**/*.test.ts`・`src/**/*.test.tsx`(vitest)。編集パイプライン(`/api/edit`→apply/undo)は Claude 呼び出しを mock した統合テストで検証。
-- CI: `.github/workflows/ci.yml` が push/PR で `npm ci → npm run verify` を実行(job 名 `test`)。Node 24 固定。
+`npm run verify` は依存ポリシー、型検査、runner/resolver selftest、Vitest、production build を実行します。実 API キーを使うブラウザ全体の編集フローと、各バックエンド runtime の実起動マトリクスは CI では未検証です。
 
-> 実APIキーを使ったエンドツーエンドの編集確認(ブラウザで要素選択→指示→反映)は、`.env` に `ANTHROPIC_API_KEY` を設定して手元で行ってください(CIでは mock のため未検証)。
+詳細な現在仕様は [SPEC.md](./SPEC.md) を参照してください。
+販売前の未解決ゲートは [COMMERCIAL_READINESS.md](./compliance/COMMERCIAL_READINESS.md)、外部サービスの確認記録は [THIRD_PARTY_SERVICES.md](./compliance/THIRD_PARTY_SERVICES.md) を参照してください。
