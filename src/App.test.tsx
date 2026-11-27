@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { App } from "./App";
 import { api } from "./lib/api";
 import type { DomDescriptor, ProjectInfo } from "./lib/types";
@@ -98,6 +98,9 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByText("project:demo")).not.toBeNull();
     });
+    // info.root 変化で選択状態を初期化する passive effect を先に flush する。
+    // 負荷下では waitFor の検出がその effect より先になり、直後のクリックを打ち消すことがあった。
+    await act(async () => {});
     expect(screen.getByText("has-key:true")).not.toBeNull();
     expect(screen.getByLabelText("git-panel").textContent).toContain("git:demo");
     expect(screen.getByLabelText("chat").textContent).toContain("selected:none");

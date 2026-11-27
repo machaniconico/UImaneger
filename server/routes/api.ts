@@ -8,6 +8,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { env } from "../lib/env.ts";
+import { buildChildEnv } from "../lib/child-env.ts";
 import { hasKey, complete, stripCodeFence, TruncatedError } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
@@ -354,7 +355,7 @@ async function hasStagedGitChanges(root: string): Promise<boolean> {
   try {
     await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code"], {
       cwd: root,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
       windowsHide: true,
     });
@@ -657,11 +658,10 @@ api.post("/project/clone", async (c) => {
         ],
         {
           cwd: wsDir,
-          env: {
-            ...process.env,
+          env: buildChildEnv({
             GIT_ALLOW_PROTOCOL: "https:ssh",
             GIT_TERMINAL_PROMPT: "0",
-          },
+          }),
           maxBuffer: 8 * 1024 * 1024,
           timeout: GIT_CLONE_TIMEOUT_MS,
           windowsHide: true,
@@ -676,7 +676,7 @@ api.post("/project/clone", async (c) => {
         ["remote", "get-url", "origin"],
         {
           cwd: dest,
-          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
           timeout: 15_000,
           windowsHide: true,
         }
@@ -697,11 +697,10 @@ api.post("/project/clone", async (c) => {
         await pExecFile(installInvocation.command, installInvocation.args, {
           cwd: dest,
           shell: installInvocation.shell,
-          env: {
-            ...process.env,
+          env: buildChildEnv({
             CI: "1",
             YARN_ENABLE_SCRIPTS: "false",
-          },
+          }),
           maxBuffer: 32 * 1024 * 1024,
           timeout: PACKAGE_INSTALL_TIMEOUT_MS,
           windowsHide: true,
@@ -1202,7 +1201,7 @@ api.get("/git/status", async (c) => {
   try {
     const { stdout } = await pExecFile("git", ["status", "--porcelain"], {
       cwd: root,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
       windowsHide: true,
     });
@@ -1223,7 +1222,7 @@ api.post("/git/commit", async (c) => {
   try {
     await pExecFile("git", ["add", "-A"], {
       cwd: root,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
       windowsHide: true,
     });
@@ -1235,7 +1234,7 @@ api.post("/git/commit", async (c) => {
       ["commit", "--no-gpg-sign", "-m", commitMessage.message],
       {
         cwd: root,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
         timeout: GIT_OPERATION_TIMEOUT_MS,
         windowsHide: true,
       }

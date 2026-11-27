@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, relative } from "node:path";
+import { buildChildEnv } from "./child-env.ts";
 
 export type GitMode = "worktree" | "snapshot" | "none";
 
@@ -66,7 +67,11 @@ function runGit(
   root: string,
   args: string[]
 ): { ok: boolean; out: string; err: string } {
-  const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  const r = spawnSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    env: buildChildEnv(),
+  });
   return {
     ok: r.status === 0,
     out: (r.stdout ?? "").trim(),

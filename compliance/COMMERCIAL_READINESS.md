@@ -24,7 +24,7 @@
 | 製品の権利 | BLOCKED | repository の製品 license、著作権者、販売主体の確定 |
 | OSS / assets | HUMAN-REVIEW | npm 依存の台帳と許可リスト検査は自動化済み。`standardwebhooks@1.0.0` は npm に LICENSE 本文が無く upstream 参照。font・icon・asset の確認と法務の最終承認が残る |
 | Anthropic terms / privacy | HUMAN-REVIEW | `THIRD_PARTY_SERVICES.md` の release blockers 解消 |
-| Security | BLOCKED | 依存 scan は CI 化済み、SAST は手動実行済み。残りは secret scan と SAST の CI 化、配布 artifact scan、脅威モデルの release 証跡 |
+| Security | BLOCKED | 2026-11-27 の脅威レビューで出た CSRF(別ポート localhost からの単純リクエスト)、プレビュープロキシの DNS rebinding、子プロセスへの API キー継承を修正済み(受け入れテスト `tests/acceptance/` 41 件、異系統レビュー 2 系統 APPROVE、最終受け入れ PASS)。依存 scan は CI 化済み、SAST は手動実行済み。残りは secret scan と SAST の CI 化、配布 artifact scan、脅威モデルの release 証跡 |
 | Browser E2E | PARTIAL | `npm run e2e`(Playwright 1.65.0 / Chromium、偽 Anthropic API、同梱 Vite+React サンプルの一時複製)で open・select・proposal・apply・undo と、別タブでの状態保持つき HMR を検証。2026-11-27 にローカル(WSL2/Node 22)で連続 PASS。残り: CI 上の初回 PASS 記録、Windows/macOS、Firefox/WebKit、実 API キーでの確認 |
 | Runtime matrix | BLOCKED | claim する OS と主要 framework/runtime の実プロセス検証 |
 | Distribution | BLOCKED | installer/package、署名、artifact hash、更新、rollback の確認 |

@@ -15,6 +15,7 @@
     "dev:client": "vite",
     "build": "vite build",
     "start": "tsx server/index.ts",
+    "start:prod": "npm run build && tsx server/index.ts --production",
     "policy": "node scripts/package-policy.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/runner-selftest.mjs && node scripts/resolver-selftest.mjs && vitest run",

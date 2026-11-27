@@ -249,12 +249,12 @@ describe("prepareBefore / cleanup", () => {
       expect(spawnMock).toHaveBeenCalledWith(
         "git",
         ["worktree", "remove", "--force", staleWorktree],
-        { cwd: sourceRoot, encoding: "utf8" }
+        expect.objectContaining({ cwd: sourceRoot, encoding: "utf8" })
       );
       expect(spawnMock).toHaveBeenCalledWith(
         "git",
         ["worktree", "prune"],
-        { cwd: sourceRoot, encoding: "utf8" }
+        expect.objectContaining({ cwd: sourceRoot, encoding: "utf8" })
       );
       expect(existsSync(staleWorktree)).toBe(false);
     } finally {

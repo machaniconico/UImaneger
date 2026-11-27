@@ -59,6 +59,10 @@ npm run dev
 <repository>/examples/sample-app
 ```
 
+UI の Vite は `strictPort` で起動するため、5173(`UIM_CLIENT_PORT`)が使用中なら別ポートへ逃げずに起動失敗します。API はこのポートの Origin だけを UI として信頼するので、変更する場合は `.env` の `UIM_CLIENT_PORT` を書き換えてください。
+
+ビルド済み UI をサーバ 1 つで配信する場合は `npm run start:prod` を使います(`npm run build` の後に `--production` 付きで起動)。このモードでは UI と API が同一 origin(既定 [http://localhost:5174](http://localhost:5174))になり、5173 の Origin は信頼しません。`npm start` 単独は API のみの開発用モードです。
+
 Git clone 後の Node 依存導入は npm/pnpm/Yarn/Bun を検出し、lifecycle script を無効にして実行します。Ruby、Python、PHP、Go、Java、.NET、Elixir などの依存導入は自動化していません。
 Clone URL は HTTPS、SSH URL、scp-like `git@host:path` のみ受け付けます。平文の Git protocol、ローカル `file:`、Git ext transport は拒否します。
 
@@ -67,7 +71,12 @@ Clone URL は HTTPS、SSH URL、scp-like `git@host:path` のみ受け付けま�
 このアプリはローカル単一ユーザー向けです。認証付きの共有サービスではありません。
 
 - コントロール API とプレビュープロキシは既定で `127.0.0.1` のみに bind します。
-- Origin/Host allowlist は `localhost`、`127.0.0.1`、`::1`、`*.localhost` に限定します。
+- コントロール API は、Origin ヘッダがある場合 UI の origin(`http://{localhost|127.0.0.1|[::1]}:{UIM_SERVER_PORT}`、開発時はさらに `UIM_CLIENT_PORT`)と完全一致したものだけを受け付けます。別ポートの localhost ページ、`null`、`https`、`*.localhost` は 403 です。許可 Origin は起動ログに出力します。
+- Host はホスト名 `localhost`、`127.0.0.1`、`::1` のみ許可します(ポートは問いません。`*.localhost` は対象外)。`Sec-Fetch-Site` が `same-site` / `cross-site` の要求も拒否します。CORS 応答ヘッダは出しません。
+- 状態を変更する API(GET/HEAD/OPTIONS 以外)は `Content-Type: application/json` を必須とし、それ以外は 415 を返します。フォームや `text/plain` の単純リクエストによる CSRF を防ぐためです。
+- プレビュープロキシも、Host がループバック名でない要求と、Origin がプロキシ自身の origin(`http://{localhost|127.0.0.1|[::1]}:{プロキシのポート}`)と一致しない要求を、HTTP・WebSocket とも 403 で拒否します(DNS rebinding 対策)。
+- 対象 dev server のポートへの直接アクセスはプレビュープロキシを通らないため、Host 検査は対象フレームワーク側に依存します。
+- 開発サーバ、git、依存インストールなどの子プロセスには、`ANTHROPIC_*`、`UIM_*` と `.env` から読み込んだキーを渡しません。
 - 任意の起動コマンドは、サーバ自体もループバック bind の場合にだけ許可します。
 - Clone したプロジェクトの install script は無効化します。ただし開発サーバを起動すると、そのプロジェクトのコードが現在ユーザー権限で実行されます。信頼できるコードだけを開いてください。
 - 編集時は対象ファイル全体、指示、DOM の補助情報が Anthropic API へ送信されます。秘密、個人情報、契約上送信できないコードを対象にしないでください。

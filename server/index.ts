@@ -3,7 +3,8 @@ import { env } from "./lib/env.ts";
 import { stopProject } from "./lib/state.ts";
 import { killAllChildrenSync } from "./lib/runner.ts";
 import { cleanupAllBefore, sweepStaleBeforeDirs } from "./lib/worktree.ts";
-import { createApp } from "./app.ts";
+import { createApp, resolveSecurityPorts } from "./app.ts";
+import { allowedApiOrigins } from "./middleware/security.ts";
 
 const app = createApp();
 
@@ -15,6 +16,8 @@ const server = serve(
   { fetch: app.fetch, hostname: bindHost, port: env.serverPort },
   (info) => {
     console.log(`[UImaneger] server listening on http://${bindHost}:${info.port}`);
+    const origins = allowedApiOrigins(resolveSecurityPorts());
+    console.log(`[UImaneger] 許可 Origin: ${origins.join(", ")}`);
     if (!env.anthropicKey) {
       console.log(
         "[UImaneger] 注意: ANTHROPIC_API_KEY 未設定。編集機能には .env が必要です。"

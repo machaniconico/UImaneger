@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApp } from "./app.ts";
+import { createApp, isProduction } from "./app.ts";
 
 const tempDirs: string[] = [];
 
@@ -110,5 +110,19 @@ describe("createApp", () => {
       headers: { host: "example.com", accept: "image/*" },
     });
     expect(missingFile.status).toBe(404);
+  });
+});
+
+describe("isProduction", () => {
+  it("is enabled by NODE_ENV=production or the --production argument", () => {
+    expect(isProduction({}, ["node", "server/index.ts"], undefined)).toBe(false);
+    expect(isProduction({}, ["node", "server/index.ts"], "production")).toBe(true);
+    expect(isProduction({}, ["node", "server/index.ts", "--production"], undefined)).toBe(true);
+    expect(isProduction({}, ["node", "server/index.ts", "--production=false"], undefined)).toBe(false);
+  });
+
+  it("lets an explicit option win over argv and NODE_ENV", () => {
+    expect(isProduction({ production: false }, ["--production"], "production")).toBe(false);
+    expect(isProduction({ production: true }, [], undefined)).toBe(true);
   });
 });

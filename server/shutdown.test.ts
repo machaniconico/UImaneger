@@ -22,8 +22,9 @@ vi.mock("./routes/api.ts", async () => {
   return { api: new Hono() } as unknown as typeof import("./routes/api.ts");
 });
 vi.mock("./middleware/security.ts", () => ({
-  securityMiddleware: async (_c: unknown, next: () => Promise<void>) =>
-    await next(),
+  createSecurityMiddleware:
+    () => async (_c: unknown, next: () => Promise<void>) => await next(),
+  allowedApiOrigins: () => [],
 }));
 vi.mock("@hono/node-server", () => ({
   serve: () => ({

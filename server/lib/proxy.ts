@@ -4,6 +4,7 @@ import { StringDecoder } from "node:string_decoder";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { isAllowedHost, loopbackOrigins } from "../middleware/security.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INSPECTOR_PATH = join(__dirname, "..", "inspector-client.js");
@@ -336,6 +337,19 @@ export function startProxy(
 ): Promise<ProxyHandle> {
   const targetHost = `${targetHostname === "::1" ? "[::1]" : targetHostname}:${targetPort}`;
   const sockets = new Set<Duplex>();
+  const allowedOrigins = new Set(loopbackOrigins([proxyPort]));
+
+  // DNS rebinding / 他 origin からの読み取り対策。upstream へ接続する前に判定する。
+  // Sec-Fetch-Site は見ない(UI からの iframe 表示は cross-site ナビゲーションになるため)。
+  function rejectReason(req: http.IncomingMessage): string | null {
+    const host = req.headers.host;
+    if (!host || !isAllowedHost(host)) return "Host header is not a loopback name";
+    const origin = req.headers.origin;
+    if (origin !== undefined && !allowedOrigins.has(origin)) {
+      return "Origin is not allowed";
+    }
+    return null;
+  }
 
   function trackSocket<T extends Duplex>(socket: T): T {
     sockets.add(socket);
@@ -532,6 +546,19 @@ export function startProxy(
   }
 
   const server = http.createServer((req, res) => {
+    const rejected = rejectReason(req);
+    if (rejected) {
+      const destroyResponse = () => res.destroy();
+      req.on("error", destroyResponse);
+      res.on("error", destroyResponse);
+      const body = `Forbidden: ${rejected}`;
+      res.writeHead(403, {
+        "content-type": "text/plain; charset=utf-8",
+        "content-length": String(Buffer.byteLength(body)),
+      });
+      res.end(body);
+      return;
+    }
     let requestPath = "/";
     try {
       requestPath = new URL(req.url || "/", "http://localhost").pathname;
@@ -589,6 +616,17 @@ export function startProxy(
   });
   server.on("upgrade", (req, socket, head) => {
     trackSocket(socket);
+    const rejected = rejectReason(req);
+    if (rejected) {
+      socket.on("error", () => socket.destroy());
+      const body = `Forbidden: ${rejected}`;
+      // end() だけでは相手が FIN を返さない限り接続が残るので、書き終えたら破棄する。
+      socket.end(
+        `HTTP/1.1 403 Forbidden\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`,
+        () => socket.destroy()
+      );
+      return;
+    }
     const headers = withoutHopByHopHeaders(req.headers, { keepUpgrade: true });
     headers.host = targetHost;
     headers.connection = req.headers.connection ?? "Upgrade";

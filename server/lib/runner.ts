@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
+import { buildChildEnv } from "./child-env.ts";
 import {
   detectPackageManager,
   packageBinaryPlan,
@@ -464,7 +465,10 @@ function registerChild(proc: ChildProcess): void {
 function taskkill(pid: number, force: boolean): boolean {
   const args = ["/pid", String(pid), "/t"];
   if (force) args.push("/f");
-  const result = spawnSync("taskkill", args, { stdio: "ignore" });
+  const result = spawnSync("taskkill", args, {
+    stdio: "ignore",
+    env: buildChildEnv(),
+  });
   return result.status === 0;
 }
 
@@ -659,7 +663,7 @@ export async function startTarget(
 
   const proc = spawn(invocation.command, invocation.args, {
     cwd: root,
-    env: { ...process.env, ...plan.env, FORCE_COLOR: "0" },
+    env: buildChildEnv({ ...plan.env, FORCE_COLOR: "0" }),
     shell: invocation.shell,
     detached: true,
   });

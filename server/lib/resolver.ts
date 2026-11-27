@@ -6,6 +6,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { DomDescriptor, ResolveResult } from "./types.ts";
 import { complete, hasKey, stripCodeFence } from "./claude.ts";
+import { buildChildEnv } from "./child-env.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -19,7 +20,10 @@ async function isRgUsable(): Promise<boolean> {
   if (rgUsableOverride !== null) return rgUsableOverride;
   if (rgUsable !== null) return rgUsable;
   try {
-    await pExecFile("rg", ["--version"], { maxBuffer: 1 << 16 });
+    await pExecFile("rg", ["--version"], {
+      maxBuffer: 1 << 16,
+      env: buildChildEnv(),
+    });
     rgUsable = true;
   } catch {
     rgUsable = false;
@@ -568,7 +572,7 @@ async function rgSearch(
         term,
         root,
       ],
-      { maxBuffer: 4 * 1024 * 1024 }
+      { maxBuffer: 4 * 1024 * 1024, env: buildChildEnv() }
     );
     return parse(stdout);
   } catch (e: any) {
@@ -628,7 +632,7 @@ async function rgCount(root: string, term: string): Promise<number> {
         term,
         root,
       ],
-      { maxBuffer: 4 * 1024 * 1024 }
+      { maxBuffer: 4 * 1024 * 1024, env: buildChildEnv() }
     );
     return parse(stdout);
   } catch (e: any) {

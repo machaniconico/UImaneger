@@ -21,6 +21,11 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run verify
+      - name: Acceptance tests must not be skipped
+        shell: bash
+        run: |
+          npx vitest run tests/acceptance --reporter=json --outputFile=acceptance-report.json
+          node -e "const r=require('./acceptance-report.json'); const s=r.numPendingTests+r.numTodoTests; if (s) { console.error('skipped acceptance tests: '+s); process.exit(1); } console.log('acceptance: '+r.numPassedTests+' passed, 0 skipped');"
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30

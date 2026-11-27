@@ -2,6 +2,7 @@
 // 対象: ProxyHandle.close の永久ハング修正の回帰
 // 実 http サーバ・実ポートを使う node 環境テスト。
 import { describe, it, expect, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import net from "node:net";
 import { gzipSync } from "node:zlib";
@@ -956,4 +957,126 @@ describeIfLoopback("proxy websocket client disconnects", () => {
       await ctx.cleanup();
     }
   }, 20_000);
+});
+
+// --- R3 レビュー差し戻し: Host 形式の厳密化と upgrade 拒否時の切断 ---
+function rawExchange(
+  port: number,
+  request: string,
+  opts: { halfOpen?: boolean } = {}
+): Promise<{ status: number; socket: net.Socket }> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: "127.0.0.1", port, allowHalfOpen: opts.halfOpen ?? false });
+    let raw = "";
+    const timer = setTimeout(() => reject(new Error(`no response: ${raw}`)), 3000);
+    socket.on("error", reject);
+    socket.on("data", (chunk) => {
+      raw += chunk.toString("utf8");
+      const m = /^HTTP\/1\.[01] (\d{3})/.exec(raw);
+      if (m) {
+        clearTimeout(timer);
+        resolve({ status: Number(m[1]), socket });
+      }
+    });
+    socket.on("connect", () => socket.write(request));
+  });
+}
+
+async function withCountingUpstream(
+  fn: (proxy: ProxyHandle, counts: { requests: number; upgrades: number }) => Promise<void>
+) {
+  const counts = { requests: 0, upgrades: 0 };
+  const upstream = http.createServer((_req, res) => {
+    counts.requests++;
+    res.end("upstream-ok");
+  });
+  upstream.on("upgrade", (_req, socket) => {
+    counts.upgrades++;
+    socket.destroy();
+  });
+  const upPort = await listenOnFreePort(upstream, "127.0.0.1");
+  const proxy = await startProxy(upPort, await findFreePort(32_500));
+  try {
+    await fn(proxy, counts);
+  } finally {
+    await proxy.close();
+    await new Promise<void>((r) => upstream.close(() => r()));
+  }
+}
+
+describeIfLoopback("proxy Host validation and upgrade rejection", () => {
+  it.each(["EPIPE", "ECONNRESET"])("handles %s while writing a rejected upgrade", async (code) => {
+    await withCountingUpstream(async (proxy, counts) => {
+      const socket = Object.assign(new EventEmitter(), {
+        destroy: vi.fn(),
+        end: vi.fn(() => {
+          socket.emit("error", Object.assign(new Error(code), { code }));
+        }),
+      });
+      expect(() => proxy.server.emit(
+        "upgrade",
+        { headers: { host: "foo.localhost" } },
+        socket,
+        Buffer.alloc(0)
+      )).not.toThrow();
+      expect(socket.end).toHaveBeenCalledWith(expect.stringMatching(/^HTTP\/1\.1 403 /), expect.any(Function));
+      expect(socket.destroy).toHaveBeenCalled();
+      expect(counts).toEqual({ requests: 0, upgrades: 0 });
+    });
+  });
+
+  it.each(["request", "response"])("handles an HTTP %s error while sending a rejection", async (source) => {
+    await withCountingUpstream(async (proxy, counts) => {
+      const req = Object.assign(new EventEmitter(), { headers: { host: "foo.localhost" } });
+      const res = Object.assign(new EventEmitter(), {
+        destroy: vi.fn(),
+        writeHead: vi.fn(),
+        end: vi.fn(() => {
+          const emitter = source === "request" ? req : res;
+          emitter.emit("error", Object.assign(new Error("ECONNRESET"), { code: "ECONNRESET" }));
+        }),
+      });
+      expect(() => proxy.server.emit("request", req, res)).not.toThrow();
+      expect(res.writeHead).toHaveBeenCalledWith(403, expect.any(Object));
+      expect(res.destroy).toHaveBeenCalled();
+      expect(counts).toEqual({ requests: 0, upgrades: 0 });
+    });
+  });
+
+  it("rejects malformed loopback-looking Host on HTTP and upgrade", async () => {
+    await withCountingUpstream(async (proxy, counts) => {
+      for (const host of ["[::1]suffix", "localhost:abc", `[::1]x:${proxy.port}`]) {
+        const http1 = await rawExchange(proxy.port, `GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
+        http1.socket.destroy();
+        expect(http1.status, host).toBe(403);
+        const up = await rawExchange(
+          proxy.port,
+          `GET /ws HTTP/1.1\r\nHost: ${host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`
+        );
+        up.socket.destroy();
+        expect(up.status, host).toBe(403);
+      }
+      expect(counts).toEqual({ requests: 0, upgrades: 0 });
+    });
+  });
+
+  it("destroys a rejected upgrade socket even if the client never sends FIN", async () => {
+    await withCountingUpstream(async (proxy) => {
+      const up = await rawExchange(
+        proxy.port,
+        `GET /ws HTTP/1.1\r\nHost: attacker.example:${proxy.port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`,
+        { halfOpen: true }
+      );
+      expect(up.status).toBe(403);
+      try {
+        await sleep(300);
+        const open = await new Promise<number>((resolve, reject) =>
+          proxy.server.getConnections((err, n) => (err ? reject(err) : resolve(n)))
+        );
+        expect(open).toBe(0);
+      } finally {
+        up.socket.destroy();
+      }
+    });
+  });
 });
