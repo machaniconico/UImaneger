@@ -42,8 +42,11 @@ vi.mock("./components/BeforePreview.tsx", () => ({
 }));
 
 vi.mock("./components/AfterPreview.tsx", () => ({
-  AfterPreview: ({ reloadKey }: any) => (
-    <section aria-label="after-preview">reload-key:{reloadKey}</section>
+  AfterPreview: ({ info, reloadKey }: any) => (
+    <section aria-label="after-preview">
+      <span>reload-key:{reloadKey}</span>
+      <span>framework:{info?.framework ?? "none"}</span>
+    </section>
   ),
 }));
 
@@ -124,6 +127,8 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText("reload-key:0");
+    // プロジェクト情報の読込前に送ると HMR 判定が効かないため、読込を待つ
+    await screen.findByText(/^framework:(?!none)/);
     act(() => {
       window.dispatchEvent(new Event("uim:applied"));
     });
@@ -142,6 +147,8 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText("reload-key:0");
+    // プロジェクト情報の読込前に送ると HMR 判定が効かないため、読込を待つ
+    await screen.findByText(/^framework:(?!none)/);
     act(() => {
       window.dispatchEvent(new Event("uim:applied"));
     });
