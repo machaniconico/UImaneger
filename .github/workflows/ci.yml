@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node: ['22.18', '24']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -35,6 +35,8 @@ jobs:
             browsers: chromium firefox webkit
           - os: windows-latest
             browsers: chromium firefox
+          - os: macos-latest
+            browsers: chromium firefox webkit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -66,8 +68,12 @@ jobs:
             runtimes: node
           - os: ubuntu-latest
             runtimes: ruby,elixir
+          - os: windows-latest
+            runtimes: python,php,go,java,dotnet
+          - os: macos-latest
+            runtimes: node,python,go,java
     runs-on: ${{ matrix.os }}
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 35 }}
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 35 || 60 }}
     env:
       RUNTIME_MATRIX_REQUIRE: ${{ matrix.runtimes }}
     steps:
