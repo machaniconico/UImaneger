@@ -1,21 +1,26 @@
 // @vitest-environment node
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   api,
   __stores,
   isSafeGitRepoUrl,
   isTrustedRunCommandHost,
+  isLoopbackBindHost,
+  JSON_BODY_MAX_BYTES,
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
@@ -187,6 +192,22 @@ async function getJson<T = Record<string, unknown>>(
   };
 }
 
+async function postRaw<T = Record<string, unknown>>(
+  path: string,
+  body: string,
+  contentType = "application/json"
+): Promise<JsonResponse<T>> {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": contentType },
+    body,
+  });
+  return {
+    res,
+    body: (await res.json()) as T,
+  };
+}
+
 async function postSse(
   path: string,
   body: unknown
@@ -251,6 +272,37 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function gitAvailable(): boolean {
+  try {
+    return spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function runGit(args: string[], cwd = root): ReturnType<typeof spawnSync> {
+  return spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+      GIT_CONFIG_SYSTEM: process.platform === "win32" ? "NUL" : "/dev/null",
+    },
+  });
+}
+
+function initGitRepo(dir: string): boolean {
+  const commands = [
+    ["init"],
+    ["config", "user.name", "test"],
+    ["config", "user.email", "test@example.com"],
+    ["add", "."],
+    ["commit", "-m", "init"],
+  ];
+  return commands.every((args) => runGit(args, dir).status === 0);
+}
+
 beforeEach(async () => {
   resetFsPromiseMocks();
   claudeMock.complete.mockReset();
@@ -292,7 +344,7 @@ describe("project security helpers", () => {
   it("accepts only safe git clone URL formats", () => {
     expect(isSafeGitRepoUrl("https://github.com/example/repo.git")).toBe(true);
     expect(isSafeGitRepoUrl("ssh://git@github.com/example/repo.git")).toBe(true);
-    expect(isSafeGitRepoUrl("git://github.com/example/repo.git")).toBe(true);
+    expect(isSafeGitRepoUrl("git://github.com/example/repo.git")).toBe(false);
     expect(isSafeGitRepoUrl("git@github.com:example/repo.git")).toBe(true);
 
     expect(isSafeGitRepoUrl("ext::sh -c id")).toBe(false);
@@ -306,12 +358,70 @@ describe("project security helpers", () => {
     expect(isTrustedRunCommandHost("localhost")).toBe(true);
     expect(isTrustedRunCommandHost("localhost:5173")).toBe(true);
     expect(isTrustedRunCommandHost("127.0.0.1:8787")).toBe(true);
+    expect(isTrustedRunCommandHost("[::1]:8787")).toBe(true);
     expect(isTrustedRunCommandHost("app.localhost:8787")).toBe(true);
 
     expect(isTrustedRunCommandHost(undefined)).toBe(false);
     expect(isTrustedRunCommandHost("")).toBe(false);
     expect(isTrustedRunCommandHost("example.com")).toBe(false);
     expect(isTrustedRunCommandHost("localhost.example.com")).toBe(false);
+    expect(isTrustedRunCommandHost("[::1].example.com:8787")).toBe(false);
+  });
+
+  it("allows custom commands only when the server itself is loopback-bound", () => {
+    expect(isLoopbackBindHost(undefined)).toBe(true);
+    expect(isLoopbackBindHost("127.0.0.1")).toBe(true);
+    expect(isLoopbackBindHost("::1")).toBe(true);
+    expect(isLoopbackBindHost("0.0.0.0")).toBe(false);
+    expect(isLoopbackBindHost("192.168.1.10")).toBe(false);
+  });
+
+  it("rejects a custom command on a non-loopback bind even with a local Host header", async () => {
+    const previous = process.env.UIM_HOST;
+    process.env.UIM_HOST = "0.0.0.0";
+    try {
+      const result = await postJson<{ error: string }>(
+        "/api/project/open",
+        { path: root, runCommand: "npm run dev" },
+        { host: "localhost:5174" }
+      );
+      expect(result.res.status).toBe(403);
+      expect(result.body.error).toContain("ローカル");
+    } finally {
+      if (previous === undefined) delete process.env.UIM_HOST;
+      else process.env.UIM_HOST = previous;
+    }
+  });
+
+  it.each([
+    ["number", 42],
+    ["object", { command: "npm run dev" }],
+    ["empty", "   "],
+    ["multiline", "npm run dev\necho unsafe"],
+    ["oversized", "x".repeat(2_001)],
+  ])("rejects an invalid %s runCommand", async (_label, runCommand) => {
+    const result = await postJson<{ error: string }>("/api/project/open", {
+      path: root,
+      runCommand,
+    });
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toContain("runCommand");
+  });
+
+  it("rejects non-string and non-directory project paths", async () => {
+    const invalidType = await postJson<{ error: string }>("/api/project/open", {
+      path: 42,
+    });
+    expect(invalidType.res.status).toBe(400);
+    expect(invalidType.body.error).toContain("path");
+
+    const fileInsteadOfDirectory = await postJson<{ error: string }>(
+      "/api/project/open",
+      { path: filePath }
+    );
+    expect(fileInsteadOfDirectory.res.status).toBe(400);
+    expect(fileInsteadOfDirectory.body.error).toContain("ディレクトリ");
   });
 
   it("rejects unsafe clone URLs before invoking git", async () => {
@@ -354,9 +464,113 @@ describe("project security helpers", () => {
       "runCommand の実行にはローカルからのアクセスが必要です"
     );
   });
+
+  it("returns a JSON 400 for malformed JSON request bodies", async () => {
+    const result = await postRaw<{ error: string }>(
+      "/api/files/write",
+      "{not-json"
+    );
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe("JSON body が不正です");
+  });
+
+  it("returns a JSON 400 for non-object JSON request bodies", async () => {
+    const result = await postRaw<{ error: string }>(
+      "/api/files/write",
+      "null"
+    );
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe("JSON body はオブジェクトである必要があります");
+  });
+
+  it("returns a JSON 413 for oversized JSON request bodies", async () => {
+    const result = await postRaw<{ error: string }>(
+      "/api/files/write",
+      `{"content":"${"x".repeat(JSON_BODY_MAX_BYTES)}"}`
+    );
+
+    expect(result.res.status).toBe(413);
+    expect(result.body.error).toContain("JSON body が大きすぎます");
+  });
 });
 
 describe("edit proposal API", () => {
+  it("rejects non-string edit instructions", async () => {
+    const result = await postJson<{ error: string }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: { text: "change it" },
+    });
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toContain("文字列");
+    expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
+  it("passes the chosen edit model through candidate selection", async () => {
+    claudeMock.complete.mockResolvedValueOnce(editedContent);
+    const result = await postJson<{ ok: boolean }>("/api/edit/candidate", {
+      file: filePath,
+      line: 8,
+      descriptor: descriptorFor(filePath),
+      instruction: "Change it",
+      model: "claude-haiku-4-5",
+    });
+    expect(result.res.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+    expect(claudeMock.streamComplete).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ model: "claude-haiku-4-5" }),
+      undefined
+    );
+
+    const rejected = await postJson<{ error: string }>("/api/edit/candidate", {
+      file: filePath,
+      instruction: "Change it",
+      model: "gpt-unknown",
+    });
+    expect(rejected.res.status).toBe(400);
+    expect(rejected.body.error).toBe("許可されていないモデルです");
+  });
+
+  it("rejects invalid candidate line numbers", async () => {
+    const result = await postJson<{ error: string }>("/api/edit/candidate", {
+      file: filePath,
+      line: 0,
+      descriptor: descriptorFor(filePath),
+      instruction: "Change it",
+    });
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toContain("line");
+    expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit candidate selection for a non-authoring text hit", async () => {
+    const messagesFile = join(root, "src", "messages.json");
+    writeFileSync(messagesFile, '{ "cta": "LocaleOnlyCheckoutLabel" }', "utf8");
+
+    const { res, body } = await postJson<{
+      ok: false;
+      confidence: string;
+      candidates: { file: string }[];
+    }>("/api/edit", {
+      descriptor: {
+        tag: "button",
+        classes: [],
+        attrs: {},
+        textSnippet: "LocaleOnlyCheckoutLabel",
+        domPath: "button",
+      },
+      instruction: "Make it red.",
+    });
+
+    expect(res.status).toBe(200);
+    expect(body.ok).toBe(false);
+    expect(body.confidence).toBe("low");
+    expect(body.candidates[0]?.file).toBe(messagesFile);
+    expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
   it("returns the available edit models and server default", async () => {
     const originalEditModel = env.editModel;
     env.editModel = "claude-opus-4-8";
@@ -833,6 +1047,33 @@ describe("edit proposal API", () => {
       claudeMock.complete.mockResolvedValueOnce(editedContent);
       const { res, body } = await postJson<ProposalBody>("/api/edit", {
         descriptor: descriptorFor(beforeFile),
+        instruction: "Change the button label.",
+      });
+
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.file).toBe(filePath);
+      expect(body.relFile).toBe("src/App.tsx");
+    } finally {
+      getBeforeSpy.mockRestore();
+      rmSync(beforeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("remaps before-preview file URLs back to the real project root", async () => {
+    const beforeDir = mkdtempSync(join(tmpdir(), "uim-before-url-route-"));
+    const beforeFile = join(beforeDir, relative(root, filePath));
+    mkdirSync(dirname(beforeFile), { recursive: true });
+    writeFileSync(beforeFile, originalContent, "utf8");
+    const getBeforeSpy = vi.spyOn(state, "getBefore").mockReturnValue({
+      dir: beforeDir,
+      root,
+      mode: "snapshot",
+    });
+    try {
+      claudeMock.complete.mockResolvedValueOnce(editedContent);
+      const { res, body } = await postJson<ProposalBody>("/api/edit", {
+        descriptor: descriptorFor(pathToFileURL(beforeFile).href),
         instruction: "Change the button label.",
       });
 
@@ -1434,6 +1675,7 @@ describe("edit proposal API", () => {
 
   it("logs a structured server error line without leaking the API key", async () => {
     const previousKey = process.env.ANTHROPIC_API_KEY;
+    // nosemgrep: ajinabraham.njsscan.generic.hardcoded_secrets.node_api_key -- 伏せ字化の検証用ダミー値
     process.env.ANTHROPIC_API_KEY = "sk-ant-test-secret";
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -1486,6 +1728,49 @@ describe("edit proposal API", () => {
     );
     expect(read.res.status).toBe(200);
     expect(read.body.content).toBe("inside");
+  });
+
+  it("rejects reads and writes that escape the root through a symlink", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "uim-symlink-outside-"));
+    try {
+      writeFileSync(join(outside, "outside-target.txt"), "outside", "utf8");
+      try {
+        // Windows の一般ユーザーでも作れる junction を使う(POSIX では type は無視される)。
+        symlinkSync(outside, join(root, "src", "escape-dir"), "junction");
+        symlinkSync(join(outside, "outside-target.txt"), join(root, "src", "escape-file.txt"));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EPERM") return; // symlink 権限が無い環境
+        throw err;
+      }
+
+      const readViaFileLink = await getJson<{ error: string }>(
+        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-file.txt"))}`
+      );
+      expect(readViaFileLink.res.status).toBe(403);
+
+      const readViaDirLink = await getJson<{ error: string }>(
+        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-dir", "outside-target.txt"))}`
+      );
+      expect(readViaDirLink.res.status).toBe(403);
+
+      const writeViaDirLink = await postJson<{ error: string }>("/api/files/write", {
+        path: join(root, "src", "escape-dir", "planted.txt"),
+        content: "planted",
+      });
+      expect(writeViaDirLink.res.status).toBe(403);
+      expect(existsSync(join(outside, "planted.txt"))).toBe(false);
+
+      const writeViaFileLink = await postJson<{ error: string }>("/api/files/write", {
+        path: join(root, "src", "escape-file.txt"),
+        content: "overwritten",
+      });
+      expect(writeViaFileLink.res.status).toBe(403);
+      expect(readFileSync(join(outside, "outside-target.txt"), "utf8")).toBe("outside");
+    } finally {
+      rmSync(join(root, "src", "escape-dir"), { force: true });
+      rmSync(join(root, "src", "escape-file.txt"), { force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it("keeps the original file when atomic file replacement fails", async () => {
@@ -1572,4 +1857,158 @@ describe("edit proposal API", () => {
     expect("summary" in proposal.body).toBe(false);
     expect(__stores.proposalStore.size).toBe(0);
   });
+});
+
+describe("git API", () => {
+  it("rejects non-string commit messages", async () => {
+    const result = await postJson<{ error: string }>("/api/git/commit", {
+      message: 42,
+    });
+
+    expect(result.res.status).toBe(400);
+    expect(result.body.error).toBe(
+      "commit message は文字列である必要があります"
+    );
+  });
+
+  it("returns 409 when there is nothing to commit", async (ctx) => {
+    if (!gitAvailable() || !initGitRepo(root)) {
+      ctx.skip();
+      return;
+    }
+
+    const result = await postJson<{ error: string }>("/api/git/commit", {
+      message: "No changes",
+    });
+
+    expect(result.res.status).toBe(409);
+    expect(result.body.error).toBe("コミットする変更がありません");
+  }, 15_000);
+
+  it("commits working-tree changes after staging them", async (ctx) => {
+    if (!gitAvailable() || !initGitRepo(root)) {
+      ctx.skip();
+      return;
+    }
+    writeFileSync(filePath, editedContent, "utf8");
+
+    const result = await postJson<{ ok: true }>("/api/git/commit", {
+      message: "Apply edit",
+    });
+
+    expect(result.res.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+    expect(String(runGit(["log", "-1", "--pretty=%B"]).stdout).trim()).toBe(
+      "Apply edit"
+    );
+    expect(String(runGit(["status", "--porcelain"]).stdout).trim()).toBe("");
+  }, 15_000);
+});
+
+describe("project switch while a history write is in flight", () => {
+  it.each(["apply", "undo", "redo"] as const)(
+    "lets %s finish and record history before /project/open switches the root",
+    async (kind) => {
+      const proposal = await requestProposal();
+      if (kind !== "apply") {
+        await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+      }
+      if (kind === "redo") await postJson("/api/edit/undo", {});
+
+      const actualRename = fsPromisesMock.actual.rename;
+      const renameStarted = deferred();
+      const releaseRename = deferred();
+      let delayed = false;
+      fsPromisesMock.rename.mockImplementation(async (...args: any[]) => {
+        if (!delayed && String(args[1]) === filePath) {
+          delayed = true;
+          renameStarted.resolve();
+          await releaseRename.promise;
+        }
+        return actualRename(...args);
+      });
+
+      const oldRoot = root;
+      const oldFilePath = filePath;
+      const writePromise = postJson<{ ok?: boolean; error?: string }>(
+        kind === "apply" ? "/api/edit/apply" : `/api/edit/${kind}`,
+        kind === "apply" ? { proposalId: proposal.proposalId } : {}
+      );
+      await renameStarted.promise;
+
+      const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-switch-"));
+      mkdirSync(join(nextRoot, "src"), { recursive: true });
+      writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+      const openPromise = postJson<{ info?: { root: string } }>(
+        "/api/project/open",
+        { path: nextRoot, runCommand: "echo test-server-ready" },
+        { host: "localhost:5174" }
+      );
+      await delay(100);
+      // 書き込み完了前にルートが切り替わってはならない
+      const rootDuringWrite = state.getRoot();
+      releaseRename.resolve();
+      const result = await writePromise;
+      const opened = await openPromise;
+      expect(rootDuringWrite).toBe(oldRoot);
+      expect(result.res.status).toBe(200);
+      expect(result.body).toMatchObject({
+        ok: true,
+        undoDepth: kind === "undo" ? 0 : 1,
+      });
+      expect(readFileSync(oldFilePath, "utf8")).toBe(
+        kind === "undo" ? originalContent : editedContent
+      );
+
+      // "echo" は常駐しないので起動自体は失敗し得る。検証対象はルート切替の順序のみ
+      expect([200, 500]).toContain(opened.res.status);
+      expect(state.getRoot()).toBe(nextRoot);
+      root = nextRoot;
+      filePath = join(nextRoot, "src", "App.tsx");
+      rmSync(oldRoot, { recursive: true, force: true });
+    }
+  );
+});
+
+describe("internal error details", () => {
+  function eacces(path: string): Error {
+    return Object.assign(
+      new Error(`EACCES: permission denied, open '${path}'`),
+      { code: "EACCES", errno: -13, syscall: "open", path }
+    );
+  }
+
+  it.each(["/api/edit", "/api/edit/stream"] as const)(
+    "%s returns a classified message instead of the absolute path on EACCES",
+    async (route) => {
+      fsPromisesMock.readFile.mockImplementation(async (...args: any[]) => {
+        // 提案生成のバイト読み (encoding 指定なし) だけを失敗させる。resolver の utf8 読みは通す
+        if (String(args[0]) === filePath && args.length === 1) throw eacces(filePath);
+        return fsPromisesMock.actual.readFile(...args);
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const request = {
+          descriptor: descriptorFor(filePath),
+          instruction: "Change the button label.",
+        };
+        let error: unknown;
+        if (route === "/api/edit") {
+          const { body } = await postJson<{ error: string }>(route, request);
+          error = body.error;
+        } else {
+          const { events } = await postSse(route, request);
+          error = events.find((event) => event.type === "result")?.error;
+        }
+
+        expect(error).toEqual(expect.stringContaining("ソースファイルを読めませんでした"));
+        expect(String(error)).not.toContain(root);
+        expect(String(error)).not.toContain("EACCES");
+        const logged = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+        expect(logged).toContain("EACCES");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    }
+  );
 });

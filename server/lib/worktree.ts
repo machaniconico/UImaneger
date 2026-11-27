@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
-  mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, relative } from "node:path";
+import { buildChildEnv } from "./child-env.ts";
 
 export type GitMode = "worktree" | "snapshot" | "none";
 
@@ -66,7 +67,11 @@ function runGit(
   root: string,
   args: string[]
 ): { ok: boolean; out: string; err: string } {
-  const r = spawnSync("git", args, { cwd: root, encoding: "utf8" });
+  const r = spawnSync("git", args, {
+    cwd: root,
+    encoding: "utf8",
+    env: buildChildEnv(),
+  });
   return {
     ok: r.status === 0,
     out: (r.stdout ?? "").trim(),
@@ -121,7 +126,7 @@ function isPidAlive(pid: number): boolean {
 
 /**
  * 作業ツリー(root/node_modules)を dir/node_modules へ symlink する。
- * すでに存在する場合や symlink 失敗(Windows等)は何もしない。
+ * Windowsでは管理者権限を要求しにくいjunction、それ以外はdirectory symlinkを使う。
  */
 function linkNodeModules(root: string, dir: string): void {
   const rootNm = join(root, "node_modules");
@@ -129,7 +134,7 @@ function linkNodeModules(root: string, dir: string): void {
   const dirNm = join(dir, "node_modules");
   if (existsSync(dirNm)) return;
   try {
-    symlinkSync(rootNm, dirNm, "dir");
+    symlinkSync(rootNm, dirNm, process.platform === "win32" ? "junction" : "dir");
   } catch {
     // symlink 不可環境では静かに無視。before 起動時に install が必要になる可能性がある。
   }
@@ -139,16 +144,21 @@ function linkNodeModules(root: string, dir: string): void {
  * 編集前スナップショット配信用ディレクトリを準備する。
  * 例外は投げず、最悪でも mode='none' へ degrade する。
  */
+/** tmpdir 直下に uim-<kind>-<pid>-<time>-XXXXXX を排他的に作る。 */
+function makeTempDir(kind: "before" | "snap"): string {
+  return mkdtempSync(join(tmpdir(), `uim-${kind}-${process.pid}-${Date.now()}-`));
+}
+
 export function prepareBefore(root: string): BeforeHandle {
   const absRoot = resolve(root);
 
   // 1. worktree モード
   if (isGitRepo(absRoot) && hasHead(absRoot)) {
-    const wtDir = join(
-      tmpdir(),
-      `uim-before-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    );
+    let wtDir = "";
     try {
+      // mkdtemp で排他的に作る。予測可能な名前 + recursive mkdir だと、他者が先に
+      // 作ったディレクトリをそのまま使ってしまう。接頭辞は sweepStaleBeforeDirs の照合形式。
+      wtDir = makeTempDir("before");
       // --detach で HEAD を detach して checkout。HEAD 時点の読み取り専用
       // スナップショットとなり、作業ツリーの編集が before に波及しない。
       const r = runGit(absRoot, [
@@ -185,17 +195,15 @@ export function prepareBefore(root: string): BeforeHandle {
       runGit(absRoot, ["worktree", "remove", "--force", wtDir]);
       rmSync(wtDir, { recursive: true, force: true });
     } catch {
+      if (wtDir) rmSync(wtDir, { recursive: true, force: true });
       // fall through to snapshot
     }
   }
 
   // 2. snapshot モード: 作業ツリーをコピー
-  const snapDir = join(
-    tmpdir(),
-    `uim-snap-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  );
+  let snapDir = "";
   try {
-    mkdirSync(snapDir, { recursive: true });
+    snapDir = makeTempDir("snap");
     cpSync(absRoot, snapDir, {
       recursive: true,
       filter: (src: string) => {
@@ -214,7 +222,7 @@ export function prepareBefore(root: string): BeforeHandle {
     });
   } catch {
     try {
-      rmSync(snapDir, { recursive: true, force: true });
+      if (snapDir) rmSync(snapDir, { recursive: true, force: true });
     } catch {
       // ベストエフォート
     }

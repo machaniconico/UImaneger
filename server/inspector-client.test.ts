@@ -22,6 +22,7 @@ interface InspectorHelpers {
   describe: (el: Element) => InspectorPayload;
   isKeyboardCandidate: (el: Element) => boolean;
   getKeyboardCandidates: () => Element[];
+  eventElement: (event: Event) => Element | null;
 }
 
 interface PostedMessage {
@@ -209,6 +210,36 @@ describe("inspector-client helpers", () => {
 
     const payload = helpers.describe(doc.querySelector("#label")!);
     expect(payload.textSnippet).toBe("Hello World Again");
+  });
+
+  it("uses the innermost composed-path element inside open shadow DOM", () => {
+    const { helpers, doc } = loadInspector();
+    const host = doc.createElement("preview-card");
+    const shadow = host.attachShadow({ mode: "open" });
+    const button = doc.createElement("button");
+    button.textContent = "Shadow action";
+    shadow.appendChild(button);
+    doc.body.appendChild(host);
+
+    const event = {
+      target: host,
+      composedPath: () => [button, shadow, host, doc.body, doc, doc.defaultView],
+    } as unknown as Event;
+
+    expect(helpers.eventElement(event)).toBe(button);
+  });
+
+  it("includes visible controls in open shadow roots for keyboard selection", () => {
+    const { helpers, doc } = loadInspector();
+    const host = doc.createElement("preview-card");
+    const shadow = host.attachShadow({ mode: "open" });
+    const button = doc.createElement("button");
+    button.textContent = "Shadow action";
+    stubVisibleRect(button, 0);
+    shadow.appendChild(button);
+    doc.body.appendChild(host);
+
+    expect(helpers.getKeyboardCandidates()).toContain(button);
   });
 
   it("trusts only localhost-family origins", () => {

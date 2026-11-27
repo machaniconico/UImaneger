@@ -8,6 +8,8 @@ import type { ProjectInfo } from "../lib/types";
 
 vi.mock("../lib/api", () => ({
   api: { open: vi.fn(), clone: vi.fn(), stop: vi.fn(), status: vi.fn() },
+  getErrorMessage: (error: unknown) =>
+    error instanceof Error && error.message ? error.message : String(error),
 }));
 
 const runningInfo: ProjectInfo = {
@@ -59,7 +61,7 @@ describe("ProjectBar.stop()", () => {
     setup();
 
     expect(
-      screen.getByRole("textbox", { name: "ローカルパスまたはGitHub URL" })
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" })
     ).not.toBeNull();
   });
 
@@ -138,7 +140,7 @@ describe("ProjectBar.stop()", () => {
     const props = setup();
 
     await user.type(
-      screen.getByRole("textbox", { name: "ローカルパスまたはGitHub URL" }),
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" }),
       "/bad/project"
     );
     await user.click(screen.getByRole("button", { name: "開く" }));
@@ -160,7 +162,7 @@ describe("ProjectBar.stop()", () => {
     const props = setup();
 
     await user.type(
-      screen.getByRole("textbox", { name: "ローカルパスまたはGitHub URL" }),
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" }),
       "https://github.com/example/repo.git"
     );
     await user.click(screen.getByRole("button", { name: "Clone & 起動" }));
@@ -177,7 +179,7 @@ describe("ProjectBar.stop()", () => {
     vi.mocked(api.open).mockResolvedValue({ info: runningInfo });
     const props = setup({ info: null });
     const input = screen.getByRole("textbox", {
-      name: "ローカルパスまたはGitHub URL",
+      name: "ローカルパスまたはGitリポジトリURL",
     });
 
     fireEvent.change(input, { target: { value: "/demo/project" } });
@@ -188,9 +190,69 @@ describe("ProjectBar.stop()", () => {
 
     fireEvent.keyDown(input, { key: "Enter" });
 
-    await waitFor(() => expect(api.open).toHaveBeenCalledWith("/demo/project"));
+    await waitFor(() =>
+      expect(api.open).toHaveBeenCalledWith("/demo/project", undefined)
+    );
     expect(props.onInfo).toHaveBeenCalledWith(runningInfo);
     await waitFor(() => expect(props.setBusy).toHaveBeenLastCalledWith(false));
+  });
+
+  it("passes an optional run command through the normal UI flow", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.open).mockResolvedValue({ info: runningInfo });
+    setup({ info: null });
+
+    await user.type(
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" }),
+      "/demo/custom"
+    );
+    await user.type(
+      screen.getByRole("textbox", { name: "起動コマンド" }),
+      "cargo run"
+    );
+    await user.click(screen.getByRole("button", { name: "開く" }));
+
+    await waitFor(() =>
+      expect(api.open).toHaveBeenCalledWith("/demo/custom", "cargo run")
+    );
+  });
+
+  it.each([
+    "ssh://git@github.com/example/repo.git",
+    "git://github.com/example/repo.git",
+  ])("routes %s through the clone API", async (repo) => {
+    const user = userEvent.setup();
+    vi.mocked(api.clone).mockResolvedValue({ info: runningInfo });
+    setup({ info: null });
+
+    await user.type(
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" }),
+      repo
+    );
+    await user.click(screen.getByRole("button", { name: "Clone & 起動" }));
+
+    await waitFor(() => expect(api.clone).toHaveBeenCalledWith(repo, undefined));
+    expect(api.open).not.toHaveBeenCalled();
+  });
+
+  it("shows a dependency-install warning while retaining the opened project", async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.clone).mockResolvedValue({
+      info: runningInfo,
+      warning: "依存関係のインストールに失敗しました",
+    });
+    const props = setup({ info: null });
+
+    await user.type(
+      screen.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" }),
+      "https://github.com/example/repo.git"
+    );
+    await user.click(screen.getByRole("button", { name: "Clone & 起動" }));
+
+    await waitFor(() => expect(props.onInfo).toHaveBeenCalledWith(runningInfo));
+    expect(props.onError).toHaveBeenLastCalledWith(
+      "依存関係のインストールに失敗しました"
+    );
   });
 
   it("HTTP エラー時はサーバーの JP error を HTTP prefix なしで表示する", async () => {

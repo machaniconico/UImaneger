@@ -3,6 +3,9 @@ dist/
 .env
 .env.local
 *.log
+.tmp/
 .omc/
 .DS_Store
 /workspaces/
+/test-results/
+acceptance-report.json

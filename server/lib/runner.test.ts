@@ -1,11 +1,17 @@
 import { describe, it, expect, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  detectRunner,
   detectRunnerFromFacts,
   extractPort,
   extractPortForRunnerOutput,
   reduceDetectedPort,
+  splitOutputChunk,
   killGroup,
+  readFacts,
   type ProjectFacts,
 } from "./runner.ts";
 
@@ -22,6 +28,7 @@ function emptyFacts(over: Partial<ProjectFacts> = {}): ProjectFacts {
     hasRailsBin: false,
     hasManagePy: false,
     hasGoMod: false,
+    hasGoMain: false,
     hasComposerJson: false,
     hasArtisan: false,
     hasPublicIndexPhp: false,
@@ -88,6 +95,29 @@ describe("detectRunnerFromFacts — Node.js 系 FW 判別", () => {
     expect(plan.env?.PORT).toBe("3000");
     expect(plan.env?.BROWSER).toBe("none");
   });
+
+  it("detects modern React Router and respects pnpm", () => {
+    const plan = detectRunnerFromFacts(
+      nodeFacts(
+        { "@react-router/dev": "^7.0.0" },
+        { dev: "react-router dev" },
+        { packageManager: "pnpm" }
+      ),
+      5173
+    );
+    expect(plan.framework).toBe("React Router");
+    expect(plan.command).toBe("pnpm");
+    expect(plan.args).toEqual(["run", "dev"]);
+  });
+
+  it("detects modern Remix through @remix-run/dev", () => {
+    const plan = detectRunnerFromFacts(
+      nodeFacts({ "@remix-run/dev": "^2.0.0" }, { dev: "remix vite:dev" }),
+      5173
+    );
+    expect(plan.framework).toBe("Remix");
+    expect(plan.args).toEqual(["run", "dev"]);
+  });
 });
 
 describe("detectRunnerFromFacts — 非 Node プロジェクト判別", () => {
@@ -105,7 +135,8 @@ describe("detectRunnerFromFacts — 非 Node プロジェクト判別", () => {
       3000
     );
     expect(plan.framework).toBe("Rails");
-    expect(plan.command).toBe("bin/rails");
+    expect(plan.command).toBe("ruby");
+    expect(plan.args).toContain("bin/rails");
     expect(plan.args).toContain("-p");
   });
 
@@ -115,17 +146,241 @@ describe("detectRunnerFromFacts — 非 Node プロジェクト判別", () => {
     expect(plan.args).toContain("artisan");
   });
 
+  it("detects only a root Go main package as an executable server", () => {
+    const plan = detectRunnerFromFacts(
+      emptyFacts({ hasGoMod: true, hasGoMain: true }),
+      8080
+    );
+    expect(plan.framework).toBe("Go");
+    expect(plan.args).toEqual(["run", "."]);
+    expect(() =>
+      detectRunnerFromFacts(emptyFacts({ hasGoMod: true }), 8080)
+    ).toThrow(/runCommand/);
+  });
+
+  it("detects Spring Boot Maven and uses the repository wrapper", () => {
+    const plan = detectRunnerFromFacts(
+      emptyFacts({ hasSpringBootMaven: true, hasMavenWrapper: true }),
+      8080
+    );
+    expect(plan.framework).toBe("Spring Boot (Maven)");
+    expect(plan.command).toContain("mvnw");
+    expect(plan.args.join(" ")).toContain("server.port=8080");
+  });
+
+  it("detects Spring Boot Gradle and pins the server port", () => {
+    const plan = detectRunnerFromFacts(
+      emptyFacts({ hasSpringBootGradle: true, hasGradleWrapper: true }),
+      8081
+    );
+    expect(plan.framework).toBe("Spring Boot (Gradle)");
+    expect(plan.command).toContain("gradlew");
+    expect(plan.args.join(" ")).toContain("server.port=8081");
+  });
+
+  it("detects ASP.NET Core web projects", () => {
+    const plan = detectRunnerFromFacts(
+      emptyFacts({ aspNetProject: "WebApp.csproj" }),
+      5050
+    );
+    expect(plan.framework).toBe("ASP.NET Core");
+    expect(plan.command).toBe("dotnet");
+    expect(plan.args).toContain("WebApp.csproj");
+    expect(plan.env?.ASPNETCORE_URLS).toBe("http://127.0.0.1:5050");
+  });
+
+  it("detects Phoenix projects", () => {
+    const plan = detectRunnerFromFacts(emptyFacts({ hasPhoenix: true }), 4000);
+    expect(plan.framework).toBe("Phoenix");
+    expect(plan.command).toBe("mix");
+    expect(plan.args).toEqual(["phx.server"]);
+    expect(plan.env?.PORT).toBe("4000");
+  });
+
   it("detects static site via index.html", () => {
     const plan = detectRunnerFromFacts(emptyFacts({ hasIndexHtml: true }), 5000);
     expect(plan.framework).toBe("Static");
     expect(plan.knownPort).toBe(true);
-    expect(plan.args).toContain("serve");
+    expect(plan.command).toBe(process.execPath);
+    expect(plan.args.some((arg) => arg.endsWith("static-server.mjs"))).toBe(true);
   });
 
   it("throws a clear error when nothing is detected", () => {
     expect(() => detectRunnerFromFacts(emptyFacts(), 3000)).toThrow(
       /runCommand/
     );
+  });
+});
+
+describe("readFacts — backend project markers", () => {
+  it("prefers executable project Python in .venv, then venv, for Django", () => {
+    const root = mkdtempSync(join(tmpdir(), "uim-django-runner-"));
+    const [bin, executable] = process.platform === "win32"
+      ? ["Scripts", "python.exe"]
+      : ["bin", "python"];
+    const previousPath = process.env.PATH;
+    const fakeBin = mkdtempSync(join(tmpdir(), "uim-fake-bin-"));
+    try {
+      // ホストの PATH に依存しないよう、python だけがある PATH に固定する。
+      writeFileSync(join(fakeBin, "python"), "", { mode: 0o755 });
+      process.env.PATH = fakeBin;
+      writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+      expect(detectRunner(root, 8000).command).toBe("python");
+
+      const venv = join(root, "venv", bin);
+      const dotVenv = join(root, ".venv", bin);
+      const venvPython = join(venv, executable);
+      const dotVenvPython = join(dotVenv, executable);
+      mkdirSync(venv, { recursive: true });
+      mkdirSync(dotVenv, { recursive: true });
+      writeFileSync(venvPython, "", { mode: 0o755 });
+      mkdirSync(dotVenvPython);
+      expect(detectRunner(root, 8000).command).toBe(venvPython);
+
+      rmSync(dotVenvPython, { recursive: true });
+      writeFileSync(dotVenvPython, "", { mode: 0o755 });
+      expect(detectRunner(root, 8000).command).toBe(dotVenvPython);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(fakeBin, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "falls back to python3 when no venv exists and only python3 is on PATH",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "uim-django-python3-"));
+      const fakeBin = mkdtempSync(join(tmpdir(), "uim-fake-bin-"));
+      const previousPath = process.env.PATH;
+      try {
+        writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+        writeFileSync(join(fakeBin, "python3"), "", { mode: 0o755 });
+        process.env.PATH = fakeBin;
+        expect(detectRunner(root, 8000).command).toBe("python3");
+
+        // python が PATH にあればそれを優先する(実行権限のないファイルは数えない)
+        writeFileSync(join(fakeBin, "python"), "", { mode: 0o644 });
+        expect(detectRunner(root, 8000).command).toBe("python3");
+        chmodSync(join(fakeBin, "python"), 0o755);
+        expect(detectRunner(root, 8000).command).toBe("python");
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+        rmSync(fakeBin, { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "resolves empty and relative PATH entries against the project root",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "uim-django-relpath-"));
+      const previousPath = process.env.PATH;
+      try {
+        writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+        writeFileSync(join(root, "python3"), "", { mode: 0o755 });
+        process.env.PATH = ":/nonexistent";
+        expect(detectRunner(root, 8000).command).toBe("python3");
+        mkdirSync(join(root, "bin"));
+        rmSync(join(root, "python3"));
+        writeFileSync(join(root, "bin", "python3"), "", { mode: 0o755 });
+        process.env.PATH = "bin";
+        expect(detectRunner(root, 8000).command).toBe("python3");
+
+        // PATH 未定義は「既定パス」で、プロジェクト直下は探さない
+        delete process.env.PATH;
+        const hostHasPython = existsSync("/usr/bin/python") || existsSync("/bin/python");
+        const hostHasPython3 = existsSync("/usr/bin/python3") || existsSync("/bin/python3");
+        expect(detectRunner(root, 8000).command).toBe(
+          !hostHasPython && hostHasPython3 ? "python3" : "python"
+        );
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "skips non-executable and dangling venv interpreters",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "uim-django-badvenv-"));
+      const fakeBin = mkdtempSync(join(tmpdir(), "uim-fake-bin-"));
+      const previousPath = process.env.PATH;
+      try {
+        writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+        writeFileSync(join(fakeBin, "python"), "", { mode: 0o755 });
+        process.env.PATH = fakeBin;
+        mkdirSync(join(root, ".venv", "bin"), { recursive: true });
+        writeFileSync(join(root, ".venv", "bin", "python"), "", { mode: 0o644 });
+        mkdirSync(join(root, "venv", "bin"), { recursive: true });
+        symlinkSync(join(root, "missing-python"), join(root, "venv", "bin", "python"));
+        expect(detectRunner(root, 8000).command).toBe("python");
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+        rmSync(fakeBin, { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it("reads Spring Boot, ASP.NET Core, and Phoenix markers from project files", () => {
+    const root = mkdtempSync(join(tmpdir(), "uim-runner-facts-"));
+    try {
+      writeFileSync(
+        join(root, "pom.xml"),
+        "<dependency><artifactId>spring-boot-starter-web</artifactId></dependency>"
+      );
+      writeFileSync(
+        join(root, "build.gradle.kts"),
+        'plugins { id("org.springframework.boot") version "3.5.0" }'
+      );
+      writeFileSync(
+        join(root, "WebApp.csproj"),
+        '<Project Sdk="Microsoft.NET.Sdk.Web"></Project>'
+      );
+      writeFileSync(join(root, "mix.exs"), '{:phoenix, "~> 1.7"}');
+      writeFileSync(join(root, "mvnw.cmd"), "");
+      writeFileSync(join(root, "gradlew.bat"), "");
+
+      const facts = readFacts(root);
+      expect(facts.hasSpringBootMaven).toBe(true);
+      expect(facts.hasMavenWrapper).toBe(true);
+      expect(facts.hasSpringBootGradle).toBe(true);
+      expect(facts.hasGradleWrapper).toBe(true);
+      expect(facts.aspNetProject).toBe("WebApp.csproj");
+      expect(facts.hasPhoenix).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects generic manage.py and go.mod files without web entrypoints", () => {
+    const root = mkdtempSync(join(tmpdir(), "uim-runner-entrypoints-"));
+    try {
+      writeFileSync(join(root, "manage.py"), "print('maintenance helper')");
+      writeFileSync(join(root, "go.mod"), "module example.test/library\n");
+      writeFileSync(join(root, "library.go"), "package library\n");
+      let facts = readFacts(root);
+      expect(facts.hasManagePy).toBe(false);
+      expect(facts.hasGoMain).toBe(false);
+
+      writeFileSync(
+        join(root, "manage.py"),
+        "os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'app.settings')\nexecute_from_command_line(sys.argv)\n"
+      );
+      writeFileSync(join(root, "main.go"), "package main\nfunc main() {}\n");
+      facts = readFacts(root);
+      expect(facts.hasManagePy).toBe(true);
+      expect(facts.hasGoMain).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -162,12 +417,12 @@ describe("detectRunnerFromFacts — conflict priority", () => {
     expect(plan.framework).toBe("Next.js");
   });
 
-  it("prefers Node project detection over non-Node files", () => {
+  it("prefers a full-stack application server over its Vite asset server", () => {
     const plan = detectRunnerFromFacts(
       nodeFacts({ vite: "^5.0.0" }, {}, { hasGemfile: true, hasRailsBin: true }),
       5173
     );
-    expect(plan.framework).toBe("Vite");
+    expect(plan.framework).toBe("Rails");
   });
 
   it("prefers a Next dev script over a Vite dependency", () => {
@@ -235,6 +490,19 @@ describe("extractPort — 境界値", () => {
     expect(
       extractPort("Local: http://localhost:3000 also listening on :4000")
     ).toBe(3000);
+  });
+});
+
+describe("splitOutputChunk", () => {
+  it("reassembles a port log split across process chunks", () => {
+    const first = splitOutputChunk("", "Listening on http://localhost:30");
+    expect(first.lines).toEqual([]);
+    const second = splitOutputChunk(first.remainder, "80/\nready\n");
+    expect(second.lines).toEqual([
+      "Listening on http://localhost:3080/",
+      "ready",
+    ]);
+    expect(second.remainder).toBe("");
   });
 });
 
@@ -311,7 +579,7 @@ describe("reduceDetectedPort — 次ポート決定", () => {
 });
 
 describe("killGroup", () => {
-  it("sends SIGKILL to the process group even when the leader has already exited", async () => {
+  it("uses the platform process-tree shutdown path even when the leader has already exited", async () => {
     const proc = {
       pid: 12345,
       exitCode: 0,
@@ -323,8 +591,12 @@ describe("killGroup", () => {
     try {
       await killGroup(proc, { graceMs: 0 });
 
-      expect(killSpy).toHaveBeenCalledWith(-12345, "SIGTERM");
-      expect(killSpy).toHaveBeenCalledWith(-12345, "SIGKILL");
+      if (process.platform === "win32") {
+        expect(killSpy).not.toHaveBeenCalled();
+      } else {
+        expect(killSpy).toHaveBeenCalledWith(-12345, "SIGTERM");
+        expect(killSpy).toHaveBeenCalledWith(-12345, "SIGKILL");
+      }
       expect(proc.kill).not.toHaveBeenCalled();
     } finally {
       killSpy.mockRestore();

@@ -50,6 +50,7 @@ function emptyFacts(overrides = {}) {
     hasRailsBin: false,
     hasManagePy: false,
     hasGoMod: false,
+    hasGoMain: false,
     hasComposerJson: false,
     hasArtisan: false,
     hasPublicIndexPhp: false,
@@ -247,7 +248,10 @@ function nodeFacts(deps = {}, scripts = {}, extra = {}) {
   );
   eq("Rails framework", plan.framework, "Rails");
   eq("Rails knownPort", plan.knownPort, true);
-  ok("Rails uses bin/rails", plan.command === "bin/rails");
+  ok(
+    "Rails uses Ruby with bin/rails script",
+    plan.command === "ruby" && plan.args[0] === "bin/rails"
+  );
   ok("Rails server -p", plan.args.includes("-p"));
 }
 
@@ -265,13 +269,23 @@ function nodeFacts(deps = {}, scripts = {}, extra = {}) {
 // Go (PORT env, ポート固定不可)
 {
   const plan = detectRunnerFromFacts(
-    emptyFacts({ hasGoMod: true }),
+    emptyFacts({ hasGoMod: true, hasGoMain: true }),
     8080
   );
   eq("Go framework", plan.framework, "Go");
   eq("Go not knownPort", plan.knownPort, false);
   ok("Go sets PORT env", plan.env?.PORT === "8080");
   ok("Go uses go run", plan.args[0] === "run");
+}
+
+{
+  let rejected = false;
+  try {
+    detectRunnerFromFacts(emptyFacts({ hasGoMod: true }), 8080);
+  } catch {
+    rejected = true;
+  }
+  ok("Go library is not auto-started", rejected);
 }
 
 // Laravel (artisan serve)
@@ -285,16 +299,62 @@ function nodeFacts(deps = {}, scripts = {}, extra = {}) {
   ok("Laravel uses artisan serve", plan.args.includes("artisan"));
 }
 
-// PHP (composer.json + public/ で php -S)
+// Spring Boot (Maven wrapper)
 {
   const plan = detectRunnerFromFacts(
-    emptyFacts({ hasComposerJson: true, hasPublicDir: true }),
+    emptyFacts({ hasSpringBootMaven: true, hasMavenWrapper: true }),
+    8080
+  );
+  eq("Spring Boot Maven framework", plan.framework, "Spring Boot (Maven)");
+  ok("Spring Boot Maven wrapper", plan.command.includes("mvnw"));
+  ok("Spring Boot Maven port", plan.args.join(" ").includes("server.port=8080"));
+}
+
+// ASP.NET Core
+{
+  const plan = detectRunnerFromFacts(
+    emptyFacts({ aspNetProject: "WebApp.csproj" }),
+    5050
+  );
+  eq("ASP.NET Core framework", plan.framework, "ASP.NET Core");
+  ok("ASP.NET Core project", plan.args.includes("WebApp.csproj"));
+  ok(
+    "ASP.NET Core port",
+    plan.env?.ASPNETCORE_URLS === "http://127.0.0.1:5050"
+  );
+}
+
+// Phoenix
+{
+  const plan = detectRunnerFromFacts(
+    emptyFacts({ hasPhoenix: true }),
+    4000
+  );
+  eq("Phoenix framework", plan.framework, "Phoenix");
+  ok("Phoenix command", plan.command === "mix" && plan.args[0] === "phx.server");
+  ok("Phoenix port", plan.env?.PORT === "4000");
+}
+
+// PHP (public/index.php で php -S)
+{
+  const plan = detectRunnerFromFacts(
+    emptyFacts({ hasPublicIndexPhp: true, hasPublicDir: true }),
     8000
   );
   eq("PHP framework", plan.framework, "PHP");
   eq("PHP knownPort", plan.knownPort, true);
   ok("PHP uses -S", plan.args.includes("-S"));
   ok("PHP docroot public", plan.args.includes("public"));
+}
+
+{
+  let rejected = false;
+  try {
+    detectRunnerFromFacts(emptyFacts({ hasComposerJson: true }), 8000);
+  } catch {
+    rejected = true;
+  }
+  ok("Composer library is not auto-started", rejected);
 }
 
 // PHP (素の index.php, public なし)
@@ -315,7 +375,11 @@ function nodeFacts(deps = {}, scripts = {}, extra = {}) {
   );
   eq("Static framework", plan.framework, "Static");
   eq("Static knownPort", plan.knownPort, true);
-  ok("Static uses serve", plan.args.includes("serve"));
+  ok(
+    "Static uses bundled server",
+    plan.command === process.execPath &&
+      plan.args.some((arg) => arg.endsWith("static-server.mjs"))
+  );
 }
 
 // 汎用 node (dev script のみ, ポート固定不可)

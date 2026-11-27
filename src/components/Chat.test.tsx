@@ -27,6 +27,8 @@ vi.mock("../lib/api", () => ({
     redoEdit: vi.fn(),
     editHistory: vi.fn(),
   },
+  getErrorMessage: (error: unknown) =>
+    error instanceof Error && error.message ? error.message : String(error),
 }));
 
 const descriptor: DomDescriptor = {
@@ -444,7 +446,12 @@ describe("Chat", () => {
     // 候補クリック
     await user.click(screen.getByRole("button", { name: /const x = 1/ }));
 
-    expect(api.editCandidate).toHaveBeenCalledWith(candidate, descriptor, "赤くして");
+    expect(api.editCandidate).toHaveBeenCalledWith(
+      candidate,
+      descriptor,
+      "赤くして",
+      "claude-opus-4-8"
+    );
   });
 
   it("undo ボタンで api.undoEdit が呼ばれる", async () => {
@@ -615,6 +622,55 @@ describe("Chat", () => {
       (screen.getByRole("textbox", { name: "編集指示" }) as HTMLTextAreaElement)
         .value
     ).toBe("この文を保持");
+  });
+
+  it("別要素への指示が候補 (low) を返したら前の提案を破棄し、候補確定では新しい要素の descriptor を送る", async () => {
+    const user = userEvent.setup();
+    const candidate = { file: "src/Link.tsx", line: 3, preview: "<a id=\"link\">" };
+    vi.mocked(api.editStream)
+      .mockResolvedValueOnce(goodProposal({ proposalId: "a-1" }))
+      .mockResolvedValueOnce({ ok: false, confidence: "low", candidates: [candidate] });
+    vi.mocked(api.editCandidate).mockResolvedValue(goodProposal({ proposalId: "b-1" }));
+    const { rerender } = render(<Chat selected={descriptor} hasKey={true} />);
+
+    await sendInstruction(user, "赤くして");
+    await screen.findByText("+added line");
+    rerender(<Chat selected={otherDescriptor} hasKey={true} />);
+    await sendInstruction(user, "青くして");
+
+    expect(await screen.findByText(candidate.preview)).not.toBeNull();
+    expect(screen.queryByText("+added line")).toBeNull();
+    expect(screen.queryByRole("button", { name: "承認して適用" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: new RegExp(candidate.preview) }));
+    expect(api.editCandidate).toHaveBeenCalledWith(
+      candidate,
+      otherDescriptor,
+      "青くして",
+      "claude-opus-4-8"
+    );
+  });
+
+  it("候補確定の要求にも選択中の編集モデルを載せる", async () => {
+    const user = userEvent.setup();
+    const candidate = { file: "src/App.tsx", line: 10, preview: "const x = 1" };
+    vi.mocked(api.editStream).mockResolvedValue({ ok: false, candidates: [candidate] });
+    vi.mocked(api.editCandidate).mockResolvedValue(goodProposal({ proposalId: "p2" }));
+    render(<Chat selected={descriptor} hasKey={true} />);
+
+    await user.selectOptions(
+      await screen.findByRole("combobox", { name: "編集モデル" }),
+      "claude-haiku-4-5"
+    );
+    await sendInstruction(user, "赤くして");
+    await user.click(await screen.findByRole("button", { name: /const x = 1/ }));
+
+    expect(api.editCandidate).toHaveBeenCalledWith(
+      candidate,
+      descriptor,
+      "赤くして",
+      "claude-haiku-4-5"
+    );
   });
 
   it("選択要素が変わっても保留中提案は生成時 descriptor を参照し、不一致ヒントを表示する", async () => {

@@ -1,0 +1,8 @@
+# gitleaks 設定: 既定ルールを使い、検証済みの誤検知だけを許可する。
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "RFC 6455 §1.3 のサンプル Sec-WebSocket-Key(WebSocket upgrade テスト用の公開値)"
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']

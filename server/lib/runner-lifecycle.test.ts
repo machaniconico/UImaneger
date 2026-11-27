@@ -3,14 +3,17 @@
 // 実プロセス・実ポートを使う node 環境テスト。jsdom 不要。
 import { describe, it, expect } from "vitest";
 import http from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   isListening,
   findFreePort,
   startTarget,
+  TargetStartupError,
   sleep,
+  killGroup,
   killAllChildrenSync,
 } from "./runner.ts";
 
@@ -188,8 +191,11 @@ describe("startTarget", () => {
       );
       process.env.PATH = join(tmp, "missing-bin");
 
+      const port = await findFreePort(30_000);
       const start = Date.now();
-      await expect(startTarget(tmp, 3000)).rejects.toThrow(/起動できません/);
+      await expect(startTarget(tmp, port)).rejects.toThrow(
+        /(起動できません|起動に失敗)/
+      );
       const elapsed = Date.now() - start;
       expect(elapsed).toBeLessThan(10_000);
     } finally {
@@ -203,13 +209,265 @@ describe("startTarget", () => {
     }
   }, 20_000);
 
-  itIfLoopback("killAllChildrenSync kills a live detached target registered by startTarget", async () => {
+  it.skipIf(!hasLoopback || process.platform === "win32")(
+    "stops a surviving process group when the target exits before readiness",
+    async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "uim-runner-early-exit-"));
+      const childInfo = join(tmp, "child.json");
+      writeFileSync(join(tmp, "launcher.cjs"), `
+        const child = require("node:child_process").fork("server.cjs");
+        child.on("message", (port) => {
+          require("node:fs").writeFileSync("child.json", JSON.stringify({ pid: child.pid, port }));
+          process.exit(42);
+        });
+      `);
+      writeFileSync(join(tmp, "server.cjs"), `
+        const server = require("node:http").createServer();
+        server.listen(0, "127.0.0.1", () => process.send(server.address().port));
+      `);
+      try {
+        await expect(startTarget(tmp, 0, { command: "exec node launcher.cjs" }))
+          .rejects.toThrow(TargetStartupError);
+        const { port } = JSON.parse(readFileSync(childInfo, "utf8"));
+        expect(await waitUntilFalse(() => isListening(port), 3_000)).toBe(true);
+      } catch (error) {
+        try {
+          const { pid } = JSON.parse(readFileSync(childInfo, "utf8"));
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // 子が作成される前に失敗したか、既に停止している。
+        }
+        throw error;
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+    15_000
+  );
+
+  itIfLoopback("starts an auto-detected Vite target through the platform command shim", async () => {
+    const root = join(process.cwd(), "examples", "sample-app");
+    const port = await findFreePort(30_100);
+    const target = await startTarget(root, port);
+    try {
+      const host = target.host === "::1" ? "[::1]" : target.host ?? "127.0.0.1";
+      const response = await fetch(`http://${host}:${target.port}`);
+      expect(response.status).toBe(200);
+      expect(target.plan.framework).toBe("Vite");
+    } finally {
+      await killGroup(target.proc);
+    }
+  }, 30_000);
+
+  itIfLoopback("accepts a generic server that listens on PORT without logging it", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-silent-"));
+    const port = await findFreePort(30_200);
+    writeFileSync(
+      join(tmp, "package.json"),
+      JSON.stringify({ scripts: { dev: "node silent-server.cjs" } })
+    );
+    writeFileSync(
+      join(tmp, "silent-server.cjs"),
+      [
+        'const http = require("node:http");',
+        "const server = http.createServer((_req, res) => res.end('ok'));",
+        'server.listen(Number(process.env.PORT), "127.0.0.1");',
+      ].join("\n")
+    );
+
+    let target;
+    try {
+      target = await startTarget(tmp, port);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("ok");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  itIfLoopback("discovers the port logged by npm run dev", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-logged-"));
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        const server = http.createServer((_req, res) => res.end("logged port"));
+        server.listen(0, "127.0.0.1", () => console.log("Listening on " + server.address().port));
+      `);
+      target = await startTarget(tmp, 0);
+      expect(target.logs).toContain(`Listening on ${target.port}`);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("logged port");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("does not lock onto a transient IPv4 listener before the real IPv6 bind", async (ctx) => {
+    // Vite は起動中に 127.0.0.1 で一時的に listen してから本番を localhost(Windows では ::1)に bind することがある。
+    // 最初の接続を受けた瞬間に IPv4 を閉じて ::1 に移るサーバで、その競合を決定的に再現する。
+    const probe = net.createServer();
+    const ipv6 = await new Promise<boolean>((resolve) => {
+      probe.once("error", () => resolve(false));
+      probe.listen(0, "::1", () => probe.close(() => resolve(true)));
+    });
+    if (!ipv6) {
+      ctx.skip();
+      return;
+    }
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-transient-"));
+    const port = await findFreePort(30_250);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        const port = Number(process.env.PORT);
+        const transient = require("node:net").createServer((socket) => {
+          socket.destroy();
+          transient.close(() => {
+            http.createServer((_req, res) => res.end("real ipv6")).listen(port, "::1");
+          });
+        });
+        transient.listen(port, "127.0.0.1");
+      `);
+      target = await startTarget(tmp, port);
+      expect(target.host).toBe("::1");
+      const response = await fetch(`http://[::1]:${target.port}`);
+      expect(await response.text()).toBe("real ipv6");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("switches to the port logged after an early listener on the requested port", async () => {
+    // 要求 port で先に listen したまま、別 port で本番を立ててログに出すサーバ。ログの port を優先する。
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-switch-"));
+    const port = await findFreePort(30_270);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        // 要求 port への最初の接続(= 起動確認の probe)を受けてから本番を立てる。
+        let started = false;
+        const early = http.createServer((_req, res) => res.end("early"));
+        early.on("connection", () => {
+          if (started) return;
+          started = true;
+          const real = http.createServer((_req, res) => res.end("real")).listen(0, "127.0.0.1", () => {
+            console.log("Listening on " + real.address().port);
+          });
+        });
+        early.listen(Number(process.env.PORT), "127.0.0.1");
+      `);
+      target = await startTarget(tmp, port);
+      expect(target.port).not.toBe(port);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("real");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("falls back to the requested port when the logged port never listens", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-fallback-"));
+    const port = await findFreePort(30_290);
+    const unused = await findFreePort(port + 1);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        http.createServer((_req, res) => res.end("requested")).listen(Number(process.env.PORT), "127.0.0.1", () => {
+          console.log("Listening on ${unused}");
+        });
+      `);
+      const started = Date.now();
+      target = await startTarget(tmp, port);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(target.port).toBe(port);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("requested");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("switches to the logged port when it starts listening between polls", async () => {
+    // 先に別 port をログに出し(まだ未 listen)、要求 port への最初の probe を契機にその port を立てる。
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-late-"));
+    const port = await findFreePort(30_310);
+    const logged = await findFreePort(port + 1);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        console.log("Listening on ${logged}");
+        let started = false;
+        const requested = http.createServer((_req, res) => res.end("requested"));
+        requested.on("connection", () => {
+          if (started) return;
+          started = true;
+          http.createServer((_req, res) => res.end("real")).listen(${logged}, "127.0.0.1");
+        });
+        requested.listen(Number(process.env.PORT), "127.0.0.1");
+      `);
+      target = await startTarget(tmp, port);
+      expect(target.port).toBe(logged);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("real");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("serves static projects without downloading an external package", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-static-"));
+    writeFileSync(join(tmp, "index.html"), "<!doctype html><h1>Static preview</h1>");
+    writeFileSync(join(tmp, ".env"), "SECRET=not-for-http");
+    const port = await findFreePort(30_300);
+    const target = await startTarget(tmp, port);
+    try {
+      const host = target.host === "::1" ? "[::1]" : target.host ?? "127.0.0.1";
+      const response = await fetch(`http://${host}:${target.port}/`);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("Static preview");
+      expect((await fetch(`http://${host}:${target.port}/.env`)).status).toBe(404);
+      expect(target.plan.command).toBe(process.execPath);
+    } finally {
+      await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  itIfLoopback("killAllChildrenSync kills a live target registered by startTarget", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "uim-runner-live-"));
     try {
-      const target = await startTarget(tmp, 0, {
-        command:
-          "node -e \"require('http').createServer((_req,res)=>res.end('ok')).listen(0,'127.0.0.1',function(){console.log('Listening on '+this.address().port)})\"",
+      writeFileSync(
+        join(tmp, "live-server.cjs"),
+        [
+          "const http = require('node:http');",
+          "const port = Number(process.env.PORT);",
+          "http.createServer((_req, res) => res.end('ok')).listen(port, '127.0.0.1', function () {",
+          "  console.log('Listening on ' + this.address().port);",
+          "});",
+          "",
+        ].join("\n")
+      );
+      const port = await findFreePort(6200);
+      const target = await startTarget(tmp, port, {
+        command: "node live-server.cjs",
       });
+      expect(target.port).toBe(port);
       expect(await isListening(target.port)).toBe(true);
 
       killAllChildrenSync();

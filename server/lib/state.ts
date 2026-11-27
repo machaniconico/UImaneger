@@ -46,6 +46,10 @@ let session: Session | null = null;
 // 世代カウンタ/kill-on-supersede は使わず、単純な直列化で競合を排除する。
 let lifecycle: Promise<unknown> = Promise.resolve();
 
+function formatRunCommand(plan: { command: string; args: string[] }): string {
+  return [plan.command, ...plan.args].join(" ").trim();
+}
+
 function withLock<T>(fn: () => Promise<T>): Promise<T> {
   const run = lifecycle.then(fn, fn);
   // チェーンは成功/失敗どちらでも消化して次を詰まらせない
@@ -71,7 +75,7 @@ async function _openProject(
   session = {
     root,
     framework: plan.framework,
-    runCommand: `${plan.command} ${plan.args.join(" ")}`,
+    runCommand: formatRunCommand(plan),
     overrideCommand: override?.command ?? null,
     before: null,
     targetBefore: null,
@@ -132,9 +136,7 @@ async function _startProject(): Promise<ProjectInfo> {
   session.target = targetAfter; // legacy alias
   session.framework = targetAfter.plan.framework;
   if (!session.overrideCommand) {
-    session.runCommand = `${targetAfter.plan.command} ${targetAfter.plan.args.join(
-      " "
-    )}`;
+    session.runCommand = formatRunCommand(targetAfter.plan);
   }
 
   // --- before (HEAD/snapshot) 起動 ---
@@ -161,7 +163,11 @@ async function _startProject(): Promise<ProjectInfo> {
 
   // --- プロキシ起動: after ---
   const afterProxyPort = await findFreePort(6100);
-  session.proxyAfter = await startProxy(targetAfter.port, afterProxyPort);
+  session.proxyAfter = await startProxy(
+    targetAfter.port,
+    afterProxyPort,
+    targetAfter.host
+  );
   session.proxy = session.proxyAfter; // legacy alias
 
   // --- プロキシ起動: before ---
@@ -172,7 +178,8 @@ async function _startProject(): Promise<ProjectInfo> {
       const beforeProxyPort = await findFreePort(6110);
       session.proxyBefore = await startProxy(
         session.targetBefore.port,
-        beforeProxyPort
+        beforeProxyPort,
+        session.targetBefore.host
       );
     } catch (e) {
       console.warn("[UImaneger] before proxy 起動失敗:", e);

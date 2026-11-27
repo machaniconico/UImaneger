@@ -2,6 +2,7 @@ import { afterEach, describe, it, expect } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   __resolverTestHooks,
   isGenericClass,
@@ -194,6 +195,22 @@ describe("buildTerms — CJK / 通常テキストの基本ケース", () => {
       "classSpecific",
     ]);
   });
+
+  it("uses stable attributes, inspector hints, and Vue component names", () => {
+    const terms = buildTerms(
+      mkD({
+        attrs: { "data-testid": "billing-submit", "aria-label": "Pay now" },
+        hints: { "data-component": "CheckoutAction" },
+        vue: { framework: "vue3", name: "CheckoutButton" },
+      })
+    );
+    const byTerm = new Map(terms.map((t) => [t.term, t.kind]));
+
+    expect(byTerm.get("billing-submit")).toBe("attribute");
+    expect(byTerm.get("Pay now")).toBe("attribute");
+    expect(byTerm.get("CheckoutAction")).toBe("attribute");
+    expect(byTerm.get("CheckoutButton")).toBe("component");
+  });
 });
 
 describe("splitWords — CJK は短くても残す", () => {
@@ -370,7 +387,7 @@ describe("resolveSource Layer-B integration", () => {
     await run();
   });
 
-  it("keeps a single rare hit in a non-authoring file at medium confidence", async () => {
+  it("requires confirmation for a single rare hit in a non-authoring file", async () => {
     const root = await fixture({
       "src/messages.json": '{ "cta": "OnlyInLocaleBundle" }',
     });
@@ -381,7 +398,42 @@ describe("resolveSource Layer-B integration", () => {
     );
 
     expect(result.file).toBe(join(root, "src/messages.json"));
-    expect(result.confidence).toBe("medium");
+    expect(result.confidence).toBe("low");
+  });
+
+  it("accepts project-relative and file URL source metadata as high confidence", async () => {
+    const root = await fixture({
+      "src/SourcePath.tsx": "export const SourcePath = () => <button>Path</button>;",
+    });
+    const file = join(root, "src/SourcePath.tsx");
+
+    const viteFsUrl = `http://localhost:5173/@fs/${file.replace(/\\/g, "/")}`;
+    for (const fileName of [
+      "/src/SourcePath.tsx",
+      pathToFileURL(file).href,
+      "webpack:///./src/SourcePath.tsx",
+      viteFsUrl,
+    ]) {
+      const result = await resolveSource(
+        root,
+        mkD({ source: { fileName, lineNumber: 1 } })
+      );
+      expect(result).toMatchObject({ file, line: 1, confidence: "high" });
+    }
+  });
+
+  it("treats server-rendered templates as authoring files", async () => {
+    const root = await fixture({
+      "Views/Home/Index.cshtml": '<button data-testid="checkout-action">Checkout</button>',
+    });
+
+    const result = await resolveSource(
+      root,
+      mkD({ attrs: { "data-testid": "checkout-action" } })
+    );
+
+    expect(result.file).toBe(join(root, "Views/Home/Index.cshtml"));
+    expect(result.confidence).toBe("high");
   });
 
   it("downgrades an out-of-range layer-A source line and verifies through candidates", async () => {

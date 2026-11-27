@@ -1,32 +1,12 @@
 import { serve } from "@hono/node-server";
-import { serveStatic } from "@hono/node-server/serve-static";
-import { Hono } from "hono";
-import { logger } from "hono/logger";
-import { existsSync } from "node:fs";
 import { env } from "./lib/env.ts";
-import { api } from "./routes/api.ts";
 import { stopProject } from "./lib/state.ts";
 import { killAllChildrenSync } from "./lib/runner.ts";
 import { cleanupAllBefore, sweepStaleBeforeDirs } from "./lib/worktree.ts";
-import { securityMiddleware } from "./middleware/security.ts";
+import { createApp, resolveSecurityPorts } from "./app.ts";
+import { allowedApiOrigins } from "./middleware/security.ts";
 
-const app = new Hono();
-
-app.get("/health", (c) => c.text("ok"));
-app.use("/api/*", logger());
-app.use("/api/*", securityMiddleware);
-app.route("/api", api);
-
-if (process.env.NODE_ENV === "production" && existsSync("dist")) {
-  const staticFiles = serveStatic({ root: "./dist" });
-  app.use("*", async (c, next) => {
-    const path = c.req.path;
-    if (path === "/api" || path.startsWith("/api/")) {
-      return next();
-    }
-    return staticFiles(c, next);
-  });
-}
+const app = createApp();
 
 sweepStaleBeforeDirs();
 
@@ -36,6 +16,8 @@ const server = serve(
   { fetch: app.fetch, hostname: bindHost, port: env.serverPort },
   (info) => {
     console.log(`[UImaneger] server listening on http://${bindHost}:${info.port}`);
+    const origins = allowedApiOrigins(resolveSecurityPorts());
+    console.log(`[UImaneger] 許可 Origin: ${origins.join(", ")}`);
     if (!env.anthropicKey) {
       console.log(
         "[UImaneger] 注意: ANTHROPIC_API_KEY 未設定。編集機能には .env が必要です。"

@@ -461,10 +461,19 @@
       "svg",
       "canvas",
     ].join(",");
-    return Array.prototype.filter.call(
-      document.body.querySelectorAll(selector),
-      isKeyboardCandidate
-    );
+    var out = [];
+    function collect(root) {
+      var matches = root.querySelectorAll(selector);
+      for (var i = 0; i < matches.length; i++) {
+        if (isKeyboardCandidate(matches[i])) out.push(matches[i]);
+      }
+      var elements = root.querySelectorAll("*");
+      for (var j = 0; j < elements.length; j++) {
+        if (elements[j].shadowRoot) collect(elements[j].shadowRoot);
+      }
+    }
+    collect(document.body);
+    return out;
   }
 
   function revealKeyboardCandidate(el) {
@@ -506,9 +515,21 @@
     }
   }
 
+  function eventElement(e) {
+    try {
+      var path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      for (var i = 0; i < path.length; i++) {
+        var node = path[i];
+        if (node && node.nodeType === 1 && node !== overlay) return node;
+      }
+    } catch (err) {}
+    var target = e && e.target;
+    return target && target.nodeType === 1 && target !== overlay ? target : null;
+  }
+
   function onMove(e) {
     if (!enabled) return;
-    var el = e.target;
+    var el = eventElement(e);
     if (!el || el === overlay) return;
     setCurrentEl(el);
     // rAF スロットル: mousemove 毎の getBoundingClientRect(強制レイアウト)を防ぐ
@@ -519,7 +540,7 @@
     if (!enabled) return;
     e.preventDefault();
     e.stopPropagation();
-    selectElement(e.target);
+    selectElement(eventElement(e));
     return false;
   }
 
@@ -599,6 +620,7 @@
       describe: describe,
       isKeyboardCandidate: isKeyboardCandidate,
       getKeyboardCandidates: getKeyboardCandidates,
+      eventElement: eventElement,
     };
   }
 

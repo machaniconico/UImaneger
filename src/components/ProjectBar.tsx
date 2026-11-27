@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ProjectInfo } from "../lib/types.ts";
-import { api } from "../lib/api.ts";
+import { api, getErrorMessage } from "../lib/api.ts";
 
 interface Props {
   info: ProjectInfo | null;
@@ -24,8 +24,9 @@ export function ProjectBar({
   setSelectMode,
 }: Props) {
   const [value, setValue] = useState("");
+  const [runCommand, setRunCommand] = useState("");
 
-  const isRepo = /^(https?:\/\/|git@)/.test(value.trim());
+  const isRepo = /^(https?:\/\/|ssh:\/\/|git:\/\/|git@)/.test(value.trim());
 
   async function reconcileInfo() {
     try {
@@ -42,15 +43,23 @@ export function ProjectBar({
     setBusy(true);
     onError("");
     try {
-      const res = isRepo ? await api.clone(v) : await api.open(v);
+      const command = runCommand.trim() || undefined;
+      const res = isRepo
+        ? await api.clone(v, command)
+        : await api.open(v, command);
       if (res.error) {
         onError(res.error);
         await reconcileInfo();
       } else {
         onInfo(res.info ?? null);
+        const warning =
+          "warning" in res && typeof res.warning === "string"
+            ? res.warning
+            : undefined;
+        if (warning) onError(warning);
       }
-    } catch (e: any) {
-      onError(String(e.message || e));
+    } catch (e) {
+      onError(getErrorMessage(e));
       await reconcileInfo();
     } finally {
       setBusy(false);
@@ -64,8 +73,8 @@ export function ProjectBar({
     try {
       const res = await api.stop();
       onInfo(res.info);
-    } catch (e: any) {
-      onError(String(e.message || e));
+    } catch (e) {
+      onError(getErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -104,8 +113,8 @@ export function ProjectBar({
             if (e.nativeEvent.isComposing || e.keyCode === 229) return;
             if (e.key === "Enter") openOrClone();
           }}
-          aria-label="ローカルパスまたはGitHub URL"
-          placeholder="ローカルパス または GitHub URL"
+          aria-label="ローカルパスまたはGitリポジトリURL"
+          placeholder="ローカルパス または GitリポジトリURL"
           className="min-w-0 flex-1 bg-transparent px-2.5 py-1.5 text-xs text-neutral-200 placeholder:text-neutral-500"
         />
         <button
@@ -116,6 +125,23 @@ export function ProjectBar({
           {busy ? "起動中…" : isRepo ? "Clone & 起動" : "開く"}
         </button>
       </div>
+      <details className="group border-t border-neutral-800 pt-2">
+        <summary className="cursor-pointer select-none text-xs text-neutral-400 hover:text-neutral-200">
+          起動設定
+        </summary>
+        <label className="mt-2 flex flex-col gap-1 text-xs text-neutral-400">
+          起動コマンド
+          <input
+            value={runCommand}
+            onChange={(e) => setRunCommand(e.target.value)}
+            aria-label="起動コマンド"
+            autoComplete="off"
+            spellCheck={false}
+            placeholder="例: npm run dev"
+            className="w-full rounded-lg border border-neutral-700 bg-raised px-2.5 py-1.5 font-mono text-xs text-neutral-200 placeholder:text-neutral-500 outline-none focus:border-accent-500"
+          />
+        </label>
+      </details>
 
       {info?.running && (
         <>

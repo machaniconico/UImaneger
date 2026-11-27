@@ -1,7 +1,16 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { delimiter, join, resolve } from "node:path";
 import net from "node:net";
+import { fileURLToPath } from "node:url";
+import { buildChildEnv } from "./child-env.ts";
+import {
+  detectPackageManager,
+  packageBinaryPlan,
+  packageScriptPlan,
+  prepareCommandInvocation,
+  type PackageManagerName,
+} from "./package-manager.ts";
 
 export interface RunnerPlan {
   framework: string;
@@ -10,6 +19,7 @@ export interface RunnerPlan {
   /** ポートをコマンド側で固定できるか (false の場合は stdout から検出) */
   knownPort: boolean;
   env?: Record<string, string>;
+  shell?: boolean;
 }
 
 /**
@@ -18,6 +28,7 @@ export interface RunnerPlan {
  */
 export interface ProjectFacts {
   hasPackageJson: boolean;
+  packageManager?: PackageManagerName;
   dependencies: Record<string, string>;
   devDependencies: Record<string, string>;
   scripts: Record<string, string>;
@@ -27,7 +38,9 @@ export interface ProjectFacts {
   hasGemfile: boolean;
   hasRailsBin: boolean;
   hasManagePy: boolean;
+  djangoPython?: string;
   hasGoMod: boolean;
+  hasGoMain: boolean;
   hasComposerJson: boolean;
   hasArtisan: boolean;
   hasPublicIndexPhp: boolean;
@@ -39,23 +52,137 @@ export interface ProjectFacts {
   hasNuxtConfig: boolean;
   hasVueConfig: boolean;
   hasRemixConfig: boolean;
+  hasReactRouterConfig?: boolean;
+  hasSpringBootMaven?: boolean;
+  hasMavenWrapper?: boolean;
+  hasSpringBootGradle?: boolean;
+  hasGradleWrapper?: boolean;
+  aspNetProject?: string;
+  hasPhoenix?: boolean;
 }
+
+const STATIC_SERVER_PATH = fileURLToPath(
+  new URL("../static-server.mjs", import.meta.url)
+);
 
 /**
  * プロジェクトの起動方法を純粋関数として検出する。
  * ファイルシステムアクセスを行わないため scripts/runner-selftest.mjs で単体テスト可能。
- * 依存 → dev script ヒューリスティック → 非Node ファイル存在 の順で判定。
+ * 強いアプリサーバ指標 → Node依存/dev script → 汎用ファイル指標の順で判定。
  */
 export function detectRunnerFromFacts(
   facts: ProjectFacts,
   port: number
 ): RunnerPlan {
+  // Rails/Laravel/Django等はフロントエンド用package.jsonも持つため、
+  // アプリサーバの強い指標をNodeのアセットサーバより優先する。
+  if (facts.hasGemfile && facts.hasRailsBin) {
+    return {
+      framework: "Rails",
+      command: "ruby",
+      args: ["bin/rails", "server", "-p", String(port)],
+      knownPort: true,
+    };
+  }
+  if (facts.hasManagePy) {
+    return {
+      framework: "Django",
+      command: facts.djangoPython ?? "python",
+      args: ["manage.py", "runserver", String(port)],
+      knownPort: true,
+    };
+  }
+  if (facts.hasArtisan) {
+    return {
+      framework: "Laravel",
+      command: "php",
+      args: ["artisan", "serve", "--port", String(port)],
+      knownPort: true,
+    };
+  }
+  if (facts.hasSpringBootMaven) {
+    return {
+      framework: "Spring Boot (Maven)",
+      command: facts.hasMavenWrapper
+        ? process.platform === "win32"
+          ? "mvnw.cmd"
+          : "./mvnw"
+        : "mvn",
+      args: [
+        "spring-boot:run",
+        `-Dspring-boot.run.arguments=--server.port=${port}`,
+      ],
+      knownPort: true,
+    };
+  }
+  if (facts.hasSpringBootGradle) {
+    return {
+      framework: "Spring Boot (Gradle)",
+      command: facts.hasGradleWrapper
+        ? process.platform === "win32"
+          ? "gradlew.bat"
+          : "./gradlew"
+        : "gradle",
+      args: ["bootRun", `--args=--server.port=${port}`],
+      knownPort: true,
+    };
+  }
+  if (facts.aspNetProject) {
+    return {
+      framework: "ASP.NET Core",
+      command: "dotnet",
+      args: ["run", "--project", facts.aspNetProject],
+      knownPort: true,
+      env: { ASPNETCORE_URLS: `http://127.0.0.1:${port}` },
+    };
+  }
+  if (facts.hasPhoenix) {
+    return {
+      framework: "Phoenix",
+      command: "mix",
+      args: ["phx.server"],
+      knownPort: true,
+      env: { PORT: String(port), MIX_ENV: "dev" },
+    };
+  }
+  if (facts.hasGoMod && facts.hasGoMain) {
+    return {
+      framework: "Go",
+      command: "go",
+      args: ["run", "."],
+      knownPort: false,
+      env: { PORT: String(port) },
+    };
+  }
+  if (facts.hasPublicIndexPhp || facts.hasIndexPhp) {
+    const docroot = facts.hasPublicDir ? "public" : ".";
+    return {
+      framework: "PHP",
+      command: "php",
+      args: ["-S", `127.0.0.1:${port}`, "-t", docroot],
+      knownPort: true,
+    };
+  }
+
   if (facts.hasPackageJson) {
     const deps: Record<string, string> = {
       ...facts.dependencies,
       ...facts.devDependencies,
     };
     const devScript = facts.devScript || facts.startScript || "";
+    const packageManager = facts.packageManager ?? "npm";
+
+    const binaryPlan = (binary: string, args: string[]) =>
+      packageBinaryPlan(packageManager, binary, args);
+    const scriptPlan = (framework: string): RunnerPlan => ({
+      framework,
+      ...packageScriptPlan(
+        packageManager,
+        facts.devScript ? "dev" : "start"
+      ),
+      knownPort: false,
+      env: { PORT: String(port) },
+    });
 
     // --- Node.js 系 FW (依存パッケージを最優先) ---
     if (
@@ -64,8 +191,7 @@ export function detectRunnerFromFacts(
     ) {
       return {
         framework: "Next.js",
-        command: "npx",
-        args: ["next", "dev", "-p", String(port)],
+        ...binaryPlan("next", ["dev", "-p", String(port)]),
         knownPort: true,
       };
     }
@@ -76,17 +202,23 @@ export function detectRunnerFromFacts(
     ) {
       return {
         framework: "Nuxt",
-        command: "npx",
-        args: ["nuxt", "dev", "--port", String(port)],
+        ...binaryPlan("nuxt", ["dev", "--port", String(port)]),
         knownPort: true,
       };
     }
-    if (deps.remix || facts.hasRemixConfig) {
-      // Remix は vite 上で動くが remix コマンドがあれば明示的に扱う
+    if (deps["@react-router/dev"] || facts.hasReactRouterConfig) {
+      if (devScript) return scriptPlan("React Router");
+      return {
+        framework: "React Router",
+        ...binaryPlan("react-router", ["dev", "--port", String(port)]),
+        knownPort: true,
+      };
+    }
+    if (deps["@remix-run/dev"] || deps.remix || facts.hasRemixConfig) {
+      if (devScript) return scriptPlan("Remix");
       return {
         framework: "Remix",
-        command: "npx",
-        args: ["remix", "vite:dev", "--port", String(port)],
+        ...binaryPlan("remix", ["vite:dev", "--port", String(port)]),
         knownPort: true,
       };
     }
@@ -94,116 +226,65 @@ export function detectRunnerFromFacts(
       // SvelteKit は vite ベース、--port で固定可能
       return {
         framework: "SvelteKit",
-        command: "npx",
-        args: ["vite", "dev", "--port", String(port), "--strictPort"],
+        ...binaryPlan("vite", [
+          "dev",
+          "--port",
+          String(port),
+          "--strictPort",
+        ]),
         knownPort: true,
       };
     }
     if (deps.astro || facts.hasAstroConfig) {
       return {
         framework: "Astro",
-        command: "npx",
-        args: ["astro", "dev", "--port", String(port)],
+        ...binaryPlan("astro", ["dev", "--port", String(port)]),
         knownPort: true,
       };
     }
     if (deps.vite || /(?<![\w-])vite(?![\w-])/.test(devScript)) {
       return {
         framework: "Vite",
-        command: "npx",
-        args: ["vite", "--port", String(port), "--strictPort"],
+        ...binaryPlan("vite", ["--port", String(port), "--strictPort"]),
         knownPort: true,
       };
     }
     if (deps["@angular/cli"]) {
       return {
         framework: "Angular",
-        command: "npx",
-        args: ["ng", "serve", "--port", String(port)],
+        ...binaryPlan("ng", ["serve", "--port", String(port)]),
         knownPort: true,
       };
     }
     if (deps["@vue/cli-service"] || facts.hasVueConfig) {
       return {
         framework: "Vue CLI",
-        command: "npx",
-        args: ["vue-cli-service", "serve", "--port", String(port)],
+        ...binaryPlan("vue-cli-service", ["serve", "--port", String(port)]),
         knownPort: true,
       };
     }
     if (deps["react-scripts"]) {
       return {
         framework: "Create React App",
-        command: "npx",
-        args: ["react-scripts", "start"],
+        ...binaryPlan("react-scripts", ["start"]),
         knownPort: true,
         env: { PORT: String(port), BROWSER: "none" },
       };
     }
     if (devScript) {
       // 汎用: プロジェクトの dev/start スクリプト。ポートは stdout から検出。
-      return {
-        framework: facts.pkgName ? `node (${facts.pkgName})` : "node",
-        command: "npm",
-        args: ["run", facts.devScript ? "dev" : "start"],
-        knownPort: false,
-        env: { PORT: String(port) },
-      };
+      return scriptPlan(
+        facts.pkgName ? `node (${facts.pkgName})` : "node"
+      );
     }
   }
 
-  // --- 非 Node プロジェクト ---
-  if (facts.hasGemfile && facts.hasRailsBin) {
-    return {
-      framework: "Rails",
-      command: "bin/rails",
-      args: ["server", "-p", String(port)],
-      knownPort: true,
-    };
-  }
-  if (facts.hasManagePy) {
-    return {
-      framework: "Django",
-      command: "python",
-      args: ["manage.py", "runserver", String(port)],
-      knownPort: true,
-    };
-  }
-  if (facts.hasGoMod) {
-    // Go は PORT env を読む慣習が多いが固定不可とみなし stdout から検出
-    return {
-      framework: "Go",
-      command: "go",
-      args: ["run", "."],
-      knownPort: false,
-      env: { PORT: String(port) },
-    };
-  }
-  // PHP (Laravel artisan serve を優先、なければ php -S 内蔵サーバ)
-  if (facts.hasArtisan) {
-    return {
-      framework: "Laravel",
-      command: "php",
-      args: ["artisan", "serve", "--port", String(port)],
-      knownPort: true,
-    };
-  }
-  if (facts.hasComposerJson || facts.hasPublicIndexPhp || facts.hasIndexPhp) {
-    const docroot = facts.hasPublicDir ? "public" : ".";
-    return {
-      framework: "PHP",
-      command: "php",
-      args: ["-S", `localhost:${port}`, "-t", docroot],
-      knownPort: true,
-    };
-  }
-
-  // 静的サイト (index.html → npx serve)
+  // 静的サイト (index.html → 同梱 read-only server)
   if (facts.hasIndexHtml) {
     return {
       framework: "Static",
-      command: "npx",
-      args: ["-y", "serve", "-l", String(port), "."],
+      command: process.execPath,
+      args: [STATIC_SERVER_PATH, "--port", String(port)],
       knownPort: true,
     };
   }
@@ -227,14 +308,97 @@ function hasAnyConfig(root: string, names: string[]): boolean {
   return names.some((n) => existsSync(join(root, n)));
 }
 
+function readProjectText(root: string, name: string): string {
+  try {
+    return readFileSync(join(root, name), "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function findAspNetProject(root: string): string | undefined {
+  let names: string[];
+  try {
+    names = readdirSync(root)
+      .filter((name) => name.toLowerCase().endsWith(".csproj"))
+      .sort();
+  } catch {
+    return undefined;
+  }
+  const webProjects = names.filter((name) =>
+    /Microsoft\.NET\.Sdk\.(?:Web|BlazorWebAssembly)/i.test(
+      readProjectText(root, name)
+    )
+  );
+  return webProjects.length === 1 ? webProjects[0] : undefined;
+}
+
+function hasGoEntrypoint(root: string): boolean {
+  let names: string[];
+  try {
+    names = readdirSync(root).filter(
+      (name) => name.endsWith(".go") && !name.endsWith("_test.go")
+    );
+  } catch {
+    return false;
+  }
+  const source = names.map((name) => readProjectText(root, name)).join("\n");
+  return /^\s*package\s+main\b/m.test(source) && /\bfunc\s+main\s*\(/m.test(source);
+}
+
+function findProjectPython(root: string): string | undefined {
+  const interpreter = process.platform === "win32" ? ["Scripts", "python.exe"] : ["bin", "python"];
+  for (const directory of [".venv", "venv"]) {
+    const path = resolve(root, directory, ...interpreter);
+    try {
+      if (!statSync(path).isFile()) continue;
+      accessSync(path, constants.X_OK);
+      return path;
+    } catch {
+      // 実行できる Python が見つかるまで次の候補を調べる。
+    }
+  }
+  // venv が無い POSIX 環境では `python` が無く `python3` だけのディストリビューション(Ubuntu 等)が多い。
+  if (process.platform !== "win32" && !isOnPath("python", root) && isOnPath("python3", root)) {
+    return "python3";
+  }
+}
+
+/** POSIX の PATH 探索。空要素と相対要素は spawn の cwd(プロジェクト root)基準で解決する。 */
+function isOnPath(command: string, cwd: string): boolean {
+  // PATH 未定義時は spawn(execvp)と同じく既定の探索パスを使う。空文字列は「cwd のみ」を意味する。
+  for (const directory of (process.env.PATH ?? "/usr/bin:/bin").split(delimiter)) {
+    try {
+      const path = resolve(cwd, directory || ".", command);
+      if (!statSync(path).isFile()) continue;
+      accessSync(path, constants.X_OK);
+      return true;
+    } catch {
+      // 次の PATH 要素へ
+    }
+  }
+  return false;
+}
+
 /** ファイルシステムから ProjectFacts を構築する。 */
 export function readFacts(root: string): ProjectFacts {
   const pkg = readPkg(root);
   const deps: Record<string, string> = pkg?.dependencies ?? {};
   const devDeps: Record<string, string> = pkg?.devDependencies ?? {};
   const scripts: Record<string, string> = pkg?.scripts ?? {};
+  const pom = readProjectText(root, "pom.xml");
+  const gradle = [
+    readProjectText(root, "build.gradle"),
+    readProjectText(root, "build.gradle.kts"),
+  ].join("\n");
+  const mix = readProjectText(root, "mix.exs");
+  const managePy = readProjectText(root, "manage.py");
+  const hasManagePy =
+    /DJANGO_SETTINGS_MODULE/.test(managePy) &&
+    /execute_from_command_line/.test(managePy);
   return {
     hasPackageJson: pkg != null,
+    packageManager: detectPackageManager(root, pkg?.packageManager).name,
     dependencies: deps,
     devDependencies: devDeps,
     scripts,
@@ -243,8 +407,10 @@ export function readFacts(root: string): ProjectFacts {
     pkgName: pkg?.name,
     hasGemfile: existsSync(join(root, "Gemfile")),
     hasRailsBin: existsSync(join(root, "bin/rails")),
-    hasManagePy: existsSync(join(root, "manage.py")),
+    hasManagePy,
+    djangoPython: hasManagePy ? findProjectPython(root) : undefined,
     hasGoMod: existsSync(join(root, "go.mod")),
+    hasGoMain: hasGoEntrypoint(root),
     hasComposerJson: existsSync(join(root, "composer.json")),
     hasArtisan: existsSync(join(root, "artisan")),
     hasPublicIndexPhp: existsSync(join(root, "public/index.php")),
@@ -267,7 +433,25 @@ export function readFacts(root: string): ProjectFacts {
       "nuxt.config.ts",
     ]),
     hasVueConfig: hasAnyConfig(root, ["vue.config.js", "vue.config.mjs"]),
-    hasRemixConfig: hasAnyConfig(root, ["remix.config.js"]),
+    hasRemixConfig: hasAnyConfig(root, [
+      "remix.config.js",
+      "remix.config.mjs",
+      "remix.config.cjs",
+      "remix.config.ts",
+    ]),
+    hasReactRouterConfig: hasAnyConfig(root, [
+      "react-router.config.js",
+      "react-router.config.mjs",
+      "react-router.config.ts",
+    ]),
+    hasSpringBootMaven:
+      Boolean(pom) && /spring-boot(?:-starter|-maven-plugin)/i.test(pom),
+    hasMavenWrapper: hasAnyConfig(root, ["mvnw", "mvnw.cmd"]),
+    hasSpringBootGradle:
+      Boolean(gradle.trim()) && /org\.springframework\.boot/i.test(gradle),
+    hasGradleWrapper: hasAnyConfig(root, ["gradlew", "gradlew.bat"]),
+    aspNetProject: findAspNetProject(root),
+    hasPhoenix: Boolean(mix) && /:phoenix\b/.test(mix),
   };
 }
 
@@ -283,10 +467,11 @@ export function detectRunner(
   if (override?.command) {
     return {
       framework: override.framework || "custom",
-      command: "sh",
-      args: ["-c", override.command],
-      knownPort: false, // override の場合はポートを stdout から拾う
+      command: override.command,
+      args: [],
+      knownPort: port > 0,
       env: { PORT: String(port) },
+      shell: true,
     };
   }
   return detectRunnerFromFacts(readFacts(root), port);
@@ -296,8 +481,22 @@ export interface RunningTarget {
   proc: ChildProcess;
   plan: RunnerPlan;
   port: number;
+  /** 実際に待受を確認できたループバックアドレス。 */
+  host?: LoopbackHost;
   logs: string[];
 }
+
+export class TargetStartupError extends Error {
+  readonly target: RunningTarget;
+
+  constructor(message: string, target: RunningTarget) {
+    super(message);
+    this.name = "TargetStartupError";
+    this.target = target;
+  }
+}
+
+export type LoopbackHost = "127.0.0.1" | "::1";
 
 const liveChildren = new Set<ChildProcess>();
 
@@ -310,10 +509,23 @@ function registerChild(proc: ChildProcess): void {
   proc.once("close", unregister);
 }
 
+function taskkill(pid: number, force: boolean): boolean {
+  const args = ["/pid", String(pid), "/t"];
+  if (force) args.push("/f");
+  const result = spawnSync("taskkill", args, {
+    stdio: "ignore",
+    env: buildChildEnv(),
+  });
+  return result.status === 0;
+}
+
 export function killAllChildrenSync(): void {
   for (const proc of Array.from(liveChildren)) {
     liveChildren.delete(proc);
     if (typeof proc.pid === "number" && proc.pid > 0) {
+      if (process.platform === "win32" && taskkill(proc.pid, true)) {
+        continue;
+      }
       try {
         process.kill(-proc.pid, "SIGKILL");
         continue;
@@ -337,6 +549,9 @@ export function signalGroup(
   signal: NodeJS.Signals = "SIGTERM"
 ): void {
   if (typeof proc.pid === "number" && proc.pid > 0) {
+    if (process.platform === "win32" && taskkill(proc.pid, signal === "SIGKILL")) {
+      return;
+    }
     try {
       process.kill(-proc.pid, signal);
       return;
@@ -386,6 +601,13 @@ export async function killGroup(
   proc: ChildProcess,
   opts?: { graceMs?: number }
 ): Promise<void> {
+  if (process.platform === "win32" && typeof proc.pid === "number" && proc.pid > 0) {
+    // cmd.exe/npm.cmd 配下の Node プロセスまで同時に止める。親だけ先に終了すると
+    // PID から子孫を辿れなくなるため、Windows では最初からツリーを強制終了する。
+    taskkill(proc.pid, true);
+    await waitForExit(proc, 1_000);
+    return;
+  }
   signalGroup(proc, "SIGTERM");
   await waitForExit(proc, opts?.graceMs ?? 3_000);
   signalGroup(proc, "SIGKILL");
@@ -436,6 +658,7 @@ export function extractPortForRunnerOutput(
   line: string,
   knownPort: boolean
 ): number | null {
+  // nosemgrep: ajinabraham.njsscan.dos.regex_dos.regex_dos -- 選択肢の列挙のみで入れ子の量指定子なし
   if (knownPort && !KNOWN_PORT_OVERRIDE_LINE_PATTERN.test(line)) {
     return null;
   }
@@ -460,6 +683,14 @@ export function reduceDetectedPort(
   return p;
 }
 
+export function splitOutputChunk(
+  remainder: string,
+  chunk: Buffer | string
+): { lines: string[]; remainder: string } {
+  const parts = (remainder + chunk.toString()).split(/\r?\n/);
+  return { lines: parts.slice(0, -1), remainder: parts.at(-1) ?? "" };
+}
+
 /** 対象を起動し、ポートが listen するまで待つ。 */
 export async function startTarget(
   root: string,
@@ -470,11 +701,20 @@ export async function startTarget(
   const plan = detectRunner(root, port, override);
   const logs: string[] = [];
 
-  const proc = spawn(plan.command, plan.args, {
-    cwd: root,
-    env: { ...process.env, ...plan.env, FORCE_COLOR: "0" },
-    shell: false,
+  if (port > 0 && (await isListening(port))) {
+    throw new Error(`対象の起動ポート ${port} は既に使用されています。`);
+  }
+
+  const { command, args, ...spawnOptions } = prepareCommandInvocation(plan.command, plan.args, {
+    shell: plan.shell,
     detached: true,
+  });
+
+  const proc = spawn(command, args, {
+    ...spawnOptions,
+    cwd: root,
+    env: buildChildEnv({ ...plan.env, FORCE_COLOR: "0" }),
+    windowsHide: true,
   });
   registerChild(proc);
 
@@ -485,57 +725,125 @@ export async function startTarget(
     spawnErrorMessage = e.message;
   });
 
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onSpawn = () => {
+        proc.off("error", onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        proc.off("spawn", onSpawn);
+        reject(error);
+      };
+      proc.once("spawn", onSpawn);
+      proc.once("error", onError);
+    });
+  } catch (error) {
+    throw new Error(
+      `${plan.command} を起動できません: ${String(
+        (error as Error)?.message ?? error
+      )}`
+    );
+  }
+
   let detectedPort = plan.knownPort ? port : 0;
+  const failStartup = async (message: string): Promise<never> => {
+    await killGroup(proc);
+    throw new TargetStartupError(message, { proc, plan, port: detectedPort || port, logs });
+  };
   const appendLog = (line: string) => {
     logs.push(line);
     if (logs.length > 500) logs.shift();
     onLog?.(line);
   };
-  const collect = (buf: Buffer) => {
-    const text = buf.toString();
-    for (const line of text.split("\n")) {
-      if (!line.trim()) continue;
-      appendLog(line);
-      const next = reduceDetectedPort(detectedPort, line, plan.knownPort);
-      if (next !== detectedPort) {
-        if (detectedPort) {
-          appendLog(
-            `[UImaneger] detected port ${next} from output; using it instead of ${detectedPort}`
-          );
-        }
-        detectedPort = next;
+  const collectLine = (line: string) => {
+    if (!line.trim()) return;
+    appendLog(line);
+    const next = reduceDetectedPort(detectedPort, line, plan.knownPort);
+    if (next !== detectedPort) {
+      if (detectedPort) {
+        appendLog(
+          `[UImaneger] detected port ${next} from output; using it instead of ${detectedPort}`
+        );
       }
+      detectedPort = next;
     }
   };
-  proc.stdout?.on("data", collect);
-  proc.stderr?.on("data", collect);
+  const attachOutput = (stream: NonNullable<typeof proc.stdout>) => {
+    let remainder = "";
+    stream.on("data", (chunk: Buffer | string) => {
+      const split = splitOutputChunk(remainder, chunk);
+      remainder = split.remainder;
+      for (const line of split.lines) collectLine(line);
+    });
+    stream.on("end", () => {
+      if (remainder.trim()) collectLine(remainder);
+      remainder = "";
+    });
+  };
+  if (proc.stdout) attachOutput(proc.stdout);
+  if (proc.stderr) attachOutput(proc.stderr);
 
   // ポート確定 & listen 待ち
+  // 同じ port・host に連続 2 回(poll 間隔を挟んで)接続できた時だけ確定する。Vite などは起動中に
+  // 127.0.0.1 で一時的に listen してから本番を localhost(Windows では ::1)に bind するため、
+  // 1 回の接続で確定すると一時リスナーの host を掴み、プレビューが ECONNREFUSED になる。
+  let lastSeen: { port: number; host: LoopbackHost } | null = null;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (spawnFailed) {
       // spawn 直後の失敗: pid が無ければプロセスグループ kill は意味を持たず、
       // 発火しない exit イベントを待ってブロックすると即 reject すべきテストが
       // 壊れるため、best-effort/非ブロッキングで抜ける。
-      if (proc.pid) signalGroup(proc, "SIGTERM");
-      throw new Error(
-        `${plan.command} を起動できません: ${spawnErrorMessage}`
-      );
+      const message = `${plan.command} を起動できません: ${spawnErrorMessage}`;
+      if (proc.pid) return failStartup(message);
+      throw new Error(message);
     }
-    if (proc.exitCode !== null) {
-      throw new Error(
-        `対象の起動に失敗しました (exit ${proc.exitCode}).\n` +
+    if (hasExited(proc)) {
+      const exitDetail =
+        proc.exitCode !== null
+          ? `exit ${proc.exitCode}`
+          : `signal ${proc.signalCode ?? "unknown"}`;
+      return failStartup(
+        `対象の起動に失敗しました (${exitDetail}).\n` +
           logs.slice(-15).join("\n")
       );
     }
-    if (detectedPort && (await isListening(detectedPort))) {
-      return { proc, plan, port: detectedPort, logs };
+    const portsToProbe = [detectedPort, port].filter(
+      (candidate, index, all) => candidate > 0 && all.indexOf(candidate) === index
+    );
+    // 2 回目は前回見つけた host を直接確認する(両方で listen するサーバでも
+    // Promise.any の勝者が poll ごとに入れ替わって確定できない、ということが起きない)。
+    // 候補を優先順(出力で検出した port → 要求 port)に調べる。前回見つけた port の番では保存済み host を
+    // 直接再確認し、通れば確定する。前回より優先度の高い候補が新たに listen していれば、それを次回の確認対象にする。
+    // これで、ログの port が後から listen した場合の切替と、未 listen の場合の要求 port での確定を両立する。
+    const detectedAtPollStart = detectedPort;
+    let found: { port: number; host: LoopbackHost } | null = null;
+    for (const candidate of portsToProbe) {
+      if (lastSeen && candidate === lastSeen.port) {
+        const host = lastSeen.host;
+        const confirmed = await probeHost(host, candidate).then(
+          () => true,
+          () => false
+        );
+        if (confirmed) {
+          // 再確認の待ち中に出力から新しい port が検出されたら、確定を見送り次の poll で最新の候補順から調べ直す。
+          if (detectedPort === detectedAtPollStart) return { proc, plan, port: candidate, host, logs };
+          found = lastSeen;
+          break;
+        }
+      }
+      const host = await findListeningHost(candidate);
+      if (host) {
+        found = { port: candidate, host };
+        break;
+      }
     }
+    lastSeen = found;
     await sleep(300);
   }
   // deadline 超過: プロセスグループを確実に停止してから reject。
-  await killGroup(proc);
-  throw new Error(
+  return failStartup(
     "対象 dev server が時間内に起動しませんでした。\n" + logs.slice(-15).join("\n")
   );
 }
@@ -557,13 +865,15 @@ function probeHost(host: string, port: number): Promise<void> {
   });
 }
 
-export function isListening(port: number): Promise<boolean> {
+export function findListeningHost(port: number): Promise<LoopbackHost | null> {
   return Promise.any([
-    probeHost("127.0.0.1", port),
-    probeHost("::1", port),
-  ])
-    .then(() => true)
-    .catch(() => false);
+    probeHost("127.0.0.1", port).then(() => "127.0.0.1" as const),
+    probeHost("::1", port).then(() => "::1" as const),
+  ]).catch(() => null);
+}
+
+export function isListening(port: number): Promise<boolean> {
+  return findListeningHost(port).then((host) => host !== null);
 }
 
 export function sleep(ms: number): Promise<void> {

@@ -4,7 +4,7 @@ import type {
   DomDescriptor,
   EditProposal,
 } from "../lib/types.ts";
-import { api } from "../lib/api.ts";
+import { api, getErrorMessage } from "../lib/api.ts";
 import type { EditModel } from "../lib/api.ts";
 import { DiffView } from "./DiffView.tsx";
 import { Candidates } from "./Candidates.tsx";
@@ -212,15 +212,19 @@ export function Chat({
         }
       );
       handleProposal(result, text);
-      if (!result.ok) {
+      // 前の提案を戻すのは同じ要素への追い込み失敗だけ。別要素への指示や候補選択待ち
+      // (low) では前の提案を破棄し、候補確定がこの指示の descriptor を使うようにする
+      if (!result.ok && previousProposalId && !result.candidates?.length) {
         setProposal(previousProposal);
-        if (previousProposal) setEditDescriptor(previousEditDescriptor);
+        setEditDescriptor(previousEditDescriptor);
       }
-    } catch (e: any) {
+    } catch (e) {
       setInstruction(text);
-      setProposal(previousProposal);
-      if (previousProposal) setEditDescriptor(previousEditDescriptor);
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+      if (previousProposalId) {
+        setProposal(previousProposal);
+        setEditDescriptor(previousEditDescriptor);
+      }
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
       setGeneration(null);
       setBusy(false);
@@ -233,11 +237,16 @@ export function Chat({
     setBusy(true);
     try {
       handleProposal(
-        await api.editCandidate(c, desc, lastInstruction),
+        await api.editCandidate(
+          c,
+          desc,
+          lastInstruction,
+          editModelRef.current || undefined
+        ),
         lastInstruction
       );
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
       setBusy(false);
     }
@@ -263,8 +272,8 @@ export function Chat({
         log({ role: "system", ok: false, text: "✗ " + (res.error || "適用失敗") });
         // proposal を保持したまま → 再試行可能
       }
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       // proposal を保持したまま → 再試行可能
     } finally {
       setBusy(false);
@@ -310,8 +319,8 @@ export function Chat({
           });
         }
       }
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshUndoDepth().catch((statusError) => {
         console.error(statusError);
       });
@@ -340,8 +349,8 @@ export function Chat({
           console.error(statusError);
         });
       }
-    } catch (e: any) {
-      log({ role: "system", ok: false, text: "✗ " + String(e.message || e) });
+    } catch (e) {
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshDepths().catch((statusError) => {
         console.error(statusError);
       });
