@@ -1,7 +1,7 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   detectPackageManager,
@@ -120,13 +120,23 @@ describe("prepareCommandInvocation on Windows PATH lookup", () => {
           prepareCommandInvocation("mvn", [], { platform: "win32", env: { PATH: `"${bin}"`, PATHEXT: "   " } })
         )
       ).toBe(expectedPath);
-      // 相対の PATH 要素は探さない(cmd.exe が開いたリポジトリ基準で解決してしまう)
-      expect(
-        prepareCommandInvocation("mvn", [], {
-          platform: "win32",
-          env: { PATH: relative(process.cwd(), bin), PATHEXT: ".CMD" },
-        }).command
-      ).toBe("mvn");
+      // 相対の PATH 要素は探さない(cmd.exe が開いたリポジトリ基準で解決してしまう)。
+      // 一時ディレクトリは別ドライブになり得る(Windows CI では C: と D:)ので、cwd 配下に作って相対化する。
+      mkdirSync(join(process.cwd(), ".tmp"), { recursive: true });
+      const local = mkdtempSync(join(process.cwd(), ".tmp", "uim-relpath-"));
+      try {
+        writeFileSync(join(local, "mvn.cmd"), "");
+        const relativeDir = relative(process.cwd(), local);
+        expect(isAbsolute(relativeDir)).toBe(false);
+        expect(
+          prepareCommandInvocation("mvn", [], {
+            platform: "win32",
+            env: { PATH: relativeDir, PATHEXT: ".CMD" },
+          }).command
+        ).toBe("mvn");
+      } finally {
+        rmSync(local, { recursive: true, force: true });
+      }
       // cmd.exe が展開・分割してしまう引数は拒否する
       expect(() =>
         prepareCommandInvocation("mvn", ["-Dvalue=%TEMP%"], { platform: "win32", env })

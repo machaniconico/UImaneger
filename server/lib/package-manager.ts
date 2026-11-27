@@ -146,6 +146,7 @@ function resolveWindowsBatch(
   command: string,
   env: { PATH?: string; Path?: string; PATHEXT?: string }
 ): string | null {
+  // nosemgrep: ajinabraham.njsscan.dos.regex_dos.regex_dos -- 文字クラス 1 つと末尾アンカーのみで入れ子の量指定子なし
   if (/[\\/]/.test(command) || /\.[^.\\/]+$/.test(command)) return null;
   let extensions = (env.PATHEXT ?? "")
     .split(";")
