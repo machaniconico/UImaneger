@@ -18,8 +18,8 @@
 | 区分 | 対象 | 現在の検証状態 |
 |---|---|---|
 | 実プロセス検証済み | Vite + React の同梱サンプル、静的 HTML、汎用 Node `dev` script | Windows の CI 相当テストで起動と HTTP 応答を確認 |
-| 実プロセス検証済み(CI) | Next.js、Nuxt、React Router、Remix、SvelteKit、Astro、Angular、Vue CLI、Create React App、Vite + React、静的 HTML、汎用 Node `dev` script | Ubuntu / Windows の runtime matrix で毎 push 実行(初回 PASS: 2026-11-27、commit `469ae1c`) |
-| 実プロセス検証済み(CI) | Django、Laravel、PHP (`index.php`)、Go、Spring Boot (Maven/Gradle)、ASP.NET Core | Ubuntu の runtime matrix で毎 push 実行(初回 PASS: 2026-11-27、commit `469ae1c`)。Windows では未実行 |
+| 実プロセス検証済み(CI) | Next.js、Nuxt、React Router、Remix、SvelteKit、Astro、Angular、Vue CLI、Create React App、Vite + React、静的 HTML、汎用 Node `dev` script | Ubuntu / Windows / macOS の runtime matrix で毎 push 実行(初回 PASS: 2026-11-27、commit `469ae1c`) |
+| 実プロセス検証済み(CI) | Django、Laravel、PHP (`index.php`)、Go、Spring Boot (Maven/Gradle)、ASP.NET Core | Ubuntu / Windows の runtime matrix で毎 push 実行(Ubuntu 初回 PASS: 2026-11-27、commit `469ae1c`。Windows 初回全 PASS: 2026-11-28、commit `07eae82`)。macOS は Django、Go、Spring Boot も実行 |
 | 実プロセス検証済み(CI) | Rails、Phoenix | Ubuntu の runtime matrix(Ruby 3.4 / Elixir 1.18)で毎 push 実行(初回 PASS: 2026-11-28、commit `9d0975f`)。Windows では未実行 |
 | 手動コマンド | FastAPI/Flask の任意 entrypoint、Rust Web、Java の非 Spring 構成、独自サーバ、複数アプリの monorepo | 「起動設定」でコマンドを指定。`PORT` 環境変数が渡される |
 

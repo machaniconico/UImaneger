@@ -27,8 +27,8 @@
 | OSS / assets | HUMAN-REVIEW | npm 依存の台帳と許可リスト検査は自動化済み。`standardwebhooks@1.0.0` は npm に LICENSE 本文が無く upstream 参照。font・icon・asset の確認と法務の最終承認が残る |
 | Anthropic terms / privacy | HUMAN-REVIEW | `THIRD_PARTY_SERVICES.md` の release blockers 解消 |
 | Security | BLOCKED | 2026-11-27 の脅威レビューで出た CSRF(別ポート localhost からの単純リクエスト)、プレビュープロキシの DNS rebinding、子プロセスへの API キー継承を修正済み(受け入れテスト `tests/acceptance/` 41 件、異系統レビュー 2 系統 APPROVE、最終受け入れ PASS)。依存 scan・SAST・secret scan は CI 化済み。脅威モデルは `THREAT_MODEL.md` に記録。残りは配布 artifact scan、第三者による侵入試験(CI の audit・secret-scan・sast は run 46016436860 で PASS) |
-| Browser E2E | PARTIAL | `npm run e2e:all`(Playwright 1.65.0、偽 Anthropic API、同梱 Vite+React サンプルの一時複製)で open・select・proposal・apply・undo と、別タブでの状態保持つき HMR を検証。GitHub Actions(run 46022965634)で Ubuntu の Chromium/Firefox/WebKit、Windows の Chromium/Firefox が PASS。残り: macOS、実 API キーでの確認 |
-| Runtime matrix | PARTIAL | GitHub Actions(run 46022965634、commit `9d0975f`)で Ubuntu は 21 構成すべて(node・python・php・go・java・dotnet・ruby・elixir を必須化)、Windows は Node 系 12 構成が PASS。ローカル(WSL2)は 19 PASS / 2 SKIP。残り: Windows の非 Node runtime、macOS |
+| Browser E2E | PARTIAL | `npm run e2e:all`(Playwright 1.65.0、偽 Anthropic API、同梱 Vite+React サンプルの一時複製)で open・select・proposal・apply・undo と、別タブでの状態保持つき HMR を検証。GitHub Actions(run 46042774173、commit `07eae82`)で Ubuntu・macOS の Chromium/Firefox/WebKit、Windows の Chromium/Firefox が PASS。残り: 実 API キーでの確認 |
+| Runtime matrix | PASS | GitHub Actions(run 46042774173、commit `07eae82`)で Ubuntu は 21 構成すべて(node・python・php・go・java・dotnet・ruby・elixir を必須化)、Windows は Node 系 12 構成と Django・PHP・Laravel・Go・Spring Boot(Maven/Gradle)・ASP.NET Core、macOS は Node 系と Django・Go・Spring Boot が PASS。ローカル(WSL2)は 19 PASS / 2 SKIP。Rails・Phoenix の Windows / macOS、PHP・.NET の macOS は対象外 |
 | Distribution | BLOCKED | installer/package、署名、artifact hash、更新、rollback の確認 |
 | Operations | PARTIAL | 脆弱性受付は GitHub Private vulnerability reporting を 2026-11-28 に有効化し、手順を `../SECURITY.md` に記載。残り: 応答期限などのサポート条件、support 窓口、incident response と data deletion の手順(販売主体の決定後) |
 | Legal / store | HUMAN-REVIEW | 対象国、販売経路、価格、返金、規約、表示義務の専門家確認 |
