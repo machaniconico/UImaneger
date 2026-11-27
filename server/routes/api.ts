@@ -800,7 +800,9 @@ api.post("/project/clone", async (c) => {
       );
     } else {
       if (!existsSync(join(dest, ".git"))) {
-        throw new Error(`Clone先が既に存在しますがGitリポジトリではありません: ${dest}`);
+        throw new Error(
+          `Clone先が既に存在しますがGitリポジトリではありません: workspaces/${basename(dest)}`
+        );
       }
       const { stdout } = await pExecFile(
         "git",
@@ -813,7 +815,7 @@ api.post("/project/clone", async (c) => {
         }
       );
       if (stdout.trim() !== repo) {
-        throw new Error(`Clone先のoriginが要求URLと一致しません: ${dest}`);
+        throw new Error(`Clone先のoriginが要求URLと一致しません: workspaces/${basename(dest)}`);
       }
     }
     // packageManager/lockfileを尊重し、cloneしたコードのlifecycle scriptは実行しない。

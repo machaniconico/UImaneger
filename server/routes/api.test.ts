@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -447,6 +448,25 @@ describe("project security helpers", () => {
     expect(result.body.error).toBe(
       "runCommand の実行にはローカルからのアクセスが必要です"
     );
+  });
+
+  it("does not reveal the absolute workspaces path when the clone destination is not a git repository", async () => {
+    const workspaces = mkdtempSync(join(tmpdir(), "uim-ws-"));
+    const previous = env.workspacesDir;
+    const repo = "https://github.com/example/repo.git";
+    const fingerprint = createHash("sha256").update(repo).digest("hex").slice(0, 10);
+    mkdirSync(join(workspaces, `repo-${fingerprint}`));
+    (env as { workspacesDir: string }).workspacesDir = workspaces;
+    try {
+      const result = await postJson<{ error: string }>("/api/project/clone", { repo });
+      expect(result.res.status).toBeGreaterThanOrEqual(400);
+      expect(result.body.error).toContain("Gitリポジトリではありません");
+      expect(result.body.error).toContain(`repo-${fingerprint}`);
+      expect(result.body.error).not.toContain(workspaces);
+    } finally {
+      (env as { workspacesDir: string }).workspacesDir = previous;
+      rmSync(workspaces, { recursive: true, force: true });
+    }
   });
 
   it("rejects clone runCommand when Host is not local", async () => {
