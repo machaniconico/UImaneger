@@ -24,6 +24,7 @@ interface MessagesRequest {
   body: {
     model?: string;
     max_tokens?: number;
+    stream?: boolean;
     messages?: { role: string; content: string }[];
   };
 }
@@ -146,13 +147,55 @@ export const test = base.extend<{ app: AppFixture }>({
             res.writeHead(404).end();
             return;
           }
+          const text = ["```tsx", edited, "```"].join("\n");
+          if (body.stream) {
+            // 編集生成は SDK の messages.stream() を使うため、Messages API の SSE 形式で返す
+            res.setHeader("Content-Type", "text/event-stream");
+            const events: [string, unknown][] = [
+              ["message_start", {
+                type: "message_start",
+                message: {
+                  id: "msg_e2e",
+                  type: "message",
+                  role: "assistant",
+                  model,
+                  content: [],
+                  stop_reason: null,
+                  stop_sequence: null,
+                  usage: { input_tokens: 1, output_tokens: 0 },
+                },
+              }],
+              ["content_block_start", {
+                type: "content_block_start",
+                index: 0,
+                content_block: { type: "text", text: "" },
+              }],
+              ["content_block_delta", {
+                type: "content_block_delta",
+                index: 0,
+                delta: { type: "text_delta", text },
+              }],
+              ["content_block_stop", { type: "content_block_stop", index: 0 }],
+              ["message_delta", {
+                type: "message_delta",
+                delta: { stop_reason: "end_turn", stop_sequence: null },
+                usage: { output_tokens: 1 },
+              }],
+              ["message_stop", { type: "message_stop" }],
+            ];
+            for (const [event, data] of events) {
+              res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+            }
+            res.end();
+            return;
+          }
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({
             id: "msg_e2e",
             type: "message",
             role: "assistant",
             model,
-            content: [{ type: "text", text: ["```tsx", edited, "```"].join("\n") }],
+            content: [{ type: "text", text }],
             stop_reason: "end_turn",
             stop_sequence: null,
             usage: { input_tokens: 1, output_tokens: 1 },

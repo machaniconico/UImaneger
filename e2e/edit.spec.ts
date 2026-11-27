@@ -14,7 +14,7 @@ test("opens, selects, proposes, applies and undoes an edit with live HMR", async
 
   await test.step("Open the temporary sample and render both previews", async () => {
     await page.goto(app.url);
-    await expect(page.getByText("● API key OK", { exact: true })).toBeVisible();
+    await expect(page.getByText("API key OK", { exact: true }).first()).toBeVisible();
     await expect(input).toBeDisabled();
     await page.getByRole("textbox", { name: "ローカルパスまたはGitリポジトリURL" }).fill(app.sample);
     await page.getByRole("button", { name: "開く", exact: true }).click();
@@ -101,7 +101,8 @@ test("opens, selects, proposes, applies and undoes an edit with live HMR", async
       apiKey,
       body: {
         model,
-        max_tokens: 16_000,
+        max_tokens: 64_000,
+        stream: true,
         messages: [{ role: "user", content: expect.any(String) }],
       },
     });

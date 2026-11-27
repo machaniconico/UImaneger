@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  unit:
     strategy:
       fail-fast: false
       matrix:
@@ -182,3 +182,18 @@ jobs:
           semgrep scan --error --metrics=off
           --config p/javascript --config p/typescript --config p/secrets --config p/nodejsscan
           --exclude node_modules --exclude dist --exclude compliance
+  # auto-merge (.github/workflows/auto-merge.yml) とブランチ保護の必須チェック名は "test"。
+  # matrix ジョブは "unit (os, node)" のように名前が展開されるため、全ジョブの成否を
+  # 集約する単一ジョブ "test" を必須チェックとして置く。
+  test:
+    name: test
+    if: ${{ always() }}
+    needs: [unit, e2e, runtime-matrix, audit, secret-scan, sast]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          node -e "const n=JSON.parse(process.env.NEEDS); const bad=Object.entries(n).filter(([,v])=>v.result!=='success'); for (const [k,v] of bad) console.error(k+': '+v.result); if (bad.length) process.exit(1); console.log('all '+Object.keys(n).length+' jobs succeeded');"

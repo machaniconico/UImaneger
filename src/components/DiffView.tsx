@@ -15,9 +15,9 @@ const confLabel: Record<string, string> = {
   low: "確度: 低",
 };
 const confColor: Record<string, string> = {
-  high: "text-green-400",
-  medium: "text-amber-400",
-  low: "text-red-400",
+  high: "bg-green-500/10 text-green-400 ring-green-500/20",
+  medium: "bg-amber-500/10 text-amber-400 ring-amber-500/20",
+  low: "bg-red-500/10 text-red-400 ring-red-500/20",
 };
 
 /** unified diff を色分け表示し、承認/却下する。 */
@@ -57,19 +57,19 @@ export function DiffView({
   }
 
   return (
-    <div className="flex flex-col gap-2 rounded border border-neutral-700 bg-neutral-900 p-2">
+    <div className="flex flex-col gap-2 rounded-lg border border-neutral-700 bg-neutral-900 p-2.5 shadow-sm">
       <div className="flex items-center justify-between text-xs">
-        <span className="truncate text-neutral-300">{relFile}</span>
+        <span className="truncate font-mono text-neutral-300">{relFile}</span>
         <div className="flex shrink-0 items-center gap-2">
           {confidence && (
-            <span className={confColor[confidence]}>
+            <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 ring-inset ${confColor[confidence]}`}>
               {confLabel[confidence]}
             </span>
           )}
           <button
             type="button"
             onClick={copyDiff}
-            className="rounded bg-neutral-800 px-2 py-0.5 text-neutral-300 hover:bg-neutral-700"
+            className="rounded-md border border-neutral-700 bg-neutral-800 px-2 py-0.5 text-neutral-300 transition-colors duration-150 hover:border-neutral-600 hover:bg-neutral-700"
           >
             {copied ? "コピー済" : "コピー"}
           </button>
@@ -79,7 +79,7 @@ export function DiffView({
         </div>
       </div>
 
-      <pre className="max-h-64 overflow-auto rounded bg-neutral-950 p-2 text-[11px] leading-relaxed">
+      <pre className="max-h-72 overflow-auto rounded-md border border-neutral-800 bg-neutral-950 p-1.5 text-[11px] leading-relaxed">
         {lines.map((ln, i) => {
           let cls = "text-neutral-400";
           if (ln.startsWith("+") && !ln.startsWith("+++"))
@@ -90,7 +90,7 @@ export function DiffView({
           else if (ln.startsWith("+++") || ln.startsWith("---"))
             cls = "text-neutral-500";
           return (
-            <div key={i} className={cls}>
+            <div key={i} className={`${cls} rounded-sm px-1 transition-colors duration-150 hover:bg-neutral-800/80`}>
               {ln || " "}
             </div>
           );
@@ -101,14 +101,14 @@ export function DiffView({
         <button
           onClick={onApply}
           disabled={busy}
-          className="flex-1 rounded bg-green-600 py-1 text-sm font-medium hover:bg-green-500 disabled:opacity-50"
+          className="flex-1 rounded-md bg-accent-600 py-1.5 text-sm font-medium text-white transition-colors duration-150 hover:bg-accent-500 disabled:opacity-50"
         >
           承認して適用
         </button>
         <button
           onClick={onReject}
           disabled={busy}
-          className="flex-1 rounded bg-neutral-700 py-1 text-sm hover:bg-neutral-600 disabled:opacity-50"
+          className="flex-1 rounded-md border border-neutral-600 bg-transparent py-1.5 text-sm text-neutral-300 transition-colors duration-150 hover:border-neutral-500 hover:bg-neutral-800 disabled:opacity-50"
         >
           却下
         </button>

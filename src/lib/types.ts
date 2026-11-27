@@ -61,5 +61,14 @@ export interface EditProposal {
   candidates?: Candidate[];
 }
 
+export interface HistoryEntry {
+  id: string;
+  relFile: string;
+  summary?: string;
+  instruction?: string;
+  appliedAt: string;
+  kind: "apply" | "undo" | "redo";
+}
+
 /** 後方互換: 旧 EditResult を EditProposal の別名に */
 export type EditResult = EditProposal;

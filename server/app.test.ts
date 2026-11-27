@@ -56,6 +56,46 @@ describe("createApp", () => {
     });
   });
 
+  it("applies API security to the edit-model, streaming and history endpoints", async () => {
+    const app = createApp({ useLogger: false, production: false });
+    const host = "127.0.0.1:5174";
+
+    for (const path of ["/api/edit/stream", "/api/edit/redo"]) {
+      const plain = await app.request(path, {
+        method: "POST",
+        headers: { host, "content-type": "text/plain" },
+        body: "{}",
+      });
+      expect(plain.status).toBe(415);
+
+      const crossSite = await app.request(path, {
+        method: "POST",
+        headers: {
+          host,
+          origin: "https://evil.example",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(crossSite.status).toBe(403);
+    }
+
+    for (const path of ["/api/models", "/api/edit/history"]) {
+      const foreignHost = await app.request(path, {
+        headers: { host: "example.com" },
+      });
+      expect(foreignHost.status).toBe(403);
+
+      const crossSite = await app.request(path, {
+        headers: { host, origin: "https://evil.example" },
+      });
+      expect(crossSite.status).toBe(403);
+
+      const allowed = await app.request(path, { headers: { host } });
+      expect(allowed.status).toBe(200);
+    }
+  });
+
   it("serves production dist files without bypassing API security", async () => {
     const distRoot = createDistFixture();
     const app = createApp({

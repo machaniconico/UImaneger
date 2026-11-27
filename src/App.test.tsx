@@ -64,6 +64,10 @@ vi.mock("./components/GitPanel.tsx", () => ({
   ),
 }));
 
+vi.mock("./components/HistoryPanel.tsx", () => ({
+  HistoryPanel: () => <section aria-label="history-panel" />,
+}));
+
 vi.mock("./components/StatusPanel.tsx", () => ({
   StatusPanel: () => <section aria-label="status-panel" />,
 }));

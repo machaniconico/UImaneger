@@ -7,6 +7,7 @@ import { AfterPreview } from "./components/AfterPreview.tsx";
 import { Chat } from "./components/Chat.tsx";
 import { GitPanel } from "./components/GitPanel.tsx";
 import { StatusPanel } from "./components/StatusPanel.tsx";
+import { HistoryPanel } from "./components/HistoryPanel.tsx";
 
 const STATUS_RETRY_DELAYS_MS = [500, 1000, 2000];
 
@@ -110,9 +111,9 @@ export function App() {
   }
 
   return (
-    <div className="flex h-full bg-neutral-900 text-neutral-200">
+    <div className="flex h-full bg-base text-neutral-200">
       {/* 左: GUI 操作パネル */}
-      <aside className="flex w-[340px] shrink-0 flex-col border-r border-neutral-800">
+      <aside className="flex w-[340px] shrink-0 flex-col border-r border-neutral-800 bg-surface">
         <ProjectBar
           info={info}
           hasKey={hasKey}
@@ -133,9 +134,15 @@ export function App() {
             key={info?.root ?? "none"}
             selected={selected}
             hasKey={hasKey}
+            selectionModeActive={selectMode}
+            onDeselect={() => {
+              setSelected(null);
+              setSelectMode(false);
+            }}
           />
         </div>
         <GitPanel info={info} />
+        <HistoryPanel />
         <StatusPanel />
       </aside>
 

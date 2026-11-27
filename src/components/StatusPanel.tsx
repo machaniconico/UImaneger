@@ -47,8 +47,8 @@ export function StatusPanel() {
   return (
     <div className="border-t border-neutral-800 bg-neutral-950 px-3 py-2 text-[11px] text-neutral-400">
       <div className="mb-1 flex items-center justify-between">
-        <span className="font-semibold text-neutral-300">ステータス</span>
-        <span className={st?.hasKey ? "text-green-400" : "text-red-400"}>
+        <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">ステータス</span>
+        <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${st?.hasKey ? "bg-green-500/10 text-green-400 ring-green-500/20" : "bg-red-500/10 text-red-400 ring-red-500/20"}`}>
           {st?.hasKey ? "API key OK" : "API key 未設定"}
         </span>
       </div>
@@ -82,7 +82,7 @@ export function StatusPanel() {
 
       {logs.length > 0 && (
         <details className="mt-1">
-          <summary className="cursor-pointer text-neutral-500">
+          <summary className="cursor-pointer text-[10px] font-semibold uppercase tracking-wide text-neutral-400 transition-colors duration-150 hover:text-neutral-300">
             起動ログ ({logs.length})
           </summary>
           <pre className="mt-1 max-h-28 overflow-auto rounded bg-black/40 p-1 text-[10px] text-neutral-500">

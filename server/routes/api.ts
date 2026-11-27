@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
+import { streamSSE } from "hono/streaming";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
@@ -9,7 +10,17 @@ import { resolve, join, relative, isAbsolute, basename, dirname } from "node:pat
 import { fileURLToPath } from "node:url";
 import { env } from "../lib/env.ts";
 import { buildChildEnv } from "../lib/child-env.ts";
-import { hasKey, complete, stripCodeFence, TruncatedError } from "../lib/claude.ts";
+import {
+  EDIT_MODELS,
+  isAllowedEditModel,
+  supportsAdaptiveThinking,
+} from "../lib/models.ts";
+import {
+  hasKey,
+  streamComplete,
+  stripCodeFence,
+  TruncatedError,
+} from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
 import {
@@ -43,6 +54,7 @@ interface ProposalEntry {
   relFile: string;
   line?: number;
   confidence: Confidence;
+  instruction: string;
   createdAt: number;
   hadBom: boolean;
 }
@@ -57,6 +69,15 @@ interface UndoEntry {
   proposalId: string;
 }
 
+interface HistoryEntry {
+  id: string;
+  relFile: string;
+  summary?: string;
+  instruction?: string;
+  appliedAt: string;
+  kind: "apply" | "undo" | "redo";
+}
+
 const PROPOSAL_TTL_MS = 30 * 60 * 1000;
 const PROPOSAL_MAX = 100;
 const UNDO_MAX = 50;
@@ -68,17 +89,29 @@ const INSTRUCTION_MAX_CHARS = 20_000;
 const GIT_CLONE_TIMEOUT_MS = 120_000;
 const GIT_OPERATION_TIMEOUT_MS = 30_000;
 const PACKAGE_INSTALL_TIMEOUT_MS = 300_000;
+const HISTORY_MAX = 100;
 
 const proposalStore = new Map<string, ProposalEntry>();
 const undoStack: UndoEntry[] = [];
+const redoStack: UndoEntry[] = [];
+const historyLog: HistoryEntry[] = [];
 
 /** apply/undo 中の proposalId を保護するための処理中セット(同一 proposalId の並行二重書き込み防止)。 */
 const inFlight = new Set<string>();
 /** apply/undo の read-compare-write を対象ファイル単位で直列化するキュー。 */
 const fileLocks = new Map<string, Promise<void>>();
+/** apply/undo/redo の履歴トランザクション全体を直列化するキュー。 */
+let historyLock = Promise.resolve();
 // テスト/検証用途にストアを公開 (本番はプロセス内メモリ)
-export const __stores = { proposalStore, undoStack, inFlight };
+export const __stores = {
+  proposalStore,
+  undoStack,
+  redoStack,
+  inFlight,
+  historyLog,
+};
 let storesRoot: string | null = null;
+let projectEpoch = 0;
 
 function sanitizeForLog(value: unknown): string {
   let s = String(value ?? "");
@@ -88,7 +121,7 @@ function sanitizeForLog(value: unknown): string {
   return s.replace(/sk-ant-[A-Za-z0-9_-]+/g, "[REDACTED]");
 }
 
-function serverError(c: Context, e: unknown, relFile?: string) {
+function serverErrorPayload(c: Context, e: unknown, relFile?: string) {
   const err = e as { name?: string; message?: string; status?: unknown };
   console.error(
     JSON.stringify({
@@ -101,7 +134,11 @@ function serverError(c: Context, e: unknown, relFile?: string) {
       status: err?.status,
     })
   );
-  return c.json({ error: sanitizeForLog((e as Error)?.message ?? e) }, 500);
+  return { error: sanitizeForLog((e as Error)?.message ?? e) };
+}
+
+function serverError(c: Context, e: unknown, relFile?: string) {
+  return c.json(serverErrorPayload(c, e, relFile), 500);
 }
 
 async function readJsonBody<T extends Record<string, unknown>>(
@@ -173,8 +210,35 @@ function ensureStoresForCurrentRoot(): void {
   if (root === storesRoot) return;
   proposalStore.clear();
   undoStack.splice(0);
+  redoStack.splice(0);
+  historyLog.splice(0);
   inFlight.clear();
   storesRoot = root;
+  projectEpoch++;
+}
+
+function isCurrentProject(root: string, epoch: number): boolean {
+  ensureStoresForCurrentRoot();
+  return getRoot() === root && projectEpoch === epoch;
+}
+
+async function withHistoryLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = historyLock;
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  historyLock = previous.then(
+    () => current,
+    () => current
+  );
+
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
 }
 
 async function withFileLock<T>(
@@ -476,6 +540,18 @@ function pushUndo(entry: UndoEntry): void {
   while (undoStack.length > UNDO_MAX) undoStack.shift();
 }
 
+/** redo スタックへ積みつつ件数上限(UNDO_MAX)を維持。古いものから破棄。 */
+function pushRedo(entry: UndoEntry): void {
+  redoStack.push(entry);
+  while (redoStack.length > UNDO_MAX) redoStack.shift();
+}
+
+/** 編集履歴へ記録しつつ件数上限(HISTORY_MAX)を維持。古いものから破棄。 */
+function pushHistory(entry: HistoryEntry): void {
+  historyLog.push(entry);
+  while (historyLog.length > HISTORY_MAX) historyLog.shift();
+}
+
 /**
  * root 配下かを realpath で判定(シンボリックリンク経由のトラバーサルを防止)。
  * ファイルが未存在の場合は親ディレクトリを realpath して判定する。
@@ -576,7 +652,23 @@ api.get("/status", (c) => {
     hasKey: hasKey(),
     logs: getLogs().slice(-50),
     undoDepth: undoStack.length,
+    redoDepth: redoStack.length,
+    historyCount: historyLog.length,
   });
+});
+
+api.get("/models", (c) => {
+  const models: Array<{ id: string; label: string; note: string }> = [
+    ...EDIT_MODELS,
+  ];
+  if (!EDIT_MODELS.some((model) => model.id === env.editModel)) {
+    models.push({
+      id: env.editModel,
+      label: env.editModel,
+      note: "UIM_EDIT_MODEL",
+    });
+  }
+  return c.json({ models, default: env.editModel });
 });
 
 api.post("/project/open", async (c) => {
@@ -611,6 +703,7 @@ api.post("/project/open", async (c) => {
   }
   try {
     const info = await openAndStart(projectPath, { command: runCommand });
+    ensureStoresForCurrentRoot();
     return c.json({ info });
   } catch (e) {
     return serverError(c, e);
@@ -715,6 +808,7 @@ api.post("/project/clone", async (c) => {
       }
     }
     const info = await openAndStart(dest, { command: runCommand });
+    ensureStoresForCurrentRoot();
     return c.json(
       installError
         ? {
@@ -748,6 +842,7 @@ api.post("/project/start", async (c) => {
 
 api.post("/project/stop", async (c) => {
   await stopProject();
+  ensureStoresForCurrentRoot();
   return c.json({ info: getInfo() });
 });
 
@@ -774,82 +869,164 @@ api.post("/files/write", async (c) => {
     return c.json({ error: "path と content は文字列である必要があります。" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
   try {
-    await atomicWrite(resolve(path), content);
+    await withFileLock(path, () => atomicWrite(resolve(path), content));
     return c.json({ ok: true });
   } catch (e) {
     return serverError(c, e);
   }
 });
 
-api.post("/edit", async (c) => {
+type EditRequestBody = {
+  descriptor: DomDescriptor;
+  instruction: string;
+  previousProposalId?: string;
+  model?: string;
+};
+
+interface EditFlowHooks {
+  onResolving?: () => void;
+  onGenerating?: (relFile: string) => void;
+  onProgress?: (info: { chars: number; tail: string }) => void;
+}
+
+type EditFlowResponse = {
+  status: 200 | 400 | 403 | 409;
+  body: Record<string, unknown>;
+};
+
+async function runEditFlow(
+  request: EditRequestBody,
+  hooks: EditFlowHooks = {}
+): Promise<EditFlowResponse> {
   ensureStoresForCurrentRoot();
   const root = getRoot();
-  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+  if (!root)
+    return { status: 400, body: { error: "プロジェクト未オープン" } };
+  const epoch = projectEpoch;
   if (!hasKey())
-    return c.json(
-      { error: "ANTHROPIC_API_KEY 未設定。.env に設定してください。" },
-      400
-    );
+    return {
+      status: 400,
+      body: { error: "ANTHROPIC_API_KEY 未設定。.env に設定してください。" },
+    };
 
-  const body = await readJsonBody<{
-    descriptor: DomDescriptor;
-    instruction: string;
-  }>(c);
-  if (body instanceof Response) return body;
-  const { descriptor: rawDescriptor } = body;
-  const normalizedInstruction = normalizeInstruction(body.instruction);
+  if (request.model !== undefined && !isAllowedEditModel(request.model)) {
+    return { status: 400, body: { error: "許可されていないモデルです" } };
+  }
+  const chosenModel = request.model || env.editModel;
+
+  const { descriptor: rawDescriptor, previousProposalId } = request;
+  const normalizedInstruction = normalizeInstruction(request.instruction);
   if (!normalizedInstruction.ok)
-    return c.json({ error: normalizedInstruction.error }, 400);
+    return { status: 400, body: { error: normalizedInstruction.error } };
   const instruction = normalizedInstruction.instruction;
   const descErr = validateDescriptor(rawDescriptor);
-  if (descErr) return c.json({ error: descErr }, 400);
+  if (descErr) return { status: 400, body: { error: descErr } };
   const descriptor = remapBeforeSource(root, normalizeDescriptor(rawDescriptor));
 
-  try {
-    // 1. ソース解決 (層A/B)
-    const resolved = await resolveSource(root, descriptor);
-    if (!resolved.file) {
-      return c.json({
+  hooks.onResolving?.();
+  const resolved = await resolveSource(root, descriptor);
+  if (!resolved.file) {
+    return {
+      status: 200,
+      body: {
         ok: false,
         error:
           "対象のソース箇所を特定できませんでした。要素のテキストやclass/idが手がかりに乏しい可能性があります。",
         confidence: "low",
         candidates: resolved.candidates,
-      });
-    }
-    if (!inRoot(root, resolved.file))
-      return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
+      },
+    };
+  }
+  if (!inRoot(root, resolved.file))
+    return { status: 403, body: { error: "解決先がプロジェクト範囲外" } };
 
-    if (resolved.confidence === "low") {
-      return c.json({
+  if (resolved.confidence === "low") {
+    return {
+      status: 200,
+      body: {
         ok: false,
         error: "対象箇所を一意に特定できませんでした。候補を確認して選択してください。",
         confidence: "low",
         candidates: resolved.candidates,
-      });
+      },
+    };
+  }
+
+  const relFile = relative(root, resolved.file);
+  hooks.onGenerating?.(relFile);
+  const result = await buildProposalForFile(
+    root,
+    resolved.file,
+    resolved.line,
+    descriptor,
+    instruction,
+    resolved.confidence,
+    {
+      onProgress: hooks.onProgress,
+      previousProposalId,
+      model: chosenModel,
+      projectEpoch: epoch,
     }
+  );
 
-    // 2. 提案生成 (ファイルはまだ書かない)
-    const result = await buildProposalForFile(
-      root,
-      resolved.file,
-      resolved.line,
-      descriptor,
-      instruction,
-      resolved.confidence
-    );
+  if (!isCurrentProject(root, epoch)) {
+    return {
+      status: 409,
+      body: { error: "プロジェクトが切り替わったため中断しました" },
+    };
+  }
 
-    // 3. 複数候補時は candidates を同梱 (low は上で選択必須として返却済み)
-    const includeCandidates =
-      Array.isArray(resolved.candidates) && resolved.candidates.length > 1;
-    return c.json(
-      includeCandidates
-        ? { ...result, candidates: resolved.candidates }
-        : result
-    );
+  // 複数候補時は candidates を同梱 (low は生成前に選択必須として返却済み)
+  const includeCandidates =
+    Array.isArray(resolved.candidates) && resolved.candidates.length > 1;
+  return {
+    status: 200,
+    body: includeCandidates
+      ? { ...result, candidates: resolved.candidates }
+      : result,
+  };
+}
+
+api.post("/edit", async (c) => {
+  try {
+    const request = await readJsonBody<EditRequestBody>(c);
+    if (request instanceof Response) return request;
+    const result = await runEditFlow(request);
+    return c.json(result.body, result.status);
   } catch (e) {
     return serverError(c, e);
   }
+});
+
+api.post("/edit/stream", async (c) => {
+  // body の不正・過大はストリーム開始前に通常の JSON エラー (400/413) で返す
+  const request = await readJsonBody<EditRequestBody>(c);
+  if (request instanceof Response) return request;
+  return streamSSE(c, async (stream) => {
+    let writes = Promise.resolve();
+    const send = (event: Record<string, unknown>): void => {
+      writes = writes.then(() =>
+        stream.writeSSE({ data: JSON.stringify(event) })
+      );
+    };
+
+    try {
+      const result = await runEditFlow(request, {
+        onResolving: () => send({ type: "stage", stage: "resolving" }),
+        onGenerating: (file) =>
+          send({ type: "stage", stage: "generating", file }),
+        onProgress: ({ chars, tail }) =>
+          send({ type: "progress", chars, tail }),
+      });
+      send({
+        type: "result",
+        ...(result.status === 200 ? result.body : { ok: false, ...result.body }),
+      });
+    } catch (e) {
+      send({ type: "result", ok: false, ...serverErrorPayload(c, e) });
+    }
+    await writes;
+  });
 });
 
 /**
@@ -863,7 +1040,13 @@ async function buildProposalForFile(
   line: number | undefined,
   descriptor: DomDescriptor,
   instruction: string,
-  confidence: Confidence
+  confidence: Confidence,
+  options: {
+    onProgress?: (info: { chars: number; tail: string }) => void;
+    previousProposalId?: string;
+    model?: string;
+    projectEpoch?: number;
+  } = {}
 ): Promise<
   | {
       ok: true;
@@ -898,10 +1081,51 @@ async function buildProposalForFile(
     };
   }
   const original = decoded.text;
-  const prompt = buildEditPrompt(relFile, original, descriptor, line, instruction);
+  pruneProposals();
+  const hasPreviousProposalId = options.previousProposalId !== undefined;
+  const previous = hasPreviousProposalId
+    ? proposalStore.get(options.previousProposalId!)
+    : undefined;
+  if (
+    hasPreviousProposalId &&
+    (!previous || resolve(previous.file) !== resolve(file))
+  ) {
+    return {
+      ok: false,
+      file,
+      relFile,
+      line,
+      confidence,
+      error:
+        "追い込み元の提案が見つかりませんでした（期限切れの可能性）。もう一度通常の指示からやり直してください。",
+    };
+  }
+  const isRefinement = Boolean(
+    previous &&
+      resolve(previous.file) === resolve(file) &&
+      originalBytes.equals(previous.originalBytes)
+  );
+  const promptContent = previous && isRefinement ? previous.proposed : original;
+  const prompt = buildEditPrompt(
+    relFile,
+    promptContent,
+    descriptor,
+    line,
+    instruction,
+    isRefinement
+  );
   let raw: string;
   try {
-    raw = await complete(prompt, { maxTokens: 16000 });
+    const chosenModel = options.model || env.editModel;
+    raw = await streamComplete(
+      prompt,
+      {
+        maxTokens: 64000,
+        model: chosenModel,
+        adaptive: supportsAdaptiveThinking(chosenModel),
+      },
+      options.onProgress
+    );
   } catch (e) {
     if (e instanceof TruncatedError) {
       return {
@@ -934,6 +1158,19 @@ async function buildProposalForFile(
 
   const diff = createUnifiedDiff(original, edited, relFile);
   const proposalId = randomUUID();
+  if (
+    options.projectEpoch !== undefined &&
+    !isCurrentProject(root, options.projectEpoch)
+  ) {
+    return {
+      ok: false,
+      file,
+      relFile,
+      line,
+      confidence,
+      error: "プロジェクトが切り替わったため中断しました",
+    };
+  }
   pruneProposals();
   proposalStore.set(proposalId, {
     file,
@@ -943,6 +1180,7 @@ async function buildProposalForFile(
     relFile,
     line,
     confidence,
+    instruction,
     createdAt: Date.now(),
     hadBom: decoded.hadBom,
   });
@@ -1004,6 +1242,7 @@ api.post("/edit/candidate", async (c) => {
     ? normalizeDescriptor(rawDescriptor)
     : { tag: "", classes: [], attrs: {}, domPath: "" };
 
+  const epoch = projectEpoch;
   try {
     const result = await buildProposalForFile(
       root,
@@ -1011,7 +1250,8 @@ api.post("/edit/candidate", async (c) => {
       line,
       desc,
       instruction,
-      "medium"
+      "medium",
+      { projectEpoch: epoch }
     );
     return c.json(result);
   } catch (e) {
@@ -1021,71 +1261,87 @@ api.post("/edit/candidate", async (c) => {
 
 /** 提案を適用: ここで初めてファイルを書き、直前内容を undo スタックへ。 */
 api.post("/edit/apply", async (c) => {
-  ensureStoresForCurrentRoot();
-  const root = getRoot();
-  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   const body = await readJsonBody<{ proposalId: string }>(c);
   if (body instanceof Response) return body;
   const { proposalId } = body;
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
 
-  pruneProposals();
+  return withHistoryLock(async () => {
+    ensureStoresForCurrentRoot();
+    const root = getRoot();
+    if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+    const epoch = projectEpoch;
+    pruneProposals();
 
-  const p = proposalStore.get(proposalId);
-  if (!p)
-    return c.json(
-      { error: "提案が見つかりません (期限切れまたは未存在)。" },
-      404
-    );
-  if (!inRoot(root, p.file))
-    return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
+    const p = proposalStore.get(proposalId);
+    if (!p)
+      return c.json(
+        { error: "提案が見つかりません (期限切れまたは未存在)。" },
+        404
+      );
+    if (!inRoot(root, p.file))
+      return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
+    if (inFlight.has(proposalId))
+      return c.json({ error: "この提案は現在処理中です。" }, 409);
+    inFlight.add(proposalId);
 
-  // 同一 proposalId の並行 apply を拒否(二重書き込み/undo 二重 push 防止)
-  if (inFlight.has(proposalId))
-    return c.json({ error: "この提案は現在処理中です。" }, 409);
-  inFlight.add(proposalId);
-
-  try {
-    return await withFileLock(p.file, async () => {
-      const beforeBytes = await readFile(p.file);
-      if (getRoot() !== root) {
-        return c.json(
-          { error: "プロジェクトが切り替わったため中断しました" },
-          409
-        );
-      }
-      if (Buffer.compare(beforeBytes, p.originalBytes) !== 0) {
-        return c.json(
-          { error: "ファイルが変更されています。再提案してください。" },
-          409
-        );
-      }
-      const before = beforeBytes.toString("utf8");
-      const appliedContent = withBom(p.proposed, p.hadBom);
-      await atomicWrite(p.file, appliedContent);
-      pushUndo({
-        file: p.file,
-        relFile: p.relFile,
-        previousContent: before,
-        appliedContent,
-        proposalId,
+    try {
+      return await withFileLock(p.file, async () => {
+        const beforeBytes = await readFile(p.file);
+        if (Buffer.compare(beforeBytes, p.originalBytes) !== 0) {
+          return c.json(
+            { error: "ファイルが変更されています。再提案してください。" },
+            409
+          );
+        }
+        if (!isCurrentProject(root, epoch)) {
+          return c.json(
+            { error: "プロジェクトが切り替わったため中断しました" },
+            409
+          );
+        }
+        const before = beforeBytes.toString("utf8");
+        const appliedContent = withBom(p.proposed, p.hadBom);
+        await atomicWrite(p.file, appliedContent);
+        if (!isCurrentProject(root, epoch)) {
+          return c.json(
+            { error: "プロジェクトが切り替わったため中断しました" },
+            409
+          );
+        }
+        pushUndo({
+          file: p.file,
+          relFile: p.relFile,
+          previousContent: before,
+          appliedContent,
+          proposalId,
+        });
+        redoStack.splice(0);
+        pushHistory({
+          id: randomUUID(),
+          relFile: p.relFile,
+          summary: `${p.relFile} を適用しました。`,
+          instruction: p.instruction,
+          appliedAt: new Date().toISOString(),
+          kind: "apply",
+        });
+        proposalStore.delete(proposalId);
+        return c.json({
+          ok: true,
+          file: p.file,
+          relFile: p.relFile,
+          line: p.line,
+          summary: `${p.relFile} を適用しました。`,
+          undoDepth: undoStack.length,
+        });
       });
-      proposalStore.delete(proposalId);
-      return c.json({
-        ok: true,
-        file: p.file,
-        relFile: p.relFile,
-        line: p.line,
-        summary: `${p.relFile} を適用しました。`,
-        undoDepth: undoStack.length,
-      });
-    });
-  } catch (e) {
-    return serverError(c, e, p.relFile);
-  } finally {
-    inFlight.delete(proposalId);
-  }
+    } catch (e) {
+      return serverError(c, e, p.relFile);
+    } finally {
+      inFlight.delete(proposalId);
+    }
+  });
 });
 
 /** 提案を破棄。 */
@@ -1106,60 +1362,142 @@ api.post("/edit/reject", async (c) => {
 
 /** 最後の適用を取り消す。 */
 api.post("/edit/undo", async (c) => {
-  ensureStoresForCurrentRoot();
-  const root = getRoot();
-  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
-  const entry = undoStack.pop();
-  if (!entry)
-    return c.json({ error: "元に戻せる適用がありません。" }, 404);
-  // 同一 proposalId の並行 undo/apply を拒否(二重書き込み防止)
-  if (inFlight.has(entry.proposalId)) {
-    undoStack.push(entry);
-    return c.json({ error: "この提案は現在処理中です。" }, 409);
-  }
-  inFlight.add(entry.proposalId);
-  if (!inRoot(root, entry.file)) {
-    undoStack.push(entry);
-    inFlight.delete(entry.proposalId);
-    return c.json({ error: "対象がプロジェクト範囲外" }, 403);
-  }
-  try {
-    return await withFileLock(entry.file, async () => {
-      const currentBytes = await readFile(entry.file);
-      if (getRoot() !== root) {
-        undoStack.push(entry);
-        return c.json(
-          { error: "プロジェクトが切り替わったため中断しました" },
-          409
-        );
-      }
-      if (
-        Buffer.compare(
-          currentBytes,
-          Buffer.from(entry.appliedContent, "utf8")
-        ) !== 0
-      ) {
-        undoStack.push(entry);
-        return c.json(
-          { error: "適用後にファイルが変更されているため取り消せません。" },
-          409
-        );
-      }
-      await atomicWrite(entry.file, entry.previousContent);
-      return c.json({
-        ok: true,
-        file: entry.file,
-        relFile: entry.relFile,
-        summary: `${entry.relFile} の適用を取り消しました。`,
-        undoDepth: undoStack.length,
+  return withHistoryLock(async () => {
+    ensureStoresForCurrentRoot();
+    const root = getRoot();
+    if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+    const epoch = projectEpoch;
+    const entry = undoStack.at(-1);
+    if (!entry)
+      return c.json({ error: "元に戻せる適用がありません。" }, 404);
+    if (inFlight.has(entry.proposalId))
+      return c.json({ error: "この提案は現在処理中です。" }, 409);
+    if (!inRoot(root, entry.file))
+      return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+    inFlight.add(entry.proposalId);
+    try {
+      return await withFileLock(entry.file, async () => {
+        const currentBytes = await readFile(entry.file);
+        if (
+          Buffer.compare(
+            currentBytes,
+            Buffer.from(entry.appliedContent, "utf8")
+          ) !== 0
+        ) {
+          return c.json(
+            { error: "適用後にファイルが変更されているため取り消せません。" },
+            409
+          );
+        }
+        if (!isCurrentProject(root, epoch)) {
+          return c.json(
+            { error: "プロジェクトが切り替わったため中断しました" },
+            409
+          );
+        }
+        await atomicWrite(entry.file, entry.previousContent);
+        if (!isCurrentProject(root, epoch)) {
+          return c.json(
+            { error: "プロジェクトが切り替わったため中断しました" },
+            409
+          );
+        }
+        undoStack.pop();
+        pushRedo(entry);
+        pushHistory({
+          id: randomUUID(),
+          relFile: entry.relFile,
+          appliedAt: new Date().toISOString(),
+          kind: "undo",
+        });
+        return c.json({
+          ok: true,
+          file: entry.file,
+          relFile: entry.relFile,
+          summary: `${entry.relFile} の適用を取り消しました。`,
+          undoDepth: undoStack.length,
+          redoDepth: redoStack.length,
+        });
       });
-    });
-  } catch (e) {
-    undoStack.push(entry);
-    return serverError(c, e, entry.relFile);
-  } finally {
-    inFlight.delete(entry.proposalId);
-  }
+    } catch (e) {
+      return serverError(c, e, entry.relFile);
+    } finally {
+      inFlight.delete(entry.proposalId);
+    }
+  });
+});
+
+/** 最後に取り消した適用をやり直す。 */
+api.post("/edit/redo", async (c) => {
+  return withHistoryLock(async () => {
+    ensureStoresForCurrentRoot();
+    const root = getRoot();
+    if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
+    const epoch = projectEpoch;
+    const entry = redoStack.at(-1);
+    if (!entry)
+      return c.json({ error: "やり直せる取り消しがありません。" }, 404);
+    if (inFlight.has(entry.proposalId))
+      return c.json({ error: "この提案は現在処理中です。" }, 409);
+    if (!inRoot(root, entry.file))
+      return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+    inFlight.add(entry.proposalId);
+    try {
+      return await withFileLock(entry.file, async () => {
+        const currentBytes = await readFile(entry.file);
+        if (
+          Buffer.compare(
+            currentBytes,
+            Buffer.from(entry.previousContent, "utf8")
+          ) !== 0
+        ) {
+          return c.json(
+            { error: "取り消し後にファイルが変更されているためやり直せません。" },
+            409
+          );
+        }
+        if (!isCurrentProject(root, epoch)) {
+          return c.json(
+            { error: "プロジェクトが切り替わったため中断しました" },
+            409
+          );
+        }
+        await atomicWrite(entry.file, entry.appliedContent);
+        if (!isCurrentProject(root, epoch)) {
+          return c.json(
+            { error: "プロジェクトが切り替わったため中断しました" },
+            409
+          );
+        }
+        redoStack.pop();
+        pushUndo(entry);
+        pushHistory({
+          id: randomUUID(),
+          relFile: entry.relFile,
+          appliedAt: new Date().toISOString(),
+          kind: "redo",
+        });
+        return c.json({
+          ok: true,
+          file: entry.file,
+          relFile: entry.relFile,
+          summary: `${entry.relFile} をやり直しました。`,
+          undoDepth: undoStack.length,
+          redoDepth: redoStack.length,
+        });
+      });
+    } catch (e) {
+      return serverError(c, e, entry.relFile);
+    } finally {
+      inFlight.delete(entry.proposalId);
+    }
+  });
+});
+
+/** 編集履歴を新しい順で返す。 */
+api.get("/edit/history", (c) => {
+  ensureStoresForCurrentRoot();
+  return c.json({ history: [...historyLog].reverse() });
 });
 
 function buildEditPrompt(
@@ -1167,7 +1505,8 @@ function buildEditPrompt(
   content: string,
   d: DomDescriptor,
   line: number | undefined,
-  instruction: string
+  instruction: string,
+  isRefinement = false
 ): string {
   return `あなたは熟練のフロントエンド開発者です。ユーザーが画面上の要素を選び、自然言語で変更を指示しました。
 対象ファイルを編集し、**ファイル全体を1つのコードブロックで** 返してください。説明文は不要です。
@@ -1188,7 +1527,11 @@ ${instruction}
 - 既存のコードスタイル/インデント/フレームワーク作法に合わせる。
 - ファイル全体を完全な形で返す(省略やプレースホルダ禁止)。
 
-# 現在のファイル内容
+# ${
+    isRefinement
+      ? "現在の作業版（ユーザーの前回の指示を反映済み）"
+      : "現在のファイル内容"
+  }
 \`\`\`
 ${content}
 \`\`\``;

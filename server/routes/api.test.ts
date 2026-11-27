@@ -24,6 +24,7 @@ import {
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
+import { env } from "../lib/env.ts";
 import type { DomDescriptor } from "../lib/types.ts";
 
 const claudeMock = vi.hoisted(() => {
@@ -36,6 +37,7 @@ const claudeMock = vi.hoisted(() => {
 
   return {
     complete: vi.fn(),
+    streamComplete: vi.fn(),
     TruncatedError,
   };
 });
@@ -51,6 +53,7 @@ const fsPromisesMock = vi.hoisted(() => ({
 
 vi.mock("../lib/claude.ts", () => ({
   complete: claudeMock.complete,
+  streamComplete: claudeMock.streamComplete,
   hasKey: () => true,
   stripCodeFence: (text: string) => {
     const m = text.match(/```[a-zA-Z0-9_-]*[ \t]*\r?\n([\s\S]*?)^```/m);
@@ -205,6 +208,22 @@ async function postRaw<T = Record<string, unknown>>(
   };
 }
 
+async function postSse(
+  path: string,
+  body: unknown
+): Promise<{ res: Response; events: Array<Record<string, unknown>> }> {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  const events = [...text.matchAll(/^data: ?(.*)$/gm)].map((match) =>
+    JSON.parse(match[1])
+  );
+  return { res, events };
+}
+
 async function requestProposal(proposed = editedContent): Promise<ProposalBody> {
   claudeMock.complete.mockResolvedValueOnce(proposed);
   const { res, body } = await postJson<ProposalBody>("/api/edit", {
@@ -287,8 +306,19 @@ function initGitRepo(dir: string): boolean {
 beforeEach(async () => {
   resetFsPromiseMocks();
   claudeMock.complete.mockReset();
+  claudeMock.streamComplete.mockReset();
+  claudeMock.streamComplete.mockImplementation(
+    (
+      prompt: string,
+      opts: unknown,
+      onProgress?: (info: { chars: number; tail: string }) => void
+    ) =>
+      claudeMock.complete(prompt, opts, onProgress)
+  );
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
+  __stores.redoStack.splice(0);
+  __stores.historyLog.splice(0);
   __stores.inFlight.clear();
 
   root = mkdtempSync(join(tmpdir(), "uim-api-"));
@@ -302,6 +332,8 @@ beforeEach(async () => {
 afterEach(async () => {
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
+  __stores.redoStack.splice(0);
+  __stores.historyLog.splice(0);
   __stores.inFlight.clear();
   resetFsPromiseMocks();
   await stopProject();
@@ -511,6 +543,333 @@ describe("edit proposal API", () => {
     expect(body.confidence).toBe("low");
     expect(body.candidates[0]?.file).toBe(messagesFile);
     expect(claudeMock.complete).not.toHaveBeenCalled();
+  });
+
+  it("returns the available edit models and server default", async () => {
+    const originalEditModel = env.editModel;
+    env.editModel = "claude-opus-4-8";
+    try {
+      const { res, body } = await getJson<{
+        models: Array<{ id: string; label: string; note: string }>;
+        default: string;
+      }>("/api/models");
+
+      expect(res.status).toBe(200);
+      expect(body).toEqual({
+        models: [
+          { id: "claude-opus-4-8", label: "Opus 4.8", note: "高品質(既定)" },
+          { id: "claude-sonnet-5", label: "Sonnet 5", note: "バランス・高速" },
+          { id: "claude-haiku-4-5", label: "Haiku 4.5", note: "最速・最安" },
+        ],
+        default: "claude-opus-4-8",
+      });
+    } finally {
+      env.editModel = originalEditModel;
+    }
+  });
+
+  it("includes and accepts a custom UIM_EDIT_MODEL", async () => {
+    const originalEditModel = env.editModel;
+    env.editModel = "claude-custom-local";
+    try {
+      const models = await getJson<{
+        models: Array<{ id: string; label: string; note: string }>;
+        default: string;
+      }>("/api/models");
+      expect(models.body.default).toBe("claude-custom-local");
+      expect(models.body.models.at(-1)).toEqual({
+        id: "claude-custom-local",
+        label: "claude-custom-local",
+        note: "UIM_EDIT_MODEL",
+      });
+
+      claudeMock.complete.mockResolvedValueOnce(editedContent);
+      const edit = await postJson<ProposalBody>("/api/edit", {
+        descriptor: descriptorFor(filePath),
+        instruction: "Change the button label.",
+        model: "claude-custom-local",
+      });
+      expect(edit.res.status).toBe(200);
+      expect(claudeMock.streamComplete).toHaveBeenCalledWith(
+        expect.any(String),
+        {
+          maxTokens: 64000,
+          model: "claude-custom-local",
+          adaptive: false,
+        },
+        undefined
+      );
+    } finally {
+      env.editModel = originalEditModel;
+    }
+  });
+
+  it("rejects an unknown edit model", async () => {
+    const { res, body } = await postJson<{ error: string }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+      model: "claude-unknown",
+    });
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({ error: "許可されていないモデルです" });
+    expect(claudeMock.streamComplete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["claude-haiku-4-5", false],
+    ["claude-sonnet-5", true],
+  ])("forwards model %s with adaptive=%s", async (model, adaptive) => {
+    claudeMock.complete.mockResolvedValueOnce(editedContent);
+
+    const { res } = await postJson<ProposalBody>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+      model,
+    });
+
+    expect(res.status).toBe(200);
+    expect(claudeMock.streamComplete).toHaveBeenCalledWith(
+      expect.any(String),
+      { maxTokens: 64000, model, adaptive },
+      undefined
+    );
+  });
+
+  it("streams resolving, generating, progress, and a successful result", async () => {
+    claudeMock.complete.mockImplementationOnce(
+      async (
+        _prompt: string,
+        _opts: unknown,
+        onProgress?: (info: { chars: number; tail: string }) => void
+      ) => {
+        onProgress?.({ chars: 42, tail: "generated tail" });
+        return editedContent;
+      }
+    );
+
+    const { res, events } = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+
+    expect(res.headers.get("content-type")).toContain("text/event-stream");
+    expect(events.map((event) => event.type)).toEqual([
+      "stage",
+      "stage",
+      "progress",
+      "result",
+    ]);
+    expect(events[0]).toEqual({ type: "stage", stage: "resolving" });
+    expect(events[1]).toEqual({
+      type: "stage",
+      stage: "generating",
+      file: "src/App.tsx",
+    });
+    expect(events[2]).toEqual({
+      type: "progress",
+      chars: 42,
+      tail: "generated tail",
+    });
+    expect(events[3]).toMatchObject({
+      type: "result",
+      ok: true,
+      relFile: "src/App.tsx",
+    });
+    expect(typeof events[3].proposalId).toBe("string");
+  });
+
+  it("does not store completed generations after an A-B-A project switch", async () => {
+    const bothGenerationsStarted = deferred();
+    const releaseGenerations = deferred();
+    let started = 0;
+    claudeMock.complete.mockImplementation(async () => {
+      started++;
+      if (started === 2) bothGenerationsStarted.resolve();
+      await releaseGenerations.promise;
+      return editedContent;
+    });
+
+    const jsonGeneration = postJson<{ error: string }>("/api/edit", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    const streamGeneration = postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    await bothGenerationsStarted.promise;
+
+    const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-generation-aba-"));
+    mkdirSync(join(nextRoot, "src"), { recursive: true });
+    writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+    await openProject(nextRoot, { command: "echo test-server-ready" });
+    await getJson("/api/status");
+    await openProject(root, { command: "echo test-server-ready" });
+    await getJson("/api/status");
+
+    releaseGenerations.resolve();
+    const [jsonResult, streamResult] = await Promise.all([
+      jsonGeneration,
+      streamGeneration,
+    ]);
+
+    expect(jsonResult.res.status).toBe(409);
+    expect(jsonResult.body.error).toBe(
+      "プロジェクトが切り替わったため中断しました"
+    );
+    expect(streamResult.events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      error: "プロジェクトが切り替わったため中断しました",
+    });
+    expect(__stores.proposalStore.size).toBe(0);
+    rmSync(nextRoot, { recursive: true, force: true });
+  });
+
+  it("refines a previous pending proposal while keeping the disk file as the diff baseline", async () => {
+    const firstProposed = editedContent.replace(
+      "Saved successfully",
+      "First pending version"
+    );
+    const refinedProposed = editedContent.replace(
+      "Saved successfully",
+      "Refined pending version"
+    );
+    claudeMock.complete.mockResolvedValueOnce(firstProposed);
+    const first = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    const firstResult = first.events.at(-1)!;
+
+    claudeMock.complete.mockResolvedValueOnce(refinedProposed);
+    const second = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Make it more prominent.",
+      previousProposalId: firstResult.proposalId,
+    });
+    const secondResult = second.events.at(-1)!;
+    const secondPrompt = String(claudeMock.complete.mock.calls[1][0]);
+
+    expect(secondPrompt).toContain("First pending version");
+    expect(secondPrompt).toContain(
+      "現在の作業版（ユーザーの前回の指示を反映済み）"
+    );
+    expect(secondResult).toMatchObject({ type: "result", ok: true });
+    expect(String(secondResult.diff)).toContain("Save now");
+    expect(String(secondResult.diff)).toContain("Refined pending version");
+    expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondResult.proposalId,
+    });
+    expect(applied.res.status).toBe(200);
+    expect(readFileSync(filePath, "utf8")).toBe(refinedProposed);
+  });
+
+  it("falls back to the current disk content when the refinement baseline bytes changed", async () => {
+    const firstProposed = editedContent.replace(
+      "Saved successfully",
+      "First pending version"
+    );
+    claudeMock.complete.mockResolvedValueOnce(firstProposed);
+    const first = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Change the button label.",
+    });
+    const firstResult = first.events.at(-1)!;
+    const interveningContent = originalContent.replace(
+      "const label = \"Save now\";",
+      "const label = \"Changed on disk\";"
+    );
+    writeFileSync(filePath, interveningContent, "utf8");
+    claudeMock.complete.mockResolvedValueOnce(
+      interveningContent.replace("Changed on disk", "Fresh proposal")
+    );
+
+    const second = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Make it more prominent.",
+      previousProposalId: firstResult.proposalId,
+    });
+    const secondPrompt = String(claudeMock.complete.mock.calls[1][0]);
+
+    expect(secondPrompt).toContain("Changed on disk");
+    expect(secondPrompt).not.toContain("First pending version");
+    expect(secondPrompt).not.toContain(
+      "現在の作業版（ユーザーの前回の指示を反映済み）"
+    );
+    expect(second.events.at(-1)).toMatchObject({ type: "result", ok: true });
+  });
+
+  it("returns an explicit error when a supplied refinement proposal is missing", async () => {
+    const { events } = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "Make it more prominent.",
+      previousProposalId: "missing-proposal",
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      error:
+        "追い込み元の提案が見つかりませんでした（期限切れの可能性）。もう一度通常の指示からやり直してください。",
+    });
+    expect(claudeMock.streamComplete).not.toHaveBeenCalled();
+  });
+
+  it("includes ok:false in validation failure stream results", async () => {
+    const { events } = await postSse("/api/edit/stream", {
+      descriptor: descriptorFor(filePath),
+      instruction: "",
+    });
+
+    expect(events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      error: "指示が空です",
+    });
+  });
+
+  it("ends the stream with a result when source resolution finds no file", async () => {
+    const { events } = await postSse("/api/edit/stream", {
+      descriptor: {
+        tag: "definitely-absent-tag",
+        classes: ["uim-no-match-unique"],
+        attrs: {},
+        domPath: "",
+      },
+      instruction: "Change this element.",
+    });
+
+    expect(events.map((event) => event.type)).toEqual(["stage", "result"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "result",
+      ok: false,
+      confidence: "low",
+      candidates: [],
+    });
+    expect(claudeMock.streamComplete).not.toHaveBeenCalled();
+  });
+
+  it("ends the stream with the server error result shape when generation throws", async () => {
+    claudeMock.complete.mockRejectedValueOnce(new Error("stream failed"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const { events } = await postSse("/api/edit/stream", {
+        descriptor: descriptorFor(filePath),
+        instruction: "Change the button label.",
+      });
+
+      expect(events.at(-1)).toEqual({
+        type: "result",
+        ok: false,
+        error: "stream failed",
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it("creates a proposal with a unified diff without changing the file", async () => {
@@ -791,7 +1150,7 @@ describe("edit proposal API", () => {
     expect(__stores.proposalStore.has(secondProposal.proposalId)).toBe(true);
   });
 
-  it("does not serialize concurrent apply operations for different files", async () => {
+  it("serializes concurrent apply operations globally across different files", async () => {
     const otherFilePath = join(root, "src", "Other.tsx");
     writeFileSync(otherFilePath, originalContent, "utf8");
     const firstContent = originalContent.replace(
@@ -848,11 +1207,68 @@ describe("edit proposal API", () => {
       secondApply,
     ]);
 
-    expect(completedBeforeRelease).toBe(true);
+    expect(completedBeforeRelease).toBe(false);
     expect(firstResult.res.status).toBe(200);
     expect(secondResult.res.status).toBe(200);
     expect(readFileSync(filePath, "utf8")).toBe(firstContent);
     expect(readFileSync(otherFilePath, "utf8")).toBe(secondContent);
+  });
+
+  it("serializes undo then apply without resurrecting redo history", async () => {
+    const otherFilePath = join(root, "src", "Other.tsx");
+    writeFileSync(otherFilePath, originalContent, "utf8");
+    const firstProposal = await requestProposal();
+    claudeMock.complete.mockResolvedValueOnce(
+      originalContent.replace("Save now", "Other saved")
+    );
+    const secondProposal = await postJson<ProposalBody>(
+      "/api/edit/candidate",
+      {
+        file: otherFilePath,
+        descriptor: descriptorFor(otherFilePath),
+        instruction: "Change the other button label.",
+      }
+    );
+    await postJson("/api/edit/apply", {
+      proposalId: firstProposal.proposalId,
+    });
+
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const undoWriteStarted = deferred();
+    const releaseUndoWrite = deferred();
+    let blockedWrite = false;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (!blockedWrite && String(args[0]).startsWith(`${filePath}.tmp-`)) {
+        blockedWrite = true;
+        undoWriteStarted.resolve();
+        await releaseUndoWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    const undo = postJson<{ ok: true }>("/api/edit/undo", {});
+    await undoWriteStarted.promise;
+    const apply = postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondProposal.body.proposalId,
+    });
+    const applyCompletedEarly = await Promise.race([
+      apply.then(() => true),
+      delay(50).then(() => false),
+    ]);
+
+    expect(applyCompletedEarly).toBe(false);
+    releaseUndoWrite.resolve();
+    const [undoResult, applyResult] = await Promise.all([undo, apply]);
+
+    expect(undoResult.res.status).toBe(200);
+    expect(applyResult.res.status).toBe(200);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.historyLog.map((entry) => entry.kind)).toEqual([
+      "apply",
+      "undo",
+      "apply",
+    ]);
   });
 
   it("aborts apply when the project changes after reading the file", async () => {
@@ -893,6 +1309,9 @@ describe("edit proposal API", () => {
     expect(result.body.error).toBe(
       "プロジェクトが切り替わったため中断しました"
     );
+    expect(__stores.undoStack).toHaveLength(0);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.historyLog).toHaveLength(0);
     expect(readFileSync(oldFilePath, "utf8")).toBe(originalContent);
     rmSync(oldRoot, { recursive: true, force: true });
   });
@@ -937,6 +1356,98 @@ describe("edit proposal API", () => {
     expect(readFileSync(filePath, "utf8")).toBe(originalContent);
   });
 
+  it("round-trips apply, undo, and redo while reporting stack depths", async () => {
+    const proposal = await requestProposal();
+
+    const applied = await postJson<{ ok: true; undoDepth: number }>(
+      "/api/edit/apply",
+      { proposalId: proposal.proposalId }
+    );
+    expect(applied.res.status).toBe(200);
+    expect(applied.body.undoDepth).toBe(1);
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+
+    const statusAfterApply = await getJson<{
+      undoDepth: number;
+      redoDepth: number;
+    }>("/api/status");
+    expect(statusAfterApply.body).toMatchObject({
+      undoDepth: 1,
+      redoDepth: 0,
+    });
+
+    const undone = await postJson<{
+      ok: true;
+      undoDepth: number;
+      redoDepth: number;
+    }>("/api/edit/undo", {});
+    expect(undone.res.status).toBe(200);
+    expect(undone.body).toMatchObject({ undoDepth: 0, redoDepth: 1 });
+    expect(readFileSync(filePath, "utf8")).toBe(originalContent);
+
+    const redone = await postJson<{
+      ok: true;
+      undoDepth: number;
+      redoDepth: number;
+    }>("/api/edit/redo", {});
+    expect(redone.res.status).toBe(200);
+    expect(redone.body).toMatchObject({ undoDepth: 1, redoDepth: 0 });
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+  });
+
+  it("keeps the redo entry when the file changed after undo", async () => {
+    const proposal = await requestProposal();
+    await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    await postJson("/api/edit/undo", {});
+    const drifted = originalContent.replace("Save now", "Changed later");
+    writeFileSync(filePath, drifted, "utf8");
+
+    const redone = await postJson<{ error: string }>("/api/edit/redo", {});
+
+    expect(redone.res.status).toBe(409);
+    expect(redone.body.error).toMatch(/変更|やり直/);
+    expect(__stores.redoStack).toHaveLength(1);
+    expect(readFileSync(filePath, "utf8")).toBe(drifted);
+  });
+
+  it("clears the redo stack after a new apply", async () => {
+    const firstProposal = await requestProposal();
+    await postJson("/api/edit/apply", {
+      proposalId: firstProposal.proposalId,
+    });
+    await postJson("/api/edit/undo", {});
+    expect(__stores.redoStack).toHaveLength(1);
+
+    const secondProposal = await requestProposal();
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: secondProposal.proposalId,
+    });
+
+    expect(applied.res.status).toBe(200);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(readFileSync(filePath, "utf8")).toBe(editedContent);
+  });
+
+  it("returns apply, undo, and redo history in newest-first order", async () => {
+    const proposal = await requestProposal();
+    await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    await postJson("/api/edit/undo", {});
+    await postJson("/api/edit/redo", {});
+
+    const history = await getJson<{
+      history: Array<{ kind: string; relFile: string }>;
+    }>("/api/edit/history");
+
+    expect(history.res.status).toBe(200);
+    expect(history.body.history).toHaveLength(3);
+    expect(history.body.history.map(({ kind, relFile }) => ({ kind, relFile })))
+      .toEqual([
+        { kind: "redo", relFile: "src/App.tsx" },
+        { kind: "undo", relFile: "src/App.tsx" },
+        { kind: "apply", relFile: "src/App.tsx" },
+      ]);
+  });
+
   it("refuses to undo while the same proposal is already in flight", async () => {
     const proposal = await requestProposal();
     await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
@@ -950,6 +1461,8 @@ describe("edit proposal API", () => {
     expect(res.status).toBe(409);
     expect(body.error).toBe("この提案は現在処理中です。");
     expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.historyLog).toHaveLength(1);
     expect(readFileSync(filePath, "utf8")).toBe(editedContent);
   });
 
@@ -990,7 +1503,9 @@ describe("edit proposal API", () => {
     expect(result.body.error).toBe(
       "プロジェクトが切り替わったため中断しました"
     );
-    expect(__stores.undoStack).toHaveLength(1);
+    expect(__stores.undoStack).toHaveLength(0);
+    expect(__stores.redoStack).toHaveLength(0);
+    expect(__stores.historyLog).toHaveLength(0);
     expect(readFileSync(oldFilePath, "utf8")).toBe(editedContent);
     rmSync(oldRoot, { recursive: true, force: true });
   });
