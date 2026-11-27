@@ -601,9 +601,17 @@ export function startProxy(
       path: req.url,
       headers,
     });
+    socket.on("error", () => proxyReq.destroy());
 
     proxyReq.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
       trackSocket(proxySocket);
+      // The browser can close the preview while Vite is sending an HMR update.
+      proxySocket.on("error", () => socket.destroy());
+      if (socket.destroyed) {
+        proxySocket.destroy();
+        return;
+      }
+      socket.once("close", () => proxySocket.destroy());
       socket.write(
         [
           `HTTP/${proxyRes.httpVersion} ${proxyRes.statusCode} ${proxyRes.statusMessage}`,

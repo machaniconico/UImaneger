@@ -20,8 +20,10 @@
     "test": "node scripts/runner-selftest.mjs && node scripts/resolver-selftest.mjs && vitest run",
     "test:ci": "node --throw-deprecation scripts/runner-selftest.mjs && node --throw-deprecation scripts/resolver-selftest.mjs && node --throw-deprecation node_modules/vitest/vitest.mjs run",
     "sbom": "node scripts/sbom.mjs",
-    "verify": "npm run policy && npm run typecheck && npm run test:ci && npm run build",
-    "audit": "npm audit --audit-level=moderate"
+    "verify": "npm run policy && node scripts/third-party-notices.mjs --check && npm run typecheck && npm run test:ci && npm run build",
+    "audit": "npm audit --audit-level=moderate",
+    "e2e": "playwright test",
+    "notices": "node scripts/third-party-notices.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.106.0",
@@ -30,6 +32,7 @@
     "tsx": "4.22.4"
   },
   "devDependencies": {
+    "@playwright/test": "1.65.0",
     "@tailwindcss/vite": "4.3.5",
     "@testing-library/dom": "10.4.1",
     "@testing-library/react": "16.3.2",

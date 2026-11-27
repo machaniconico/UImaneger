@@ -7,3 +7,4 @@ dist/
 .omc/
 .DS_Store
 /workspaces/
+/test-results/

@@ -17,7 +17,7 @@ import { spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
-  mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -139,16 +139,21 @@ function linkNodeModules(root: string, dir: string): void {
  * 編集前スナップショット配信用ディレクトリを準備する。
  * 例外は投げず、最悪でも mode='none' へ degrade する。
  */
+/** tmpdir 直下に uim-<kind>-<pid>-<time>-XXXXXX を排他的に作る。 */
+function makeTempDir(kind: "before" | "snap"): string {
+  return mkdtempSync(join(tmpdir(), `uim-${kind}-${process.pid}-${Date.now()}-`));
+}
+
 export function prepareBefore(root: string): BeforeHandle {
   const absRoot = resolve(root);
 
   // 1. worktree モード
   if (isGitRepo(absRoot) && hasHead(absRoot)) {
-    const wtDir = join(
-      tmpdir(),
-      `uim-before-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    );
+    let wtDir = "";
     try {
+      // mkdtemp で排他的に作る。予測可能な名前 + recursive mkdir だと、他者が先に
+      // 作ったディレクトリをそのまま使ってしまう。接頭辞は sweepStaleBeforeDirs の照合形式。
+      wtDir = makeTempDir("before");
       // --detach で HEAD を detach して checkout。HEAD 時点の読み取り専用
       // スナップショットとなり、作業ツリーの編集が before に波及しない。
       const r = runGit(absRoot, [
@@ -185,17 +190,15 @@ export function prepareBefore(root: string): BeforeHandle {
       runGit(absRoot, ["worktree", "remove", "--force", wtDir]);
       rmSync(wtDir, { recursive: true, force: true });
     } catch {
+      if (wtDir) rmSync(wtDir, { recursive: true, force: true });
       // fall through to snapshot
     }
   }
 
   // 2. snapshot モード: 作業ツリーをコピー
-  const snapDir = join(
-    tmpdir(),
-    `uim-snap-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  );
+  let snapDir = "";
   try {
-    mkdirSync(snapDir, { recursive: true });
+    snapDir = makeTempDir("snap");
     cpSync(absRoot, snapDir, {
       recursive: true,
       filter: (src: string) => {
@@ -214,7 +217,7 @@ export function prepareBefore(root: string): BeforeHandle {
     });
   } catch {
     try {
-      rmSync(snapDir, { recursive: true, force: true });
+      if (snapDir) rmSync(snapDir, { recursive: true, force: true });
     } catch {
       // ベストエフォート
     }

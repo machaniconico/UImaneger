@@ -876,3 +876,84 @@ describeIfLoopback("proxy transport fidelity", () => {
     }
   });
 });
+
+// ブラウザがプレビューを閉じた瞬間の WebSocket 切断でサーバが落ちない回帰 (EPIPE/ECONNRESET)。
+describeIfLoopback("proxy websocket client disconnects", () => {
+  async function setup(delayUpgradeMs: number) {
+    const upstreamSockets = new Set<net.Socket>();
+    // http.Server のソケットは allowHalfOpen なので、destroyed ではなく end/close で切断を判定する。
+    const disconnected = new WeakSet<net.Socket>();
+    const upstream = http.createServer();
+    upstream.on("upgrade", (_req, duplex) => {
+      const socket = duplex as net.Socket;
+      upstreamSockets.add(socket);
+      socket.on("error", () => {});
+      socket.once("end", () => disconnected.add(socket));
+      socket.once("close", () => disconnected.add(socket));
+      setTimeout(() => {
+        if (socket.destroyed) return;
+        socket.write(
+          ["HTTP/1.1 101 Switching Protocols", "Connection: Upgrade", "Upgrade: websocket", "", ""].join("\r\n")
+        );
+      }, delayUpgradeMs);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+    const handle = await startProxy(upstreamPort, proxyPort);
+    const allUpstreamClosed = () =>
+      waitUntilFalse(async () => [...upstreamSockets].some((s) => !disconnected.has(s)), 3_000);
+    const cleanup = async () => {
+      for (const s of upstreamSockets) s.destroy();
+      await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    };
+    return { proxyPort, upstreamSockets, allUpstreamClosed, cleanup };
+  }
+
+  it("closes the upstream socket when the client leaves before the upgrade completes", async () => {
+    const ctx = await setup(300);
+    try {
+      const client = net.connect({ host: "127.0.0.1", port: ctx.proxyPort });
+      client.on("error", () => {});
+      await new Promise<void>((resolve) => client.once("connect", () => resolve()));
+      client.write(
+        [
+          "GET /hmr HTTP/1.1",
+          `Host: 127.0.0.1:${ctx.proxyPort}`,
+          "Connection: Upgrade",
+          "Upgrade: websocket",
+          "Sec-WebSocket-Version: 13",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+          "",
+          "",
+        ].join("\r\n")
+      );
+      await waitUntilFalse(async () => ctx.upstreamSockets.size === 0, 2_000);
+      client.destroy();
+      await sleep(500);
+      expect(await ctx.allUpstreamClosed()).toBe(true);
+      // プロキシは生きていて次の upgrade を受け付ける
+      const next = await upgradeViaProxy(ctx.proxyPort).catch(() => null);
+      // 上流は 300ms 遅延するので upgradeViaProxy の 2s 以内に 101 が返る
+      expect(next).not.toBeNull();
+      next?.destroy();
+    } finally {
+      await ctx.cleanup();
+    }
+  }, 20_000);
+
+  it("survives a client RST after the upgrade and closes the upstream socket", async () => {
+    const ctx = await setup(0);
+    try {
+      const client = await upgradeViaProxy(ctx.proxyPort);
+      client.on("error", () => {});
+      client.resetAndDestroy();
+      expect(await ctx.allUpstreamClosed()).toBe(true);
+      expect(await isListening(ctx.proxyPort)).toBe(true);
+      const next = await upgradeViaProxy(ctx.proxyPort);
+      next.destroy();
+    } finally {
+      await ctx.cleanup();
+    }
+  }, 20_000);
+});
