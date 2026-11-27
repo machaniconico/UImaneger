@@ -334,14 +334,15 @@ config :matrix, Matrix.Endpoint,
   def start(_, _), do: Supervisor.start_link([Matrix.Endpoint], strategy: :one_for_one)
 end
 
-defmodule Matrix.Endpoint do
-  use Phoenix.Endpoint, otp_app: :matrix
-  plug Matrix.Page
-end
-
+# Plug は Endpoint のコンパイル時に Matrix.Page.init/1 を呼ぶため、Page を先に定義する。
 defmodule Matrix.Page do
   def init(opts), do: opts
   def call(conn, _opts), do: Plug.Conn.send_resp(conn, 200, "${marker}")
+end
+
+defmodule Matrix.Endpoint do
+  use Phoenix.Endpoint, otp_app: :matrix
+  plug Matrix.Page
 end
 `,
       });

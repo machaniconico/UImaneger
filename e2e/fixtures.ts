@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
@@ -78,6 +78,11 @@ function startProcess(args: string[], cwd: string, env: NodeJS.ProcessEnv) {
   return {
     logs: () => logs,
     async stop() {
+      if (process.platform === "win32" && child.pid && child.exitCode === null) {
+        // Windows の kill() は直下の 1 プロセスしか止めない。tsx の実サーバや、そこから起動した
+        // dev server が残って一時ディレクトリを掴み続けるため、製品と同じくツリーごと止める。
+        spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+      }
       child.kill("SIGTERM");
       const timeout = setTimeout(() => child.kill("SIGKILL"), 8_000);
       try {
@@ -198,7 +203,8 @@ export const test = base.extend<{ app: AppFixture }>({
         await Promise.all(Object.values(processes).map((process) => process.stop()));
       } finally {
         if (anthropic?.listening) await close(anthropic);
-        await rm(temp, { recursive: true, force: true });
+        // Windows ではプロセス終了直後もハンドルの解放が遅れることがある。
+        await rm(temp, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
         if (testInfo.status !== testInfo.expectedStatus) {
           for (const [name, process] of Object.entries(processes)) {
             await testInfo.attach(`${name}.log`, { body: process.logs(), contentType: "text/plain" });
