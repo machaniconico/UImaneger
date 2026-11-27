@@ -96,7 +96,6 @@ describe("api client errors", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ message: "Apply edit" }),
-      signal: expect.any(AbortSignal),
     });
   });
 });
@@ -322,27 +321,68 @@ describe("api タイムアウト・中断", () => {
     );
   }
 
-  it("apply/undo/redo は 30 秒応答が無ければタイムアウトする", async () => {
+  it("状態を変える操作(apply/undo/redo/open/clone)にはタイムアウトも中止も付けない", async () => {
     vi.useFakeTimers();
-    vi.stubGlobal("fetch", hangingFetch());
+    const fetchMock = hangingFetch();
+    vi.stubGlobal("fetch", fetchMock);
     for (const call of [
       () => api.applyEdit("p1"),
       () => api.undoEdit(),
       () => api.redoEdit(),
+      () => api.open("/x"),
+      () => api.clone("https://example.com/r.git"),
     ]) {
+      let settled = false;
       const p = call();
-      const assertion = expect(p).rejects.toThrow(/30秒/);
-      await vi.advanceTimersByTimeAsync(30_000);
-      await assertion;
+      p.then(
+        () => (settled = true),
+        () => (settled = true)
+      );
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(settled).toBe(false);
+    }
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init?.signal).toBeUndefined();
     }
   });
 
-  it("呼び出し側の signal で apply を中断すると AbortError になる", async () => {
+  it("候補確定(生成を伴う)は signal で中止でき、120 秒でタイムアウトする", async () => {
+    const candidate = { file: "src/App.tsx", line: 1, preview: "x", reason: "r" } as any;
     vi.stubGlobal("fetch", hangingFetch());
     const ac = new AbortController();
-    const p = api.applyEdit("p1", ac.signal);
+    const aborted = api.editCandidate(candidate, descriptor, "x", undefined, ac.signal);
     ac.abort();
-    await expect(p).rejects.toMatchObject({ name: "AbortError" });
+    await expect(aborted).rejects.toMatchObject({ name: "AbortError" });
+
+    vi.useFakeTimers();
+    const p = api.editCandidate(candidate, descriptor, "x");
+    const assertion = expect(p).rejects.toThrow(/120秒/);
+    await vi.advanceTimersByTimeAsync(120_000);
+    await assertion;
+  });
+
+  it("status は 10 秒応答が無ければ「サーバに接続できません」でタイムアウトする", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("fetch", hangingFetch());
+    const p = api.status();
+    const assertion = expect(p).rejects.toThrow(/サーバに接続できません/);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await assertion;
+  });
+
+  it("editStream の HTTP 413 + JSON は生 JSON でなく整形済みメッセージにする", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "指示が長すぎます" }), { status: 413 })
+      )
+    );
+    const p = api.editStream(
+      { descriptor, instruction: "x" },
+      { onStage: vi.fn(), onProgress: vi.fn() }
+    );
+    await expect(p).rejects.toThrow("指示が長すぎます");
+    await p.catch((e) => expect(e.message).not.toContain("{"));
   });
 
   it("editStream は signal で中断でき AbortError になる", async () => {

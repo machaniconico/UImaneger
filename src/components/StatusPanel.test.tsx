@@ -115,4 +115,37 @@ describe("StatusPanel", () => {
     expect(screen.getByText("API key OK")).not.toBeNull();
     expect(screen.getByText(/running/)).not.toBeNull();
   });
+
+  it("前回の取得が未完了なら次のポーリングを飛ばし、未完了 GET を積み上げない", async () => {
+    vi.mocked(api.status).mockReturnValue(new Promise<never>(() => {}));
+    render(<StatusPanel />);
+    await flushInitial();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(9000);
+    });
+
+    expect(api.status).toHaveBeenCalledTimes(1);
+  });
+
+  it("タイムアウト(reject)後は次のポーリングで再取得して復旧する", async () => {
+    let rejectFirst!: (e: Error) => void;
+    vi.mocked(api.status).mockReturnValueOnce(
+      new Promise<never>((_, reject) => {
+        rejectFirst = reject;
+      })
+    );
+    render(<StatusPanel />);
+    await flushInitial();
+    await act(async () => {
+      rejectFirst(new Error("サーバに接続できません"));
+    });
+    expect(screen.getByRole("alert").textContent).toContain("サーバに接続できません");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(api.status).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
 });

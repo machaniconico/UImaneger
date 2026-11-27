@@ -285,9 +285,8 @@ export function Chat({
   async function apply() {
     if (!proposal?.proposalId || busy) return;
     setBusy(true);
-    const ac = beginAbortable();
     try {
-      const res = await api.applyEdit(proposal.proposalId, ac.signal);
+      const res = await api.applyEdit(proposal.proposalId);
       if (res.ok) {
         log({
           role: "system",
@@ -304,11 +303,9 @@ export function Chat({
         // proposal を保持したまま → 再試行可能
       }
     } catch (e) {
-      if (ac.signal.aborted) log({ role: "system", text: "中止しました（サーバ側で処理が済んでいる場合があります。編集履歴で確認してください）" });
-      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       // proposal を保持したまま → 再試行可能
     } finally {
-      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -331,9 +328,8 @@ export function Chat({
   async function undo() {
     if (busy || undoDepth <= 0) return;
     setBusy(true);
-    const ac = beginAbortable();
     try {
-      const res = await api.undoEdit(ac.signal);
+      const res = await api.undoEdit();
       if (res.ok) {
         log({
           role: "system",
@@ -354,13 +350,11 @@ export function Chat({
         }
       }
     } catch (e) {
-      if (ac.signal.aborted) log({ role: "system", text: "中止しました（サーバ側で処理が済んでいる場合があります。編集履歴で確認してください）" });
-      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshUndoDepth().catch((statusError) => {
         console.error(statusError);
       });
     } finally {
-      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -368,9 +362,8 @@ export function Chat({
   async function redo() {
     if (busy || redoDepth <= 0) return;
     setBusy(true);
-    const ac = beginAbortable();
     try {
-      const res = await api.redoEdit(ac.signal);
+      const res = await api.redoEdit();
       if (res.ok) {
         log({
           role: "system",
@@ -387,13 +380,11 @@ export function Chat({
         });
       }
     } catch (e) {
-      if (ac.signal.aborted) log({ role: "system", text: "中止しました（サーバ側で処理が済んでいる場合があります。編集履歴で確認してください）" });
-      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshDepths().catch((statusError) => {
         console.error(statusError);
       });
     } finally {
-      endAbortable(ac);
       setBusy(false);
     }
   }

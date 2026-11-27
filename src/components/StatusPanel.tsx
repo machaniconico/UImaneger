@@ -23,7 +23,12 @@ export function StatusPanel() {
 
   useEffect(() => {
     let alive = true;
-    const tick = () =>
+    // 前回の取得が未完了(api 側の 10 秒タイムアウト待ち)の間は次を発行しない。
+    // 未完了 GET の積み上がりと、応答順の逆転で古い成功が新しい失敗を消すのを防ぐ
+    let inFlight = false;
+    const tick = () => {
+      if (inFlight) return;
+      inFlight = true;
       api
         .status()
         .then((s) => {
@@ -33,7 +38,11 @@ export function StatusPanel() {
         })
         .catch(() => {
           if (alive) setOffline(true);
+        })
+        .finally(() => {
+          inFlight = false;
         });
+    };
     tick();
     const t = setInterval(tick, 3000);
     return () => {

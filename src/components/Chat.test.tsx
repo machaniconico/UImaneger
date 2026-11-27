@@ -294,7 +294,7 @@ describe("Chat", () => {
     await screen.findByRole("button", { name: "承認して適用" });
     fireEvent.keyDown(document, { key: "Enter", metaKey: true });
 
-    await waitFor(() => expect(api.applyEdit).toHaveBeenCalledWith("p1", expect.any(AbortSignal)));
+    await waitFor(() => expect(api.applyEdit).toHaveBeenCalledWith("p1"));
   });
 
   it("IME composition 中の Cmd+Enter では保留中の提案を適用しない", async () => {
@@ -350,7 +350,7 @@ describe("Chat", () => {
     await screen.findByText("承認して適用");
     await user.click(screen.getByRole("button", { name: "承認して適用" }));
 
-    expect(api.applyEdit).toHaveBeenCalledWith("p1", expect.any(AbortSignal));
+    expect(api.applyEdit).toHaveBeenCalledWith("p1");
     expect(await screen.findByText(/適用しました/)).not.toBeNull();
     expect(
       await screen.findByRole("button", { name: /undo \(2\)/ })
@@ -369,7 +369,7 @@ describe("Chat", () => {
     await screen.findByText("承認して適用");
     await user.click(screen.getByRole("button", { name: "承認して適用" }));
 
-    expect(api.applyEdit).toHaveBeenCalledWith("p1", expect.any(AbortSignal));
+    expect(api.applyEdit).toHaveBeenCalledWith("p1");
     // エラーメッセージが表示される
     expect(await screen.findByText(/boom/)).not.toBeNull();
     // proposal 保持 → 承認ボタンがまだ表示されている
@@ -840,26 +840,47 @@ describe("App", () => {
       expect(textarea.value).toBe("赤くして");
     });
 
-    it("適用中も中止でき、提案は保持される", async () => {
+    it("適用・undo・redo 中は中止ボタンを出さず、signal も渡さない", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.status).mockResolvedValue({
+        info: null, hasKey: true, logs: [], undoDepth: 1, redoDepth: 1,
+      });
+      vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+      vi.mocked(api.applyEdit).mockReturnValue(new Promise<never>(() => {}));
+      vi.mocked(api.undoEdit).mockReturnValue(new Promise<never>(() => {}));
+      render(<Chat selected={descriptor} hasKey={true} />);
+
+      await user.click(await screen.findByRole("button", { name: /undo/ }));
+      expect(api.undoEdit).toHaveBeenCalledWith();
+      expect(screen.queryByRole("button", { name: "中止" })).toBeNull();
+    });
+
+    it("適用中は中止ボタンが出ない", async () => {
       const user = userEvent.setup();
       vi.mocked(api.editStream).mockResolvedValue(goodProposal());
-      vi.mocked(api.applyEdit).mockImplementation(
-        (_id: string, signal?: AbortSignal) =>
-          new Promise<never>((_resolve, reject) => {
-            signal?.addEventListener("abort", () =>
-              reject(new DOMException("aborted", "AbortError"))
-            );
-          })
-      );
+      vi.mocked(api.applyEdit).mockReturnValue(new Promise<never>(() => {}));
       render(<Chat selected={descriptor} hasKey={true} />);
 
       await sendInstruction(user, "赤くして");
       await user.click(await screen.findByRole("button", { name: "承認して適用" }));
-      await user.click(await screen.findByRole("button", { name: "中止" }));
-
-      expect(await screen.findByText(/中止しました/)).not.toBeNull();
+      expect(api.applyEdit).toHaveBeenCalledWith("p1");
       expect(screen.queryByRole("button", { name: "中止" })).toBeNull();
-      expect(screen.getByRole("button", { name: "承認して適用" })).not.toBeNull();
+    });
+
+    it("別要素への生成を中止しても前要素の提案が混ざらない", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.editStream).mockResolvedValueOnce(goodProposal());
+      const { rerender } = render(<Chat selected={descriptor} hasKey={true} />);
+      await sendInstruction(user, "赤くして");
+      await screen.findByRole("button", { name: "承認して適用" });
+
+      vi.mocked(api.editStream).mockImplementation(pendingUntilAbort() as any);
+      rerender(<Chat selected={otherDescriptor} hasKey={true} />);
+      await sendInstruction(user, "青くして");
+      await user.click(await screen.findByRole("button", { name: "中止" }));
+      await screen.findByText("中止しました");
+      expect(screen.queryByRole("button", { name: "承認して適用" })).toBeNull();
+      expect(screen.queryByText(/提案対象/)).toBeNull();
     });
   });
 });
