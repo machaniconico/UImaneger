@@ -45,8 +45,8 @@ test("opens, selects, proposes, applies and undoes an edit with live HMR", async
     await expect(live.getByRole("heading", { name: originalHeading, exact: true })).toBeVisible();
   });
 
-  // Apply and undo remount the initiating tab's iframe. The observer tab stays
-  // mounted, so the updated heading and preserved counter demonstrate Fast Refresh.
+  // Vite は HMR で更新するため、適用・undo でも iframe は作り直さない。別タブ(observer)でも
+  // 見出しの更新とカウンタの保持を確認し、Fast Refresh で反映されていることを示す。
   const observer = await context.newPage();
   const observerIframe = observer.locator('iframe[title="after"]');
   const hmr = observerIframe.contentFrame();

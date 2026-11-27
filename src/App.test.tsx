@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { App } from "./App";
+import { App, hasDevServerHmr } from "./App";
 import { api } from "./lib/api";
 import type { DomDescriptor, ProjectInfo } from "./lib/types";
 
@@ -113,7 +113,7 @@ describe("App", () => {
     expect(screen.getByText("select-mode:false")).not.toBeNull();
   });
 
-  it("reloads the after preview when an edit is applied", async () => {
+  it("leaves HMR frameworks to the dev server instead of remounting the after preview", async () => {
     vi.mocked(api.status).mockResolvedValue({
       info,
       hasKey: true,
@@ -124,8 +124,47 @@ describe("App", () => {
     render(<App />);
 
     await screen.findByText("reload-key:0");
-    window.dispatchEvent(new Event("uim:applied"));
+    act(() => {
+      window.dispatchEvent(new Event("uim:applied"));
+    });
+    // 作り直すと HMR 接続前の更新を取りこぼし得るので、Vite では reloadKey を進めない
+    expect(screen.getByText("reload-key:0")).not.toBeNull();
+  });
 
-    await screen.findByText("reload-key:1");
+  it("reloads the after preview once when an edit is applied without HMR", async () => {
+    vi.mocked(api.status).mockResolvedValue({
+      info: { ...info, framework: "Django", runCommand: "python manage.py runserver" },
+      hasKey: true,
+      logs: [],
+      undoDepth: 0,
+    });
+
+    render(<App />);
+
+    await screen.findByText("reload-key:0");
+    act(() => {
+      window.dispatchEvent(new Event("uim:applied"));
+    });
+    expect(screen.getByText("reload-key:1")).not.toBeNull();
+    act(() => {
+      window.dispatchEvent(new Event("uim:applied"));
+    });
+    expect(screen.getByText("reload-key:2")).not.toBeNull();
+  });
+
+  it("knows which frameworks reload through HMR", () => {
+    for (const framework of ["Vite", "Next.js", "Nuxt", "SvelteKit", "Astro", "Angular", "Vue CLI", "Create React App", "Remix", "React Router"]) {
+      expect(hasDevServerHmr(framework)).toBe(true);
+    }
+    for (const framework of ["Django", "Rails", "Laravel", "PHP", "Static", "Go", "Phoenix", "Node", undefined]) {
+      expect(hasDevServerHmr(framework)).toBe(false);
+    }
+    // dev script が無く start script で起動した React Router / Remix は本番サーバのことが多い
+    expect(hasDevServerHmr("Remix", "npm run start")).toBe(false);
+    expect(hasDevServerHmr("React Router", "pnpm run start")).toBe(false);
+    expect(hasDevServerHmr("Remix", "npm run dev")).toBe(true);
+    expect(hasDevServerHmr("React Router", "npx react-router dev --port 6100")).toBe(true);
+    // 起動設定で任意コマンドを指定した場合は framework が "custom" になり再読込する
+    expect(hasDevServerHmr("custom", "node server.js")).toBe(false);
   });
 });
