@@ -115,6 +115,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+      # Spring Boot fixture の依存取得で Maven Central が 429 を返すことがあるため、ローカルリポジトリを再利用する。
+      # fixture は実行時に一時ディレクトリへ生成するので、pom.xml ではなく fixture 定義のハッシュをキーにする。
+      - uses: actions/cache@v4
+        if: contains(matrix.runtimes, 'java')
+        with:
+          path: ~/.m2/repository
+          key: m2-${{ runner.os }}-${{ hashFiles('scripts/runtime-matrix-fixtures.mjs') }}
+          restore-keys: m2-${{ runner.os }}-
       - uses: gradle/actions/setup-gradle@v4
         if: contains(matrix.runtimes, 'java')
         with:
