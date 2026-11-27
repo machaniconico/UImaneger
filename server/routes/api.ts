@@ -4,7 +4,16 @@ import { streamSSE } from "hono/streaming";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
+import {
+  readFile,
+  mkdir,
+  rename,
+  unlink,
+  writeFile,
+  chmod,
+  realpath,
+  stat,
+} from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -494,14 +503,35 @@ async function hasStagedGitChanges(root: string): Promise<boolean> {
   }
 }
 
+/**
+ * 一時ファイルに書いてから rename で置き換える。symlink はリンクを保ってリンク先(実体)を
+ * 更新し、既存ファイルの権限(mode & 0o777)は umask に依存せず引き継ぐ。一時ファイルは
+ * 排他作成・0600 で作って内容を書き、mode を合わせてから rename する。新規ファイルは
+ * 0666 で作成し umask を OS に適用させる。Windows では mode を扱わない。
+ */
 export async function atomicWrite(
   path: string,
   content: string | Uint8Array
 ): Promise<void> {
-  const tmp = `${path}.tmp-${randomUUID()}`;
+  let target = resolve(path);
+  let mode: number | null = null;
   try {
-    await writeFile(tmp, content, "utf8");
-    await rename(tmp, path);
+    target = await realpath(target);
+    const st = await stat(target);
+    if (!st.isFile()) throw new Error("通常ファイルではないため書き込めません");
+    mode = st.mode & 0o777;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const tmp = `${target}.tmp-${randomUUID()}`;
+  try {
+    await writeFile(tmp, content, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: mode === null ? 0o666 : 0o600,
+    });
+    if (mode !== null && process.platform !== "win32") await chmod(tmp, mode);
+    await rename(tmp, target);
   } catch (e) {
     await unlink(tmp).catch(() => {});
     throw e;
