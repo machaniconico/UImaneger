@@ -156,13 +156,48 @@ export function clientErrorMessage(e: unknown, relFile?: string): string {
     if (FS_READ_SYSCALLS.has(syscall)) return `ソースファイルを読めませんでした${where}`;
     return `ファイル操作に失敗しました${where}`;
   }
-  let message = sanitizeForLog(err?.message ?? e);
-  const root = getRoot();
-  if (root) message = message.split(root + sep).join("").split(root).join(".");
-  // clone 先 (UIM_WORKSPACES_DIR) の絶対パスは "workspaces" に置き換える
-  const workspaces = resolve(env.workspacesDir);
-  message = message.split(workspaces).join("workspaces");
-  return message;
+  return redactLocalPaths(sanitizeForLog(err?.message ?? e), [
+    { path: getRoot(), label: "." },
+    // clone 先 (UIM_WORKSPACES_DIR) の絶対パスは "workspaces" に置き換える
+    { path: resolve(env.workspacesDir), label: "workspaces" },
+  ]);
+}
+
+/**
+ * メッセージ中の絶対パスを表示用ラベルに置き換える。
+ * - 長いパスを優先する(ルートと workspaces が親子でも、より具体的な方で置換する)
+ * - パス要素の境界でだけ一致させる(`/w` が `/www` にも、URL の `//w` にも一致しない)
+ * - 区切りは / と \ のどちらにも一致し、Windows では大文字小文字を区別しない
+ * - ファイルシステムのルート(`/`、`C:\`)は置換しない
+ */
+export function redactLocalPaths(
+  message: string,
+  entries: Array<{ path: string | null | undefined; label: string }>,
+  platform: NodeJS.Platform = process.platform
+): string {
+  const usable = entries
+    .filter((entry): entry is { path: string; label: string } => Boolean(entry.path))
+    .map((entry) => ({ ...entry, path: entry.path.replace(/[\\/]+$/, "") }))
+    .filter((entry) => entry.path && !/^[A-Za-z]:$/.test(entry.path))
+    .sort((a, b) => b.path.length - a.path.length);
+  if (!usable.length) return message;
+  const toPattern = (path: string) =>
+    path
+      .split(/[\\/]+/)
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("[\\\\/]+");
+  const pattern = new RegExp(
+    `(?<![A-Za-z0-9._~:\\\\/-])(?:${usable.map((entry) => `(${toPattern(entry.path)})`).join("|")})(?![A-Za-z0-9._~-])([\\\\/]+)?`,
+    platform === "win32" ? "gi" : "g"
+  );
+  return message.replace(pattern, (...match: unknown[]) => {
+    const groups = match.slice(1, usable.length + 1) as Array<string | undefined>;
+    const index = groups.findIndex((group) => group !== undefined);
+    const separator = match[usable.length + 1] as string | undefined;
+    const label = usable[index]!.label;
+    if (label === ".") return separator ? "" : ".";
+    return separator ? `${label}/` : label;
+  });
 }
 
 function serverError(c: Context, e: unknown, relFile?: string) {

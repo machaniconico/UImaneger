@@ -19,6 +19,7 @@ import {
   api,
   __stores,
   clientErrorMessage,
+  redactLocalPaths,
   isSafeGitRepoUrl,
   isTrustedRunCommandHost,
   isLoopbackBindHost,
@@ -485,6 +486,30 @@ describe("project security helpers", () => {
       (env as { workspacesDir: string }).workspacesDir = previous;
       rmSync(workspaces, { recursive: true, force: true });
     }
+  });
+
+  it("redacts local paths only at path boundaries, preferring the most specific entry", () => {
+    const posix = (message: string, root: string | null, workspaces: string) =>
+      redactLocalPaths(message, [{ path: root, label: "." }, { path: workspaces, label: "workspaces" }], "linux");
+    // workspaces がルートの子: より具体的な workspaces で置換する
+    expect(posix("fail /srv/app/cache/r and /srv/app/src/a.ts", "/srv/app", "/srv/app/cache")).toBe(
+      "fail workspaces/r and src/a.ts"
+    );
+    // workspaces がルートの親: ルートはルートで、兄弟は workspaces で置換する
+    expect(posix("x /srv/app/r y /srv/other/r", "/srv/app", "/srv")).toBe("x r y workspaces/other/r");
+    // ファイルシステムのルートや部分一致・URL は置換しない
+    expect(posix("see https://host/r", null, "/")).toBe("see https://host/r");
+    expect(posix("in /www/r", null, "/w")).toBe("in /www/r");
+    expect(posix("open https://w/r", null, "/w")).toBe("open https://w/r");
+    expect(posix("at /w", null, "/w")).toBe("at workspaces");
+    // Windows: 大文字小文字と区切りの違いを吸収する
+    const win = (message: string) =>
+      redactLocalPaths(message, [{ path: null, label: "." }, { path: "C:\\WS", label: "workspaces" }], "win32");
+    expect(win("git clone c:\\WS\\r failed")).toBe("git clone workspaces/r failed");
+    expect(win("git clone C:/ws/r failed")).toBe("git clone workspaces/r failed");
+    expect(win("drive C:\\ only")).toBe("drive C:\\ only");
+    // Linux は大文字小文字を区別する
+    expect(posix("/SRV/app/x", "/srv/app", "/ws")).toBe("/SRV/app/x");
   });
 
   it("rejects clone runCommand when Host is not local", async () => {
