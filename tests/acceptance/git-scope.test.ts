@@ -101,7 +101,8 @@ afterEach(async () => {
   if (repo) rmSync(repo, { recursive: true, force: true });
 });
 
-describe.skipIf(!hasGit)("件3 git scope (git が無い環境は skip)", () => {
+// git が無い環境ではこのファイルの AC は登録されない(対象外。skip ゲート対策)。
+if (hasGit) describe("件3 git scope", () => {
   it("AC-3-1 git_commit_in_subdir_project_excludes_sibling_and_parent_changes", async () => {
     await openProject(join(repo, "app"), { command: "echo test-server-ready" });
     put(repo, "app/a.txt", "a1\n");

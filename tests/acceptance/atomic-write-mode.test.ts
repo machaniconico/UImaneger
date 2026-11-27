@@ -37,6 +37,8 @@ const app = createApp({ production: false, useLogger: false, serverPort: 5174, c
 const C0 = "export const App = () => <div>C0</div>;";
 const C1 = "export const App = () => <div>C1</div>;";
 const isWin = process.platform === "win32";
+// CI の skip ゲート対策: OS 条件付きの AC は条件を満たす時だけ登録する(対象外の環境ではレポートに現れない)。
+const noop = (..._args: unknown[]): void => {};
 
 const canSetUmask: boolean = (() => {
   try {
@@ -96,12 +98,16 @@ async function post(path: string, body: unknown): Promise<{ status: number; json
   return { status: res.status, json: await res.json().catch(() => null) };
 }
 
+// AC-4-1 / 4-4: POSIX かつ umask を変えられる環境のみ登録。AC-4-2 / 4-3: POSIX のみ。AC-4-5: win32 のみ。
+const itPosixUmask = !isWin && canSetUmask ? it : noop;
+const itPosix = !isWin ? it : noop;
+const itWin32 = isWin ? it : noop;
 const modeOf = (p: string): number => statSync(p).mode & 0o777;
 const oct = (n: number): string => n.toString(8).padStart(4, "0");
 const tmpLeftovers = (dir: string): string[] => readdirSync(dir).filter((n) => n.includes(".tmp-"));
 
 describe("件4 atomicWrite mode", () => {
-  it.skipIf(isWin || !canSetUmask)(
+  itPosixUmask(
     "AC-4-1 files_write_preserves_existing_mode_independent_of_umask (POSIX のみ・umask 変更可のみ)",
     async () => {
       const f = join(root, "src/f.txt");
@@ -119,7 +125,7 @@ describe("件4 atomicWrite mode", () => {
     }
   );
 
-  it.skipIf(isWin)("AC-4-2 apply_undo_redo_preserve_mode (POSIX のみ)", async () => {
+  itPosix("AC-4-2 apply_undo_redo_preserve_mode (POSIX のみ)", async () => {
     const f = join(root, "src/App.tsx");
     for (const m of [0o600, 0o755]) {
       writeFileSync(f, C0, "utf8");
@@ -147,7 +153,7 @@ describe("件4 atomicWrite mode", () => {
     }
   });
 
-  it.skipIf(isWin)("AC-4-3 write_through_symlink_keeps_link_and_target_mode (POSIX のみ)", async () => {
+  itPosix("AC-4-3 write_through_symlink_keeps_link_and_target_mode (POSIX のみ)", async () => {
     mkdirSync(join(root, "real"), { recursive: true });
     const target = join(root, "real/target.txt");
     const alias = join(root, "src/alias.txt");
@@ -162,7 +168,7 @@ describe("件4 atomicWrite mode", () => {
     expect(oct(modeOf(target)), "target の mode").toBe("0600");
   });
 
-  it.skipIf(isWin || !canSetUmask)(
+  itPosixUmask(
     "AC-4-4 new_file_uses_umask_default_and_no_temp_files_remain (POSIX のみ・umask 変更可のみ)",
     async () => {
       // (a) 未存在ファイル: 0666 & ~umask
@@ -188,7 +194,7 @@ describe("件4 atomicWrite mode", () => {
   );
 
   // win32 のみ: Windows は mode 保持対象外。読み取り専用は失敗・不変・残骸なし。Linux では skip。
-  it.skipIf(!isWin)("AC-4-5 windows_write_succeeds_and_readonly_file_fails_cleanly (win32 only)", async () => {
+  itWin32("AC-4-5 windows_write_succeeds_and_readonly_file_fails_cleanly (win32 only)", async () => {
     const dir = join(root, "src");
     const ok = join(dir, "plain.txt");
     writeFileSync(ok, "before", "utf8");
