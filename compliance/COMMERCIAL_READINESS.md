@@ -27,7 +27,7 @@
 | OSS / assets | HUMAN-REVIEW | npm 依存の台帳と許可リスト検査は自動化済み。`standardwebhooks@1.0.0` は npm に LICENSE 本文が無く upstream 参照。font・icon・asset の確認と法務の最終承認が残る |
 | Anthropic terms / privacy | HUMAN-REVIEW | `THIRD_PARTY_SERVICES.md` の release blockers 解消 |
 | Security | BLOCKED | 2026-11-27 の脅威レビューで出た CSRF(別ポート localhost からの単純リクエスト)、プレビュープロキシの DNS rebinding、子プロセスへの API キー継承を修正済み(受け入れテスト `tests/acceptance/` 41 件、異系統レビュー 2 系統 APPROVE、最終受け入れ PASS)。依存 scan・SAST・secret scan は CI 化済み。脅威モデルは `THREAT_MODEL.md` に記録。残りは配布 artifact scan、第三者による侵入試験(CI の audit・secret-scan・sast は run 46016436860 で PASS) |
-| Browser E2E | PARTIAL | `npm run e2e`(Playwright 1.65.0 / Chromium、偽 Anthropic API、同梱 Vite+React サンプルの一時複製)で open・select・proposal・apply・undo と、別タブでの状態保持つき HMR を検証。2026-11-27 にローカル(WSL2/Node 22)と GitHub Actions ubuntu-latest で PASS(run 46016436860、commit `469ae1c`)。残り: Windows/macOS、Firefox/WebKit、実 API キーでの確認 |
+| Browser E2E | PARTIAL | `npm run e2e`(Playwright 1.65.0 / Chromium、偽 Anthropic API、同梱 Vite+React サンプルの一時複製)で open・select・proposal・apply・undo と、別タブでの状態保持つき HMR を検証。2026-11-27 にローカル(WSL2/Node 22)と GitHub Actions ubuntu-latest で PASS(run 46016436860、commit `469ae1c`)。Firefox もローカルで PASS。CI は Ubuntu で Chromium/Firefox/WebKit、Windows で Chromium/Firefox を実行。残り: macOS、実 API キーでの確認 |
 | Runtime matrix | PARTIAL | 2026-11-27 に WSL2 / Node 22（一部は一時 SDK を使用）で 19 PASS、2 SKIP、0 FAIL。Rails と Phoenix は fixture あり・実プロセス未実行。GitHub Actions(run 46016436860、commit `469ae1c`)で Ubuntu は 19 構成(node・python・php・go・java・dotnet を必須化)、Windows は Node 系 12 構成が PASS。残りは Rails/Phoenix、Windows の非 Node runtime、macOS |
 | Distribution | BLOCKED | installer/package、署名、artifact hash、更新、rollback の確認 |
 | Operations | BLOCKED | support、脆弱性受付、incident response、data deletion の窓口と手順 |

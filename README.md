@@ -94,6 +94,9 @@ npm run build
 npm run verify
 npm run sbom
 npm run audit
+npm run notices
+npm run e2e          # 実ブラウザ E2E(Chromium)
+npm run e2e:all      # Chromium / Firefox / WebKit(WebKit は Linux で `npx playwright install --with-deps webkit` が必要)
 ```
 
 `npm run verify` は依存ポリシー、型検査、runner/resolver selftest、Vitest、production build を実行します。実 API キーを使うブラウザ全体の編集フローは CI 対象外です。

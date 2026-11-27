@@ -23,7 +23,8 @@
     "sbom": "node scripts/sbom.mjs",
     "verify": "npm run policy && node scripts/third-party-notices.mjs --check && npm run typecheck && npm run test:ci && npm run build",
     "audit": "npm audit --audit-level=moderate",
-    "e2e": "playwright test",
+    "e2e": "playwright test --project=chromium",
+    "e2e:all": "playwright test",
     "notices": "node scripts/third-party-notices.mjs",
     "runtime-matrix": "node --import tsx scripts/runtime-matrix.mjs"
   },
