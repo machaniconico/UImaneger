@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1186,6 +1187,49 @@ describe("edit proposal API", () => {
     );
     expect(read.res.status).toBe(200);
     expect(read.body.content).toBe("inside");
+  });
+
+  it("rejects reads and writes that escape the root through a symlink", async () => {
+    const outside = mkdtempSync(join(tmpdir(), "uim-symlink-outside-"));
+    try {
+      writeFileSync(join(outside, "secret.txt"), "outside", "utf8");
+      try {
+        // Windows の一般ユーザーでも作れる junction を使う(POSIX では type は無視される)。
+        symlinkSync(outside, join(root, "src", "escape-dir"), "junction");
+        symlinkSync(join(outside, "secret.txt"), join(root, "src", "escape-file.txt"));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EPERM") return; // symlink 権限が無い環境
+        throw err;
+      }
+
+      const readViaFileLink = await getJson<{ error: string }>(
+        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-file.txt"))}`
+      );
+      expect(readViaFileLink.res.status).toBe(403);
+
+      const readViaDirLink = await getJson<{ error: string }>(
+        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-dir", "secret.txt"))}`
+      );
+      expect(readViaDirLink.res.status).toBe(403);
+
+      const writeViaDirLink = await postJson<{ error: string }>("/api/files/write", {
+        path: join(root, "src", "escape-dir", "planted.txt"),
+        content: "planted",
+      });
+      expect(writeViaDirLink.res.status).toBe(403);
+      expect(existsSync(join(outside, "planted.txt"))).toBe(false);
+
+      const writeViaFileLink = await postJson<{ error: string }>("/api/files/write", {
+        path: join(root, "src", "escape-file.txt"),
+        content: "overwritten",
+      });
+      expect(writeViaFileLink.res.status).toBe(403);
+      expect(readFileSync(join(outside, "secret.txt"), "utf8")).toBe("outside");
+    } finally {
+      rmSync(join(root, "src", "escape-dir"), { force: true });
+      rmSync(join(root, "src", "escape-file.txt"), { force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it("keeps the original file when atomic file replacement fails", async () => {
