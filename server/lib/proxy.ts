@@ -139,7 +139,11 @@ function addSelfSource(directive: string): string {
   return [name, ...sources].join(" ");
 }
 
-function rewriteCspPolicy(policy: string, frameAncestors: string): string {
+function rewriteCspPolicy(
+  policy: string,
+  frameAncestors: string,
+  allowInspector: boolean
+): string {
   const directives = policy
     .split(";")
     .map((part) => part.trim())
@@ -154,6 +158,7 @@ function rewriteCspPolicy(policy: string, frameAncestors: string): string {
       hasFrameAncestors = true;
       return frameAncestors;
     }
+    if (!allowInspector) return directive;
     if (name === "script-src" || name === "script-src-elem") {
       hasScriptDirective = true;
       return addSelfSource(directive);
@@ -169,10 +174,18 @@ function rewriteCspPolicy(policy: string, frameAncestors: string): string {
 
 function rewriteCspHeader(
   value: http.OutgoingHttpHeader | undefined,
-  frameAncestors: string
+  frameAncestors: string,
+  allowInspector: boolean
 ): string | string[] {
-  if (Array.isArray(value)) return value.map((policy) => rewriteCspPolicy(policy, frameAncestors));
-  if (typeof value === "string") return rewriteCspPolicy(value, frameAncestors);
+  const rewrite = (policy: string): string =>
+    allowInspector
+      ? rewriteCspPolicy(policy, frameAncestors, true)
+      : policy
+          .split(",")
+          .map((part) => rewriteCspPolicy(part, frameAncestors, false))
+          .join(", ");
+  if (Array.isArray(value)) return value.map(rewrite);
+  if (typeof value === "string") return rewrite(value);
   return frameAncestors;
 }
 
@@ -412,13 +425,13 @@ export function startProxy(
     const responseHeaders = (isHtml: boolean): http.OutgoingHttpHeaders => {
       const next: http.OutgoingHttpHeaders = { ...headers };
       // HTML と判定できない応答(Content-Type なしの圧縮応答など)や非 HTML も、埋め込める
-      // 親を UI の origin に限るため frame-ancestors を付ける。既存 CSP の他ディレクティブは
-      // 維持する。x-frame-options を外す(UI からの埋め込みを許す)のは HTML 文書だけ。
-      if (isHtml) delete next["x-frame-options"];
+      // 親を UI の origin に限り、inspector 用のスクリプト許可は HTML だけに付ける。
+      // x-frame-options を外すのは埋め込み対象の HTML・XHTML 文書だけ。
+      if (isHtml || declaredDocument) delete next["x-frame-options"];
       setOutgoingHeader(
         next,
         "content-security-policy",
-        rewriteCspHeader(next["content-security-policy"], frameAncestors)
+        rewriteCspHeader(next["content-security-policy"], frameAncestors, isHtml)
       );
       return next;
     };
@@ -514,7 +527,7 @@ export function startProxy(
       statusCode === 304 ||
       (statusCode >= 100 && statusCode < 200);
     if (bodyless || encoded) {
-      res.writeHead(statusCode, responseHeaders(declaredDocument));
+      res.writeHead(statusCode, responseHeaders(declaredHtml));
       proxyRes.pipe(res);
       return;
     }
@@ -525,7 +538,7 @@ export function startProxy(
     }
 
     if (!mustSniff) {
-      res.writeHead(statusCode, responseHeaders(declaredDocument));
+      res.writeHead(statusCode, responseHeaders(declaredHtml));
       proxyRes.pipe(res);
       return;
     }

@@ -453,6 +453,43 @@ describeIfLoopback("proxy transport fidelity", () => {
     }
   });
 
+  it("only rewrites frame-ancestors for JavaScript responses", async () => {
+    const defaultSource = "default-src https://cdn.example";
+    const scriptSources = "script-src 'none'; script-src-elem https://cdn.example";
+    const upstream = http.createServer((req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/javascript",
+        "content-security-policy":
+          req.url === "/worker.js"
+            ? defaultSource
+            : `${scriptSources}; frame-ancestors 'none'`,
+      });
+      res.end("/* script */");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+    const parentOrigin = "http://localhost:5173";
+    const frameAncestors = `frame-ancestors 'self' ${parentOrigin}`;
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort, "127.0.0.1", {
+        parentOrigins: [parentOrigin],
+      });
+      const worker = await requestViaProxy(proxyPort, "/worker.js");
+      const script = await requestViaProxy(proxyPort, "/script.js");
+      expect(worker.headers["content-security-policy"]).toBe(
+        `${defaultSource}; ${frameAncestors}`
+      );
+      expect(script.headers["content-security-policy"]).toBe(
+        `${scriptSources}; ${frameAncestors}`
+      );
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
   it("rewrites target Location headers on the pipe response path", async () => {
     let upstreamPort = 0;
     const upstream = http.createServer((_req, res) => {
