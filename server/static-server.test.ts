@@ -1,7 +1,9 @@
 // @vitest-environment node
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import http from "node:http";
+import * as fs from "node:fs";
 import { mkdtempSync, realpathSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -36,6 +38,60 @@ function get(port: number, path: string): Promise<number> {
 }
 
 describe("static-server", () => {
+  it.skipIf(process.platform === "win32")(
+    "opens nonblocking and keeps serving after rejecting a FIFO descriptor",
+    async () => {
+      const port = await findFreePort(39200);
+      const open = vi.fn(fs.openSync);
+      const fstat = vi.fn((fd: number) => fs.fstatSync(fd)).mockImplementationOnce(
+        (fd) =>
+          Object.assign(fs.fstatSync(fd), {
+            isFile: () => false,
+            isFIFO: () => true,
+          })
+      );
+      const close = vi.fn(fs.closeSync);
+      let server: http.Server | undefined;
+      vi.stubEnv("PORT", String(port));
+      vi.doMock("node:fs", () => ({
+        ...fs,
+        openSync: open,
+        fstatSync: fstat,
+        closeSync: close,
+      }));
+      vi.doMock("node:http", () => ({
+        default: {
+          createServer(listener: http.RequestListener) {
+            server = http.createServer(listener);
+            return server;
+          },
+        },
+      }));
+
+      try {
+        const staticServer = "./static-server.mjs";
+        await import(staticServer);
+        if (!server) throw new Error("Static server was not created");
+        if (!server.listening) await once(server, "listening");
+
+        expect(await get(port, "/package.json")).toBe(404);
+        expect(close).toHaveBeenCalledWith(open.mock.results[0]?.value);
+        expect(await get(port, "/package.json")).toBe(200);
+        expect(Number(open.mock.calls[0]?.[1]) & fs.constants.O_NONBLOCK).toBe(
+          fs.constants.O_NONBLOCK
+        );
+      } finally {
+        await new Promise<void>((resolve) => {
+          if (server) server.close(() => resolve());
+          else resolve();
+        });
+        vi.doUnmock("node:fs");
+        vi.doUnmock("node:http");
+        vi.unstubAllEnvs();
+      }
+    }
+  );
+
   it("keeps running when a file disappears between the checks and the read", async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "uim-static-race-")));
     const port = await findFreePort(39200);

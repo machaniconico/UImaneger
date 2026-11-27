@@ -116,7 +116,11 @@ const server = http.createServer((req, res) => {
     const checked = statSync(file);
     if (!checked.isFile()) throw new Error("not a file");
     // 検査した実体そのものを開いて配信する(検査後に差し替えられたら配信しない)。
-    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    // FIFO への差し替えで、fstat に到達する前の open がブロックしないようにする。
+    fd = openSync(
+      file,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+    );
     const opened = fstatSync(fd);
     if (!opened.isFile() || opened.dev !== checked.dev || opened.ino !== checked.ino) {
       throw new Error("changed after check");
