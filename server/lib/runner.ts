@@ -785,6 +785,10 @@ export async function startTarget(
   if (proc.stderr) attachOutput(proc.stderr);
 
   // ポート確定 & listen 待ち
+  // 同じ port・host に連続 2 回(poll 間隔を挟んで)接続できた時だけ確定する。Vite などは起動中に
+  // 127.0.0.1 で一時的に listen してから本番を localhost(Windows では ::1)に bind するため、
+  // 1 回の接続で確定すると一時リスナーの host を掴み、プレビューが ECONNREFUSED になる。
+  let lastSeen: { port: number; host: LoopbackHost } | null = null;
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (spawnFailed) {
@@ -808,12 +812,34 @@ export async function startTarget(
     const portsToProbe = [detectedPort, port].filter(
       (candidate, index, all) => candidate > 0 && all.indexOf(candidate) === index
     );
+    // 2 回目は前回見つけた host を直接確認する(両方で listen するサーバでも
+    // Promise.any の勝者が poll ごとに入れ替わって確定できない、ということが起きない)。
+    // 候補を優先順(出力で検出した port → 要求 port)に調べる。前回見つけた port の番では保存済み host を
+    // 直接再確認し、通れば確定する。前回より優先度の高い候補が新たに listen していれば、それを次回の確認対象にする。
+    // これで、ログの port が後から listen した場合の切替と、未 listen の場合の要求 port での確定を両立する。
+    const detectedAtPollStart = detectedPort;
+    let found: { port: number; host: LoopbackHost } | null = null;
     for (const candidate of portsToProbe) {
+      if (lastSeen && candidate === lastSeen.port) {
+        const host = lastSeen.host;
+        const confirmed = await probeHost(host, candidate).then(
+          () => true,
+          () => false
+        );
+        if (confirmed) {
+          // 再確認の待ち中に出力から新しい port が検出されたら、確定を見送り次の poll で最新の候補順から調べ直す。
+          if (detectedPort === detectedAtPollStart) return { proc, plan, port: candidate, host, logs };
+          found = lastSeen;
+          break;
+        }
+      }
       const host = await findListeningHost(candidate);
       if (host) {
-        return { proc, plan, port: candidate, host, logs };
+        found = { port: candidate, host };
+        break;
       }
     }
+    lastSeen = found;
     await sleep(300);
   }
   // deadline 超過: プロセスグループを確実に停止してから reject。

@@ -3,6 +3,7 @@
 // 実プロセス・実ポートを使う node 環境テスト。jsdom 不要。
 import { describe, it, expect } from "vitest";
 import http from "node:http";
+import net from "node:net";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -299,6 +300,130 @@ describe("startTarget", () => {
       expect(target.logs).toContain(`Listening on ${target.port}`);
       const response = await fetch(`http://127.0.0.1:${target.port}`);
       expect(await response.text()).toBe("logged port");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("does not lock onto a transient IPv4 listener before the real IPv6 bind", async (ctx) => {
+    // Vite は起動中に 127.0.0.1 で一時的に listen してから本番を localhost(Windows では ::1)に bind することがある。
+    // 最初の接続を受けた瞬間に IPv4 を閉じて ::1 に移るサーバで、その競合を決定的に再現する。
+    const probe = net.createServer();
+    const ipv6 = await new Promise<boolean>((resolve) => {
+      probe.once("error", () => resolve(false));
+      probe.listen(0, "::1", () => probe.close(() => resolve(true)));
+    });
+    if (!ipv6) {
+      ctx.skip();
+      return;
+    }
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-transient-"));
+    const port = await findFreePort(30_250);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        const port = Number(process.env.PORT);
+        const transient = require("node:net").createServer((socket) => {
+          socket.destroy();
+          transient.close(() => {
+            http.createServer((_req, res) => res.end("real ipv6")).listen(port, "::1");
+          });
+        });
+        transient.listen(port, "127.0.0.1");
+      `);
+      target = await startTarget(tmp, port);
+      expect(target.host).toBe("::1");
+      const response = await fetch(`http://[::1]:${target.port}`);
+      expect(await response.text()).toBe("real ipv6");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("switches to the port logged after an early listener on the requested port", async () => {
+    // 要求 port で先に listen したまま、別 port で本番を立ててログに出すサーバ。ログの port を優先する。
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-switch-"));
+    const port = await findFreePort(30_270);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        // 要求 port への最初の接続(= 起動確認の probe)を受けてから本番を立てる。
+        let started = false;
+        const early = http.createServer((_req, res) => res.end("early"));
+        early.on("connection", () => {
+          if (started) return;
+          started = true;
+          const real = http.createServer((_req, res) => res.end("real")).listen(0, "127.0.0.1", () => {
+            console.log("Listening on " + real.address().port);
+          });
+        });
+        early.listen(Number(process.env.PORT), "127.0.0.1");
+      `);
+      target = await startTarget(tmp, port);
+      expect(target.port).not.toBe(port);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("real");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("falls back to the requested port when the logged port never listens", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-fallback-"));
+    const port = await findFreePort(30_290);
+    const unused = await findFreePort(port + 1);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        http.createServer((_req, res) => res.end("requested")).listen(Number(process.env.PORT), "127.0.0.1", () => {
+          console.log("Listening on ${unused}");
+        });
+      `);
+      const started = Date.now();
+      target = await startTarget(tmp, port);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(target.port).toBe(port);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("requested");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
+  itIfLoopback("switches to the logged port when it starts listening between polls", async () => {
+    // 先に別 port をログに出し(まだ未 listen)、要求 port への最初の probe を契機にその port を立てる。
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-late-"));
+    const port = await findFreePort(30_310);
+    const logged = await findFreePort(port + 1);
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        console.log("Listening on ${logged}");
+        let started = false;
+        const requested = http.createServer((_req, res) => res.end("requested"));
+        requested.on("connection", () => {
+          if (started) return;
+          started = true;
+          http.createServer((_req, res) => res.end("real")).listen(${logged}, "127.0.0.1");
+        });
+        requested.listen(Number(process.env.PORT), "127.0.0.1");
+      `);
+      target = await startTarget(tmp, port);
+      expect(target.port).toBe(logged);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("real");
     } finally {
       if (target) await killGroup(target.proc);
       rmSync(tmp, { recursive: true, force: true });
