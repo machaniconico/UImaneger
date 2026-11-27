@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp, isProduction } from "./app.ts";
+import { getPreviewParentOrigins } from "./lib/state.ts";
 
 const tempDirs: string[] = [];
 
@@ -164,5 +165,19 @@ describe("isProduction", () => {
   it("lets an explicit option win over argv and NODE_ENV", () => {
     expect(isProduction({ production: false }, ["--production"], "production")).toBe(false);
     expect(isProduction({ production: true }, [], undefined)).toBe(true);
+  });
+});
+
+describe("preview parent origins wiring", () => {
+  it("passes the UI origin of createApp to the preview proxies", () => {
+    createApp({ useLogger: false, production: false, serverPort: 5300, clientPort: 5301 });
+    expect(getPreviewParentOrigins()).toEqual(
+      expect.arrayContaining(["http://localhost:5301", "http://127.0.0.1:5301"])
+    );
+    expect(getPreviewParentOrigins()).not.toContain("http://localhost:5300");
+
+    createApp({ useLogger: false, production: true, serverPort: 5300, clientPort: 5301 });
+    expect(getPreviewParentOrigins()).toContain("http://localhost:5300");
+    expect(getPreviewParentOrigins()).not.toContain("http://localhost:5301");
   });
 });

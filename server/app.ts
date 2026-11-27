@@ -3,7 +3,8 @@ import { Hono } from "hono";
 import { logger } from "hono/logger";
 import { existsSync } from "node:fs";
 import { api } from "./routes/api.ts";
-import { createSecurityMiddleware } from "./middleware/security.ts";
+import { createSecurityMiddleware, previewParentOrigins } from "./middleware/security.ts";
+import { setPreviewParentOrigins } from "./lib/state.ts";
 import { env, isProduction } from "./lib/env.ts";
 
 export interface CreateAppOptions {
@@ -46,7 +47,10 @@ export function createApp(options: CreateAppOptions = {}): Hono {
 
   app.get("/health", (c) => c.text("ok"));
   if (options.useLogger ?? true) app.use("/api/*", logger());
-  app.use("/api/*", createSecurityMiddleware(resolveSecurityPorts(options)));
+  const securityPorts = resolveSecurityPorts(options);
+  app.use("/api/*", createSecurityMiddleware(securityPorts));
+  // プレビュープロキシの frame-ancestors と inspector も、この UI の origin に合わせる。
+  setPreviewParentOrigins(previewParentOrigins(securityPorts));
   app.route("/api", api);
 
   const distRoot = options.distRoot ?? "./dist";
