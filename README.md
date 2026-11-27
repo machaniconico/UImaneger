@@ -82,7 +82,7 @@ npm run test:ci
 npm run build
 npm run verify
 npm run sbom
-npm audit
+npm run audit
 ```
 
 `npm run verify` は依存ポリシー、型検査、runner/resolver selftest、Vitest、production build を実行します。実 API キーを使うブラウザ全体の編集フローと、各バックエンド runtime の実起動マトリクスは CI では未検証です。

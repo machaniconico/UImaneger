@@ -10,7 +10,8 @@
 
 - exact dependency versions と lockfile 整合を `npm run policy` で検査
 - TypeScript、selftest、Vitest、production build を `npm run verify` で検査
-- CycloneDX SBOM: `sbom.cdx.json`
+- CycloneDX SBOM: `sbom.cdx.json`(`npm run sbom`。失敗時は既存ファイルを変更しない)
+- 依存 scan: `npm run audit`(moderate 以上で失敗)。CI の `audit` job で毎 push 実行。2026-11-27 時点 0 件
 - 外部サービス記録: `THIRD_PARTY_SERVICES.md`
 - 現在の対応範囲と未検証 runtime: `../README.md` と `../SPEC.md`
 
@@ -21,7 +22,7 @@
 | 製品の権利 | BLOCKED | repository の製品 license、著作権者、販売主体の確定 |
 | OSS / assets | BLOCKED | 直接・推移依存、font、icon、asset の license 確認と `THIRD_PARTY_NOTICES` |
 | Anthropic terms / privacy | HUMAN-REVIEW | `THIRD_PARTY_SERVICES.md` の release blockers 解消 |
-| Security | BLOCKED | secret scan、SAST、依存 scan、配布 artifact scan、脅威モデルの release 証跡 |
+| Security | BLOCKED | 依存 scan は CI 化済み。残りは secret scan、SAST、配布 artifact scan、脅威モデルの release 証跡 |
 | Browser E2E | BLOCKED | 実ブラウザで open、select、proposal、apply、undo、HMR を検証 |
 | Runtime matrix | BLOCKED | claim する OS と主要 framework/runtime の実プロセス検証 |
 | Distribution | BLOCKED | installer/package、署名、artifact hash、更新、rollback の確認 |
