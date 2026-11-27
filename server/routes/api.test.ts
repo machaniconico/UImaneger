@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   api,
@@ -481,7 +481,8 @@ describe("project security helpers", () => {
         new Error(`Command failed: git clone --depth 1 -- https://example.com/r.git ${join(workspaces, "r-0123456789")}\nfatal: unable to access`)
       );
       expect(message).not.toContain(workspaces);
-      expect(message).toContain(`workspaces${sep}r-0123456789`);
+      // 区切りは OS によらず "/" に揃える
+      expect(message).toContain("workspaces/r-0123456789");
     } finally {
       (env as { workspacesDir: string }).workspacesDir = previous;
       rmSync(workspaces, { recursive: true, force: true });
