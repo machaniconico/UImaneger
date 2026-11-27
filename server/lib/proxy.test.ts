@@ -8,6 +8,8 @@ import net from "node:net";
 import { gzipSync } from "node:zlib";
 import { findFreePort, isListening, sleep } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
+import { previewParentOrigins } from "../middleware/security.ts";
+import { env } from "./env.ts";
 
 // --- helpers (自己完結) ---
 
@@ -374,9 +376,9 @@ describeIfLoopback("proxy upstream response errors", () => {
 });
 
 describeIfLoopback("proxy transport fidelity", () => {
-  it("sets frame-ancestors to localhost-family origins only", async () => {
+  it("sets frame-ancestors to the UI origins only", async () => {
     const expectedCsp =
-      "frame-ancestors 'self' http://localhost:* http://*.localhost:* http://127.0.0.1:* http://[::1]:*";
+      "frame-ancestors 'self' http://localhost:5173 http://127.0.0.1:5173 http://[::1]:5173";
     const upstream = http.createServer((_req, res) => {
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
@@ -391,11 +393,14 @@ describeIfLoopback("proxy transport fidelity", () => {
 
     let handle: ProxyHandle | null = null;
     try {
-      handle = await startProxy(upstreamPort, proxyPort);
+      handle = await startProxy(upstreamPort, proxyPort, "127.0.0.1", {
+        parentOrigins: previewParentOrigins({ serverPort: 5174, clientPort: 5173 }),
+      });
       const response = await requestViaProxy(proxyPort);
 
       expect(response.headers["x-frame-options"]).toBeUndefined();
       expect(response.headers["content-security-policy"]).toContain(expectedCsp);
+      expect(response.headers["content-security-policy"]).not.toContain("*");
       expect(response.headers["content-security-policy"]).toContain(
         "default-src 'self'"
       );
@@ -562,7 +567,7 @@ describeIfLoopback("proxy transport fidelity", () => {
     }
   });
 
-  it("keeps XHTML byte-identical while allowing localhost iframe previews", async () => {
+  it("keeps XHTML byte-identical while allowing UI iframe previews", async () => {
     const xhtml = Buffer.from(
       '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body>xhtml</body></html>',
       "utf8"
@@ -586,9 +591,11 @@ describeIfLoopback("proxy transport fidelity", () => {
       expect(response.body.equals(xhtml)).toBe(true);
       expect(response.body.toString("utf8")).not.toContain("data-uim-inspector");
       expect(response.headers["x-frame-options"]).toBeUndefined();
+      // options 省略時は env の UI origin(dev は clientPort)だけを許可する。
       expect(response.headers["content-security-policy"]).toContain(
-        "http://localhost:*"
+        `http://localhost:${env.clientPort}`
       );
+      expect(response.headers["content-security-policy"]).not.toContain("*");
     } finally {
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});

@@ -20,19 +20,12 @@
   var trustedParentOrigin = null;
   var readySent = false;
 
+  // プレビューを埋め込める親(UI)の origin。プロキシが配信時に JSON 配列で埋め込む
+  // (埋め込まれていなければ空 = どの親も信頼しない)。
+  var PARENT_ORIGINS = /*__UIM_PARENT_ORIGINS__*/ [];
+
   function isTrustedOrigin(o) {
-    try {
-      var u = new URL(o);
-      return (
-        u.hostname === "127.0.0.1" ||
-        u.hostname === "localhost" ||
-        u.hostname === "[::1]" ||
-        u.hostname === "::1" ||
-        u.hostname.endsWith(".localhost")
-      );
-    } catch (e) {
-      return false;
-    }
+    return typeof o === "string" && PARENT_ORIGINS.indexOf(o) !== -1;
   }
 
   function postToParent(message) {

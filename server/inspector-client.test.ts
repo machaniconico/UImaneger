@@ -31,10 +31,17 @@ interface PostedMessage {
 }
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+// プロキシは配信時に許可する親 origin を埋め込む(server/lib/proxy.ts)。テストでは
+// dev の UI(clientPort 5173)を許可した状態を再現する。
+const PARENT_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://[::1]:5173",
+];
 const inspectorSource = readFileSync(
   join(__dirname, "inspector-client.js"),
   "utf8"
-);
+).replace("/*__UIM_PARENT_ORIGINS__*/ []", JSON.stringify(PARENT_ORIGINS));
 
 function loadInspector(referrer = "https://editor.example/projects/1"): {
   helpers: InspectorHelpers;
@@ -242,13 +249,15 @@ describe("inspector-client helpers", () => {
     expect(helpers.getKeyboardCandidates()).toContain(button);
   });
 
-  it("trusts only localhost-family origins", () => {
+  it("trusts only the embedded UI origins", () => {
     const { helpers } = loadInspector();
 
     expect(helpers.isTrustedOrigin("http://localhost:5173")).toBe(true);
     expect(helpers.isTrustedOrigin("http://127.0.0.1:5173")).toBe(true);
     expect(helpers.isTrustedOrigin("http://[::1]:5173")).toBe(true);
-    expect(helpers.isTrustedOrigin("http://app.localhost:5173")).toBe(true);
+    expect(helpers.isTrustedOrigin("http://app.localhost:5173")).toBe(false);
+    expect(helpers.isTrustedOrigin("http://localhost:6100")).toBe(false);
+    expect(helpers.isTrustedOrigin("https://localhost:5173")).toBe(false);
     expect(helpers.isTrustedOrigin("https://evil.com")).toBe(false);
     expect(helpers.isTrustedOrigin("http://localhost.evil.com")).toBe(false);
     expect(helpers.isTrustedOrigin("not a url")).toBe(false);
