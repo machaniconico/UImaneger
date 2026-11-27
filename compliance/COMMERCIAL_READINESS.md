@@ -30,7 +30,7 @@
 | Browser E2E | PARTIAL | `npm run e2e`(Playwright 1.65.0 / Chromium、偽 Anthropic API、同梱 Vite+React サンプルの一時複製)で open・select・proposal・apply・undo と、別タブでの状態保持つき HMR を検証。2026-11-27 にローカル(WSL2/Node 22)と GitHub Actions ubuntu-latest で PASS(run 46016436860、commit `469ae1c`)。Firefox もローカルで PASS。CI は Ubuntu で Chromium/Firefox/WebKit、Windows で Chromium/Firefox を実行。残り: macOS、実 API キーでの確認 |
 | Runtime matrix | PARTIAL | 2026-11-27 に WSL2 / Node 22（一部は一時 SDK を使用）で 19 PASS、2 SKIP、0 FAIL。Rails と Phoenix は fixture あり・実プロセス未実行。GitHub Actions(run 46016436860、commit `469ae1c`)で Ubuntu は 19 構成(node・python・php・go・java・dotnet を必須化)、Windows は Node 系 12 構成が PASS。残りは Rails/Phoenix、Windows の非 Node runtime、macOS |
 | Distribution | BLOCKED | installer/package、署名、artifact hash、更新、rollback の確認 |
-| Operations | BLOCKED | support、脆弱性受付、incident response、data deletion の窓口と手順 |
+| Operations | PARTIAL | 脆弱性受付は GitHub Private vulnerability reporting を 2026-11-28 に有効化し、手順を `../SECURITY.md` に記載。残り: 応答期限などのサポート条件、support 窓口、incident response と data deletion の手順(販売主体の決定後) |
 | Legal / store | HUMAN-REVIEW | 対象国、販売経路、価格、返金、規約、表示義務の専門家確認 |
 
 ## Release rule
