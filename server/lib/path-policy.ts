@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 /** 403 の応答本文に使う文言(ファイル内容や絶対パスは含めない)。 */
@@ -28,7 +28,25 @@ function relHasProtectedSegment(rootPath: string, filePath: string): boolean {
   return rel.split(/[\\/]+/).some(isProtectedSegment);
 }
 
-/** 実体パス。未存在なら最も近い既存の祖先を realpath して残りを連結する。 */
+/**
+ * パスの末端が本当に存在しないか(realpath が ENOENT、かつ lstat でも無い)。宙づり symlink は
+ * lstat では存在するので false。
+ */
+function isMissing(path: string, err: unknown): boolean {
+  if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") return false;
+  try {
+    lstatSync(path);
+    return false;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === "ENOENT";
+  }
+}
+
+/**
+ * 実体パス。未存在なら最も近い既存の祖先を realpath して残りを連結する。
+ * 祖先での補完は末端が本当に存在しない時だけ行い、それ以外の解決失敗(EACCES・EIO・ELOOP、
+ * 宙づり symlink)は null を返す(呼び出し側は拒否する = fail-closed)。
+ */
 export function realpathOrNearest(abs: string): string | null {
   const rest: string[] = [];
   let cur = abs;
@@ -36,7 +54,8 @@ export function realpathOrNearest(abs: string): string | null {
     try {
       const real = realpathSync.native(cur);
       return rest.length ? join(real, ...rest.reverse()) : real;
-    } catch {
+    } catch (e) {
+      if (!isMissing(cur, e)) return null;
       const parent = dirname(cur);
       if (parent === cur) return null;
       rest.push(basename(cur));
@@ -68,7 +87,9 @@ export function isInsideRoot(root: string, file: string): boolean {
   }
   try {
     realFile = realpathSync.native(abs);
-  } catch {
+  } catch (e) {
+    // 補完は末端が本当に無い時だけ。EACCES・ELOOP・宙づり symlink などは root 外として拒否する。
+    if (!isMissing(abs, e)) return false;
     try {
       realFile = join(realpathSync.native(dirname(abs)), basename(abs));
     } catch {
@@ -94,6 +115,7 @@ export function isProtectedPath(root: string, file: string): boolean {
     return false;
   }
   const realFile = realpathOrNearest(abs);
-  if (realFile === null) return false;
+  // 実体を解決できないものは保護対象として扱う(fail-closed)。
+  if (realFile === null) return true;
   return relHasProtectedSegment(realRoot, realFile);
 }
