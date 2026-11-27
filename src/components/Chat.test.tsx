@@ -358,6 +358,34 @@ describe("Chat", () => {
     expect(screen.queryByRole("button", { name: /redo/ })).toBeNull();
   });
 
+  it.each(["成功", "失敗"] as const)(
+    "初回の status が適用より後に%sしても、適用で確定した undo/redo の件数を上書きしない",
+    async (outcome) => {
+      const user = userEvent.setup();
+      let settleStatus!: () => void;
+      vi.mocked(api.status).mockReturnValueOnce(
+        new Promise((resolve, reject) => {
+          settleStatus = () =>
+            outcome === "成功"
+              ? resolve({ info: null, hasKey: true, logs: [], undoDepth: 0, redoDepth: 0 })
+              : reject(new Error("サーバに接続できません"));
+        })
+      );
+      vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+      vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx", undoDepth: 1 });
+      render(<Chat selected={descriptor} hasKey={true} />);
+
+      await sendInstruction(user, "赤くして");
+      await user.click(await screen.findByRole("button", { name: "承認して適用" }));
+      expect(await screen.findByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
+
+      await act(async () => {
+        settleStatus();
+      });
+      expect(screen.getByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
+    }
+  );
+
   // ★最重要: apply 失敗時の回帰テスト(Codex確認済みの修正)
   it("api.applyEdit が ok:false を返したとき proposal を保持し再試行可能・busy解除される", async () => {
     const user = userEvent.setup();

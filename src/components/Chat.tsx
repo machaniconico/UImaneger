@@ -50,6 +50,8 @@ export function Chat({
   const [lastInstruction, setLastInstruction] = useState("");
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
+  /** 操作の応答で undo/redo 件数を更新するたびに進める(初回 status の古い結果を捨てるため) */
+  const depthVersionRef = useRef(0);
   const [editModels, setEditModels] = useState<EditModel[]>([]);
   const [editModel, setEditModel] = useState("");
   const editModelRef = useRef("");
@@ -112,19 +114,18 @@ export function Chat({
 
   useEffect(() => {
     let alive = true;
+    // 初回取得より後に適用・undo・redo の応答で件数が確定していたら、古い取得結果では上書きしない
+    const versionAtStart = depthVersionRef.current;
+    const isStale = () => !alive || depthVersionRef.current !== versionAtStart;
     api
       .status()
       .then((s) => {
-        if (alive) {
-          setUndoDepth(s.undoDepth ?? 0);
-          setRedoDepth(s.redoDepth ?? 0);
-        }
+        if (isStale()) return;
+        setUndoDepth(s.undoDepth ?? 0);
+        setRedoDepth(s.redoDepth ?? 0);
       })
       .catch(() => {
-        if (alive) {
-          setUndoDepth(0);
-          setRedoDepth(0);
-        }
+        // 取得に失敗しても件数は初期値 0 のまま。後から確定した値を 0 で消さない
       });
     return () => {
       alive = false;
@@ -156,11 +157,13 @@ export function Chat({
 
   async function refreshUndoDepth() {
     const s = await api.status();
+    depthVersionRef.current++;
     setUndoDepth(s.undoDepth ?? 0);
   }
 
   async function refreshDepths() {
     const s = await api.status();
+    depthVersionRef.current++;
     setUndoDepth(s.undoDepth ?? 0);
     setRedoDepth(s.redoDepth ?? 0);
   }
@@ -293,6 +296,7 @@ export function Chat({
           ok: true,
           text: `✓ ${res.relFile || proposal.relFile} に適用しました`,
         });
+        depthVersionRef.current++;
         setUndoDepth((depth) => res.undoDepth ?? depth + 1);
         setRedoDepth(0);
         window.dispatchEvent(new CustomEvent("uim:applied"));
@@ -337,11 +341,13 @@ export function Chat({
           text: `↩ ${res.relFile || ""} を元に戻しました`,
         });
         window.dispatchEvent(new CustomEvent("uim:applied"));
+        depthVersionRef.current++;
         setUndoDepth(res.undoDepth ?? 0);
         setRedoDepth((depth) => res.redoDepth ?? depth + 1);
       } else {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
         if (res.undoDepth != null) {
+          depthVersionRef.current++;
           setUndoDepth(res.undoDepth);
         } else {
           await refreshUndoDepth().catch((statusError) => {
@@ -371,6 +377,7 @@ export function Chat({
           text: `↪ ${res.relFile || ""} をやり直しました`,
         });
         window.dispatchEvent(new CustomEvent("uim:applied"));
+        depthVersionRef.current++;
         setUndoDepth((depth) => res.undoDepth ?? depth + 1);
         setRedoDepth(res.redoDepth ?? 0);
       } else {
