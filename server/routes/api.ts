@@ -112,6 +112,8 @@ export const __stores = {
 };
 let storesRoot: string | null = null;
 let projectEpoch = 0;
+/** 履歴ロック待ち・実行中のプロジェクト切替の数 */
+let pendingSwitches = 0;
 
 function sanitizeForLog(value: unknown): string {
   let s = String(value ?? "");
@@ -145,7 +147,7 @@ const FS_WRITE_SYSCALLS = new Set(["write", "rename", "unlink", "mkdir", "rmdir"
  * 分類済みの汎用文に置き換え、詳細はサーバログ (serverErrorPayload) のみに残す。
  * それ以外の例外も API キーを伏せ、プロジェクトルートの絶対パスは相対表記にする。
  */
-function clientErrorMessage(e: unknown, relFile?: string): string {
+export function clientErrorMessage(e: unknown, relFile?: string): string {
   const err = e as { code?: unknown; syscall?: unknown; message?: unknown };
   const where = relFile ? ` (${relFile})` : "";
   if (typeof err?.code === "string" && /^E[A-Z0-9]+$/.test(err.code)) {
@@ -154,10 +156,48 @@ function clientErrorMessage(e: unknown, relFile?: string): string {
     if (FS_READ_SYSCALLS.has(syscall)) return `ソースファイルを読めませんでした${where}`;
     return `ファイル操作に失敗しました${where}`;
   }
-  let message = sanitizeForLog(err?.message ?? e);
-  const root = getRoot();
-  if (root) message = message.split(root + sep).join("").split(root).join(".");
-  return message;
+  return redactLocalPaths(sanitizeForLog(err?.message ?? e), [
+    { path: getRoot(), label: "." },
+    // clone 先 (UIM_WORKSPACES_DIR) の絶対パスは "workspaces" に置き換える
+    { path: resolve(env.workspacesDir), label: "workspaces" },
+  ]);
+}
+
+/**
+ * メッセージ中の絶対パスを表示用ラベルに置き換える。
+ * - 長いパスを優先する(ルートと workspaces が親子でも、より具体的な方で置換する)
+ * - パス要素の境界でだけ一致させる(`/w` が `/www` にも、URL の `//w` にも一致しない)
+ * - 区切りは / と \ のどちらにも一致し、Windows では大文字小文字を区別しない
+ * - ファイルシステムのルート(`/`、`C:\`)は置換しない
+ */
+export function redactLocalPaths(
+  message: string,
+  entries: Array<{ path: string | null | undefined; label: string }>,
+  platform: NodeJS.Platform = process.platform
+): string {
+  const usable = entries
+    .filter((entry): entry is { path: string; label: string } => Boolean(entry.path))
+    .map((entry) => ({ ...entry, path: entry.path.replace(/[\\/]+$/, "") }))
+    .filter((entry) => entry.path && !/^[A-Za-z]:$/.test(entry.path))
+    .sort((a, b) => b.path.length - a.path.length);
+  if (!usable.length) return message;
+  const toPattern = (path: string) =>
+    path
+      .split(/[\\/]+/)
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("[\\\\/]+");
+  const pattern = new RegExp(
+    `(?<![A-Za-z0-9._~:\\\\/-])(?:${usable.map((entry) => `(${toPattern(entry.path)})`).join("|")})(?![A-Za-z0-9._~-])([\\\\/]+)?`,
+    platform === "win32" ? "gi" : "g"
+  );
+  return message.replace(pattern, (...match: unknown[]) => {
+    const groups = match.slice(1, usable.length + 1) as Array<string | undefined>;
+    const index = groups.findIndex((group) => group !== undefined);
+    const separator = match[usable.length + 1] as string | undefined;
+    const label = usable[index]!.label;
+    if (label === ".") return separator ? "" : ".";
+    return separator ? `${label}/` : label;
+  });
 }
 
 function serverError(c: Context, e: unknown, relFile?: string) {
@@ -699,15 +739,29 @@ api.get("/models", (c) => {
  * 旧プロジェクトのファイルだけ書き換わり、応答 409・履歴なしになるため、進行中の
  * 書き込みと履歴記録が終わるまで切替を待たせる。
  */
-function switchProject(path: string, command: string | undefined) {
-  return withHistoryLock(async () => {
-    try {
-      return await openAndStart(path, { command });
-    } finally {
-      // 起動失敗でもルートは切り替わり得るので、ストアは常に現在のルートへ合わせる
-      ensureStoresForCurrentRoot();
-    }
-  });
+async function switchProject(path: string, command: string | undefined) {
+  pendingSwitches++;
+  try {
+    return await withHistoryLock(async () => {
+      try {
+        return await openAndStart(path, { command });
+      } finally {
+        // 起動失敗でもルートは切り替わり得るので、ストアは常に現在のルートへ合わせる
+        ensureStoresForCurrentRoot();
+      }
+    });
+  } finally {
+    pendingSwitches--;
+  }
+}
+
+/**
+ * 切替(dev server の起動待ちを含み最大で数十秒)を待っている間の apply/undo/redo は、
+ * 切替の後ろに並べても旧プロジェクト向けとして 409 になるだけなので、すぐに断る。
+ */
+function rejectDuringSwitch(c: Context): Response | null {
+  if (pendingSwitches === 0) return null;
+  return c.json({ error: "プロジェクトを切り替え中です。切替の完了後にやり直してください。" }, 409);
 }
 
 api.post("/project/open", async (c) => {
@@ -800,7 +854,9 @@ api.post("/project/clone", async (c) => {
       );
     } else {
       if (!existsSync(join(dest, ".git"))) {
-        throw new Error(`Clone先が既に存在しますがGitリポジトリではありません: ${dest}`);
+        throw new Error(
+          `Clone先が既に存在しますがGitリポジトリではありません: workspaces/${basename(dest)}`
+        );
       }
       const { stdout } = await pExecFile(
         "git",
@@ -813,7 +869,7 @@ api.post("/project/clone", async (c) => {
         }
       );
       if (stdout.trim() !== repo) {
-        throw new Error(`Clone先のoriginが要求URLと一致しません: ${dest}`);
+        throw new Error(`Clone先のoriginが要求URLと一致しません: workspaces/${basename(dest)}`);
       }
     }
     // packageManager/lockfileを尊重し、cloneしたコードのlifecycle scriptは実行しない。
@@ -1310,6 +1366,8 @@ api.post("/edit/apply", async (c) => {
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
 
+  const switching = rejectDuringSwitch(c);
+  if (switching) return switching;
   return withHistoryLock(async () => {
     ensureStoresForCurrentRoot();
     const root = getRoot();
@@ -1405,6 +1463,8 @@ api.post("/edit/reject", async (c) => {
 
 /** 最後の適用を取り消す。 */
 api.post("/edit/undo", async (c) => {
+  const switching = rejectDuringSwitch(c);
+  if (switching) return switching;
   return withHistoryLock(async () => {
     ensureStoresForCurrentRoot();
     const root = getRoot();
@@ -1472,6 +1532,8 @@ api.post("/edit/undo", async (c) => {
 
 /** 最後に取り消した適用をやり直す。 */
 api.post("/edit/redo", async (c) => {
+  const switching = rejectDuringSwitch(c);
+  if (switching) return switching;
   return withHistoryLock(async () => {
     ensureStoresForCurrentRoot();
     const root = getRoot();

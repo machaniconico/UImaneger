@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -17,6 +18,8 @@ import { pathToFileURL } from "node:url";
 import {
   api,
   __stores,
+  clientErrorMessage,
+  redactLocalPaths,
   isSafeGitRepoUrl,
   isTrustedRunCommandHost,
   isLoopbackBindHost,
@@ -447,6 +450,67 @@ describe("project security helpers", () => {
     expect(result.body.error).toBe(
       "runCommand の実行にはローカルからのアクセスが必要です"
     );
+  });
+
+  it("does not reveal the absolute workspaces path when the clone destination is not a git repository", async () => {
+    const workspaces = mkdtempSync(join(tmpdir(), "uim-ws-"));
+    const previous = env.workspacesDir;
+    const repo = "https://github.com/example/repo.git";
+    const fingerprint = createHash("sha256").update(repo).digest("hex").slice(0, 10);
+    mkdirSync(join(workspaces, `repo-${fingerprint}`));
+    (env as { workspacesDir: string }).workspacesDir = workspaces;
+    try {
+      const result = await postJson<{ error: string }>("/api/project/clone", { repo });
+      expect(result.res.status).toBeGreaterThanOrEqual(400);
+      expect(result.body.error).toContain("Gitリポジトリではありません");
+      expect(result.body.error).toContain(`repo-${fingerprint}`);
+      expect(result.body.error).not.toContain(workspaces);
+    } finally {
+      (env as { workspacesDir: string }).workspacesDir = previous;
+      rmSync(workspaces, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reveal the absolute workspaces path when git clone itself fails", () => {
+    const workspaces = mkdtempSync(join(tmpdir(), "uim-ws-"));
+    const previous = env.workspacesDir;
+    (env as { workspacesDir: string }).workspacesDir = workspaces;
+    try {
+      // execFile の失敗は "Command failed: git clone ... <絶対パス>" を message に含む
+      const message = clientErrorMessage(
+        new Error(`Command failed: git clone --depth 1 -- https://example.com/r.git ${join(workspaces, "r-0123456789")}\nfatal: unable to access`)
+      );
+      expect(message).not.toContain(workspaces);
+      // 区切りは OS によらず "/" に揃える
+      expect(message).toContain("workspaces/r-0123456789");
+    } finally {
+      (env as { workspacesDir: string }).workspacesDir = previous;
+      rmSync(workspaces, { recursive: true, force: true });
+    }
+  });
+
+  it("redacts local paths only at path boundaries, preferring the most specific entry", () => {
+    const posix = (message: string, root: string | null, workspaces: string) =>
+      redactLocalPaths(message, [{ path: root, label: "." }, { path: workspaces, label: "workspaces" }], "linux");
+    // workspaces がルートの子: より具体的な workspaces で置換する
+    expect(posix("fail /srv/app/cache/r and /srv/app/src/a.ts", "/srv/app", "/srv/app/cache")).toBe(
+      "fail workspaces/r and src/a.ts"
+    );
+    // workspaces がルートの親: ルートはルートで、兄弟は workspaces で置換する
+    expect(posix("x /srv/app/r y /srv/other/r", "/srv/app", "/srv")).toBe("x r y workspaces/other/r");
+    // ファイルシステムのルートや部分一致・URL は置換しない
+    expect(posix("see https://host/r", null, "/")).toBe("see https://host/r");
+    expect(posix("in /www/r", null, "/w")).toBe("in /www/r");
+    expect(posix("open https://w/r", null, "/w")).toBe("open https://w/r");
+    expect(posix("at /w", null, "/w")).toBe("at workspaces");
+    // Windows: 大文字小文字と区切りの違いを吸収する
+    const win = (message: string) =>
+      redactLocalPaths(message, [{ path: null, label: "." }, { path: "C:\\WS", label: "workspaces" }], "win32");
+    expect(win("git clone c:\\WS\\r failed")).toBe("git clone workspaces/r failed");
+    expect(win("git clone C:/ws/r failed")).toBe("git clone workspaces/r failed");
+    expect(win("drive C:\\ only")).toBe("drive C:\\ only");
+    // Linux は大文字小文字を区別する
+    expect(posix("/SRV/app/x", "/srv/app", "/ws")).toBe("/SRV/app/x");
   });
 
   it("rejects clone runCommand when Host is not local", async () => {
@@ -1968,6 +2032,51 @@ describe("project switch while a history write is in flight", () => {
       rmSync(oldRoot, { recursive: true, force: true });
     }
   );
+
+  it("rejects history writes with 409 while a project switch is waiting instead of queueing behind it", async () => {
+    const proposal = await requestProposal();
+    const actualRename = fsPromisesMock.actual.rename;
+    const renameStarted = deferred();
+    const releaseRename = deferred();
+    let delayed = false;
+    fsPromisesMock.rename.mockImplementation(async (...args: any[]) => {
+      if (!delayed && String(args[1]) === filePath) {
+        delayed = true;
+        renameStarted.resolve();
+        await releaseRename.promise;
+      }
+      return actualRename(...args);
+    });
+
+    const oldRoot = root;
+    const writePromise = postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    await renameStarted.promise;
+
+    const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-switch-"));
+    mkdirSync(join(nextRoot, "src"), { recursive: true });
+    writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+    const openPromise = postJson(
+      "/api/project/open",
+      { path: nextRoot, runCommand: "echo test-server-ready" },
+      { host: "localhost:5174" }
+    );
+    await delay(50);
+
+    // 切替待ちの間に来た undo / redo は、切替(dev server 起動を含む)の後ろに並ばず即座に断る
+    for (const kind of ["undo", "redo"] as const) {
+      const rejected = await postJson<{ error?: string }>(`/api/edit/${kind}`, {});
+      expect(rejected.res.status).toBe(409);
+      expect(rejected.body.error).toContain("切り替え中");
+    }
+
+    releaseRename.resolve();
+    expect((await writePromise).res.status).toBe(200);
+    await openPromise;
+    expect(state.getRoot()).toBe(nextRoot);
+    root = nextRoot;
+    filePath = join(nextRoot, "src", "App.tsx");
+    rmSync(oldRoot, { recursive: true, force: true });
+  });
 });
 
 describe("internal error details", () => {
