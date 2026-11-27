@@ -22,6 +22,7 @@ import {
   TruncatedError,
 } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
+import { isProtectedPath, PROTECTED_PATH_ERROR } from "../lib/path-policy.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
 import {
   getInfo,
@@ -944,6 +945,7 @@ api.get("/files/read", async (c) => {
   const path = c.req.query("path") || "";
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
+  if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
   try {
     const content = await readFile(resolve(path), "utf8");
     return c.json({ path: resolve(path), content });
@@ -961,6 +963,7 @@ api.post("/files/write", async (c) => {
   if (typeof path !== "string" || typeof content !== "string")
     return c.json({ error: "path と content は文字列である必要があります。" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
+  if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
   try {
     await withFileLock(path, () => atomicWrite(resolve(path), content));
     return c.json({ ok: true });
@@ -1032,6 +1035,8 @@ async function runEditFlow(
   }
   if (!inRoot(root, resolved.file))
     return { status: 403, body: { error: "解決先がプロジェクト範囲外" } };
+  if (isProtectedPath(root, resolved.file))
+    return { status: 403, body: { error: PROTECTED_PATH_ERROR } };
 
   if (resolved.confidence === "low") {
     return {
@@ -1326,6 +1331,8 @@ api.post("/edit/candidate", async (c) => {
   }
   if (!inRoot(root, file))
     return c.json({ error: "範囲外のパス" }, 403);
+  if (isProtectedPath(root, file))
+    return c.json({ error: PROTECTED_PATH_ERROR }, 403);
 
   const abs = resolve(file);
   if (!existsSync(abs))
@@ -1383,6 +1390,8 @@ api.post("/edit/apply", async (c) => {
       );
     if (!inRoot(root, p.file))
       return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
+    if (isProtectedPath(root, p.file))
+      return c.json({ error: PROTECTED_PATH_ERROR }, 403);
     if (inFlight.has(proposalId))
       return c.json({ error: "この提案は現在処理中です。" }, 409);
     inFlight.add(proposalId);
@@ -1477,6 +1486,8 @@ api.post("/edit/undo", async (c) => {
       return c.json({ error: "この提案は現在処理中です。" }, 409);
     if (!inRoot(root, entry.file))
       return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+    if (isProtectedPath(root, entry.file))
+      return c.json({ error: PROTECTED_PATH_ERROR }, 403);
     inFlight.add(entry.proposalId);
     try {
       return await withFileLock(entry.file, async () => {
@@ -1546,6 +1557,8 @@ api.post("/edit/redo", async (c) => {
       return c.json({ error: "この提案は現在処理中です。" }, 409);
     if (!inRoot(root, entry.file))
       return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+    if (isProtectedPath(root, entry.file))
+      return c.json({ error: PROTECTED_PATH_ERROR }, 403);
     inFlight.add(entry.proposalId);
     try {
       return await withFileLock(entry.file, async () => {

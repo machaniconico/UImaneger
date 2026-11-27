@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { DomDescriptor, ResolveResult } from "./types.ts";
 import { complete, hasKey, stripCodeFence } from "./claude.ts";
 import { buildChildEnv } from "./child-env.ts";
+import { isProtectedPath } from "./path-policy.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -722,7 +723,13 @@ function sourceFileCandidates(root: string, fileName: string): string[] {
 
 function findSourceFile(root: string, fileName: string): string | null {
   for (const candidate of sourceFileCandidates(root, fileName)) {
-    if (existsSync(candidate) && withinRoot(root, candidate)) return candidate;
+    // 保護パス(.git・node_modules・隠しファイル)を指すヒントは候補にせず層 B へ。
+    if (
+      existsSync(candidate) &&
+      withinRoot(root, candidate) &&
+      !isProtectedPath(root, candidate)
+    )
+      return candidate;
   }
   return null;
 }
