@@ -1,5 +1,13 @@
 import http from "node:http";
-import { createReadStream, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  createReadStream,
+  fstatSync,
+  openSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { extname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 
 const MIME = new Map([
@@ -96,6 +104,8 @@ const server = http.createServer((req, res) => {
     sendText(res, 404, "Not Found");
     return;
   }
+  let fd;
+  let size;
   try {
     if (statSync(file).isDirectory()) file = join(file, "index.html");
     // symlink や 8.3 名・大小文字の別名を実体名に解決してから同じ検査をやり直す。
@@ -103,24 +113,33 @@ const server = http.createServer((req, res) => {
     if (!isInsideRoot(file) || relative(root, file).split(sep).some(isBlockedSegment)) {
       throw new Error("blocked");
     }
-    if (!statSync(file).isFile()) throw new Error("not a file");
+    const checked = statSync(file);
+    if (!checked.isFile()) throw new Error("not a file");
+    // 検査した実体そのものを開いて配信する(検査後に差し替えられたら配信しない)。
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== checked.dev || opened.ino !== checked.ino) {
+      throw new Error("changed after check");
+    }
+    size = opened.size;
   } catch {
+    if (fd !== undefined) closeSync(fd);
     sendText(res, 404, "Not Found");
     return;
   }
 
-  const size = statSync(file).size;
   res.writeHead(200, {
     "content-type": MIME.get(extname(file).toLowerCase()) || "application/octet-stream",
     "content-length": String(size),
     "cache-control": "no-store",
     "x-content-type-options": "nosniff",
   });
-  if (req.method === "HEAD") {
+  if (req.method === "HEAD" || size === 0) {
+    closeSync(fd);
     res.end();
     return;
   }
-  const stream = createReadStream(file);
+  const stream = createReadStream(null, { fd, start: 0, end: size - 1 });
   stream.on("error", () => res.destroy());
   stream.pipe(res);
 });
