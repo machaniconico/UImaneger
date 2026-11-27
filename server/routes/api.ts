@@ -147,7 +147,7 @@ const FS_WRITE_SYSCALLS = new Set(["write", "rename", "unlink", "mkdir", "rmdir"
  * 分類済みの汎用文に置き換え、詳細はサーバログ (serverErrorPayload) のみに残す。
  * それ以外の例外も API キーを伏せ、プロジェクトルートの絶対パスは相対表記にする。
  */
-function clientErrorMessage(e: unknown, relFile?: string): string {
+export function clientErrorMessage(e: unknown, relFile?: string): string {
   const err = e as { code?: unknown; syscall?: unknown; message?: unknown };
   const where = relFile ? ` (${relFile})` : "";
   if (typeof err?.code === "string" && /^E[A-Z0-9]+$/.test(err.code)) {
@@ -159,6 +159,9 @@ function clientErrorMessage(e: unknown, relFile?: string): string {
   let message = sanitizeForLog(err?.message ?? e);
   const root = getRoot();
   if (root) message = message.split(root + sep).join("").split(root).join(".");
+  // clone 先 (UIM_WORKSPACES_DIR) の絶対パスは "workspaces" に置き換える
+  const workspaces = resolve(env.workspacesDir);
+  message = message.split(workspaces).join("workspaces");
   return message;
 }
 

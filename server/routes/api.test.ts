@@ -13,11 +13,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   api,
   __stores,
+  clientErrorMessage,
   isSafeGitRepoUrl,
   isTrustedRunCommandHost,
   isLoopbackBindHost,
@@ -463,6 +464,23 @@ describe("project security helpers", () => {
       expect(result.body.error).toContain("Gitリポジトリではありません");
       expect(result.body.error).toContain(`repo-${fingerprint}`);
       expect(result.body.error).not.toContain(workspaces);
+    } finally {
+      (env as { workspacesDir: string }).workspacesDir = previous;
+      rmSync(workspaces, { recursive: true, force: true });
+    }
+  });
+
+  it("does not reveal the absolute workspaces path when git clone itself fails", () => {
+    const workspaces = mkdtempSync(join(tmpdir(), "uim-ws-"));
+    const previous = env.workspacesDir;
+    (env as { workspacesDir: string }).workspacesDir = workspaces;
+    try {
+      // execFile の失敗は "Command failed: git clone ... <絶対パス>" を message に含む
+      const message = clientErrorMessage(
+        new Error(`Command failed: git clone --depth 1 -- https://example.com/r.git ${join(workspaces, "r-0123456789")}\nfatal: unable to access`)
+      );
+      expect(message).not.toContain(workspaces);
+      expect(message).toContain(`workspaces${sep}r-0123456789`);
     } finally {
       (env as { workspacesDir: string }).workspacesDir = previous;
       rmSync(workspaces, { recursive: true, force: true });
