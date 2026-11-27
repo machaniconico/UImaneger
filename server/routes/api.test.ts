@@ -1952,6 +1952,36 @@ describe("git API", () => {
     expect(result.body.error).toBe("コミットする変更がありません");
   }, 15_000);
 
+  it("commits a root merge whose result matches HEAD", async (ctx) => {
+    if (!gitAvailable() || !initGitRepo(root)) {
+      ctx.skip();
+      return;
+    }
+    const originalHead = String(runGit(["rev-parse", "HEAD"]).stdout).trim();
+    const branch = String(runGit(["branch", "--show-current"]).stdout).trim();
+    for (const args of [
+      ["checkout", "-b", "topic"],
+      ["commit", "--allow-empty", "-m", "Topic change"],
+      ["checkout", branch],
+      ["merge", "--no-commit", "--no-ff", "-s", "ours", "topic"],
+    ]) {
+      const git = runGit(args);
+      expect(git.status, String(git.stderr)).toBe(0);
+    }
+    const topicHead = String(runGit(["rev-parse", "MERGE_HEAD"]).stdout).trim();
+    expect(topicHead).toMatch(/^[0-9a-f]+$/);
+    expect(runGit(["diff", "--cached", "--quiet"]).status).toBe(0);
+
+    const result = await postJson<{ ok: true }>("/api/git/commit", {
+      message: "Complete merge",
+    });
+
+    expect(result.res.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+    const parents = runGit(["show", "-s", "--format=%P", "HEAD"]);
+    expect(String(parents.stdout).trim()).toBe(`${originalHead} ${topicHead}`);
+  }, 15_000);
+
   it("commits working-tree changes after staging them", async (ctx) => {
     if (!gitAvailable() || !initGitRepo(root)) {
       ctx.skip();

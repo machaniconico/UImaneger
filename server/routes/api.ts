@@ -1752,10 +1752,13 @@ const GIT_IN_PROGRESS_MARKERS = [
   "rebase-apply",
 ];
 
-async function gitOperationInProgress(root: string): Promise<boolean> {
+async function gitOperationInProgress(
+  root: string,
+  markers: readonly string[] = GIT_IN_PROGRESS_MARKERS
+): Promise<boolean> {
   const { stdout } = await pExecFile(
     "git",
-    ["rev-parse", ...GIT_IN_PROGRESS_MARKERS.flatMap((name) => ["--git-path", name])],
+    ["rev-parse", ...markers.flatMap((name) => ["--git-path", name])],
     {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
@@ -1813,7 +1816,10 @@ api.post("/git/commit", async (c) => {
       windowsHide: true,
     });
     if (!(await hasStagedGitChanges(root, pathspec))) {
-      return c.json({ error: "コミットする変更がありません" }, 409);
+      // マージ結果が HEAD と同じ場合も、リポジトリ直下ならマージを完了できる。
+      const isRootMerge =
+        pathspec.length === 0 && (await gitOperationInProgress(root, ["MERGE_HEAD"]));
+      if (!isRootMerge) return c.json({ error: "コミットする変更がありません" }, 409);
     }
     await pExecFile(
       "git",
