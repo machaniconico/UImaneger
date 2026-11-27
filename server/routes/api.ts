@@ -112,6 +112,8 @@ export const __stores = {
 };
 let storesRoot: string | null = null;
 let projectEpoch = 0;
+/** 履歴ロック待ち・実行中のプロジェクト切替の数 */
+let pendingSwitches = 0;
 
 function sanitizeForLog(value: unknown): string {
   let s = String(value ?? "");
@@ -699,15 +701,29 @@ api.get("/models", (c) => {
  * 旧プロジェクトのファイルだけ書き換わり、応答 409・履歴なしになるため、進行中の
  * 書き込みと履歴記録が終わるまで切替を待たせる。
  */
-function switchProject(path: string, command: string | undefined) {
-  return withHistoryLock(async () => {
-    try {
-      return await openAndStart(path, { command });
-    } finally {
-      // 起動失敗でもルートは切り替わり得るので、ストアは常に現在のルートへ合わせる
-      ensureStoresForCurrentRoot();
-    }
-  });
+async function switchProject(path: string, command: string | undefined) {
+  pendingSwitches++;
+  try {
+    return await withHistoryLock(async () => {
+      try {
+        return await openAndStart(path, { command });
+      } finally {
+        // 起動失敗でもルートは切り替わり得るので、ストアは常に現在のルートへ合わせる
+        ensureStoresForCurrentRoot();
+      }
+    });
+  } finally {
+    pendingSwitches--;
+  }
+}
+
+/**
+ * 切替(dev server の起動待ちを含み最大で数十秒)を待っている間の apply/undo/redo は、
+ * 切替の後ろに並べても旧プロジェクト向けとして 409 になるだけなので、すぐに断る。
+ */
+function rejectDuringSwitch(c: Context): Response | null {
+  if (pendingSwitches === 0) return null;
+  return c.json({ error: "プロジェクトを切り替え中です。切替の完了後にやり直してください。" }, 409);
 }
 
 api.post("/project/open", async (c) => {
@@ -1312,6 +1328,8 @@ api.post("/edit/apply", async (c) => {
   if (!proposalId)
     return c.json({ error: "proposalId が必要です" }, 400);
 
+  const switching = rejectDuringSwitch(c);
+  if (switching) return switching;
   return withHistoryLock(async () => {
     ensureStoresForCurrentRoot();
     const root = getRoot();
@@ -1407,6 +1425,8 @@ api.post("/edit/reject", async (c) => {
 
 /** 最後の適用を取り消す。 */
 api.post("/edit/undo", async (c) => {
+  const switching = rejectDuringSwitch(c);
+  if (switching) return switching;
   return withHistoryLock(async () => {
     ensureStoresForCurrentRoot();
     const root = getRoot();
@@ -1474,6 +1494,8 @@ api.post("/edit/undo", async (c) => {
 
 /** 最後に取り消した適用をやり直す。 */
 api.post("/edit/redo", async (c) => {
+  const switching = rejectDuringSwitch(c);
+  if (switching) return switching;
   return withHistoryLock(async () => {
     ensureStoresForCurrentRoot();
     const root = getRoot();

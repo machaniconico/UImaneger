@@ -1988,6 +1988,51 @@ describe("project switch while a history write is in flight", () => {
       rmSync(oldRoot, { recursive: true, force: true });
     }
   );
+
+  it("rejects history writes with 409 while a project switch is waiting instead of queueing behind it", async () => {
+    const proposal = await requestProposal();
+    const actualRename = fsPromisesMock.actual.rename;
+    const renameStarted = deferred();
+    const releaseRename = deferred();
+    let delayed = false;
+    fsPromisesMock.rename.mockImplementation(async (...args: any[]) => {
+      if (!delayed && String(args[1]) === filePath) {
+        delayed = true;
+        renameStarted.resolve();
+        await releaseRename.promise;
+      }
+      return actualRename(...args);
+    });
+
+    const oldRoot = root;
+    const writePromise = postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+    await renameStarted.promise;
+
+    const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-switch-"));
+    mkdirSync(join(nextRoot, "src"), { recursive: true });
+    writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+    const openPromise = postJson(
+      "/api/project/open",
+      { path: nextRoot, runCommand: "echo test-server-ready" },
+      { host: "localhost:5174" }
+    );
+    await delay(50);
+
+    // 切替待ちの間に来た undo / redo は、切替(dev server 起動を含む)の後ろに並ばず即座に断る
+    for (const kind of ["undo", "redo"] as const) {
+      const rejected = await postJson<{ error?: string }>(`/api/edit/${kind}`, {});
+      expect(rejected.res.status).toBe(409);
+      expect(rejected.body.error).toContain("切り替え中");
+    }
+
+    releaseRename.resolve();
+    expect((await writePromise).res.status).toBe(200);
+    await openPromise;
+    expect(state.getRoot()).toBe(nextRoot);
+    root = nextRoot;
+    filePath = join(nextRoot, "src", "App.tsx");
+    rmSync(oldRoot, { recursive: true, force: true });
+  });
 });
 
 describe("internal error details", () => {
