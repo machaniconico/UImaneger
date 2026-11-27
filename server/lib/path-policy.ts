@@ -29,7 +29,7 @@ function relHasProtectedSegment(rootPath: string, filePath: string): boolean {
 }
 
 /** 実体パス。未存在なら最も近い既存の祖先を realpath して残りを連結する。 */
-function realpathOrNearest(abs: string): string | null {
+export function realpathOrNearest(abs: string): string | null {
   const rest: string[] = [];
   let cur = abs;
   for (;;) {

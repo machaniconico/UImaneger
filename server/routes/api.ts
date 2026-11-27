@@ -10,8 +10,8 @@ import {
   rename,
   unlink,
   writeFile,
+  open,
   chmod,
-  realpath,
   stat,
 } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
@@ -31,7 +31,11 @@ import {
   TruncatedError,
 } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
-import { isProtectedPath, PROTECTED_PATH_ERROR } from "../lib/path-policy.ts";
+import {
+  isProtectedPath,
+  PROTECTED_PATH_ERROR,
+  realpathOrNearest,
+} from "../lib/path-policy.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
 import {
   getInfo,
@@ -211,6 +215,7 @@ export function redactLocalPaths(
 }
 
 function serverError(c: Context, e: unknown, relFile?: string) {
+  if (e instanceof WriteTargetRejectedError) return c.json({ error: e.message }, 403);
   return c.json(serverErrorPayload(c, e, relFile), 500);
 }
 
@@ -318,7 +323,9 @@ async function withFileLock<T>(
   file: string,
   fn: () => Promise<T>
 ): Promise<T> {
-  const key = resolve(file);
+  // 鍵は実体パス。symlink と実体への同時書き込みも同じ鍵で直列化する。
+  const abs = resolve(file);
+  const key = realpathOrNearest(abs) ?? abs;
   const previous = fileLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((r) => {
@@ -506,34 +513,68 @@ async function hasStagedGitChanges(
   }
 }
 
+/** 書き込み先が検査後に保護パスやプロジェクト外へ変わった時に atomicWrite が投げる。 */
+export class WriteTargetRejectedError extends Error {
+  constructor() {
+    super("書き込み先が検査後に変わったため中止しました");
+    this.name = "WriteTargetRejectedError";
+  }
+}
+
+/** 新規ファイルの既定 mode(0o666 & ~umask)。process.umask() の読み取りは非推奨なので、
+ * 同じディレクトリに 0o666 で空ファイルを作って OS が適用した mode を読む。 */
+async function defaultFileMode(dir: string): Promise<number> {
+  const probe = join(dir, `.uim-umask-${randomUUID()}`);
+  const handle = await open(probe, "wx", 0o666);
+  try {
+    return (await handle.stat()).mode & 0o777;
+  } finally {
+    await handle.close();
+    await unlink(probe).catch(() => {});
+  }
+}
+
 /**
  * 一時ファイルに書いてから rename で置き換える。symlink はリンクを保ってリンク先(実体)を
  * 更新し、既存ファイルの権限(mode & 0o777)は umask に依存せず引き継ぐ。一時ファイルは
- * 排他作成・0600 で作って内容を書き、mode を合わせてから rename する。新規ファイルは
- * 0666 で作成し umask を OS に適用させる。Windows では mode を扱わない。
+ * 新規・既存とも排他作成・0600 で作って内容を書き、最終 mode(新規は 0o666 & ~umask)に
+ * 合わせてから rename する。Windows では mode を扱わない。
+ * root を渡すと、書き込み前と rename 直前に実体を解決し直し、検査時と違う・root 外・
+ * 保護パスなら WriteTargetRejectedError で中止する(検査後の symlink 差し替え対策)。
  */
 export async function atomicWrite(
   path: string,
-  content: string | Uint8Array
+  content: string | Uint8Array,
+  root?: string
 ): Promise<void> {
-  let target = resolve(path);
+  const abs = resolve(path);
+  const target = realpathOrNearest(abs) ?? abs;
+  const assertTarget = () => {
+    if (root === undefined) return;
+    if (
+      realpathOrNearest(abs) !== target ||
+      !inRoot(root, target) ||
+      isProtectedPath(root, target)
+    ) {
+      throw new WriteTargetRejectedError();
+    }
+  };
+  assertTarget();
   let mode: number | null = null;
   try {
-    target = await realpath(target);
     const st = await stat(target);
     if (!st.isFile()) throw new Error("通常ファイルではないため書き込めません");
     mode = st.mode & 0o777;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
+  const posix = process.platform !== "win32";
+  if (mode === null && posix) mode = await defaultFileMode(dirname(target));
   const tmp = `${target}.tmp-${randomUUID()}`;
   try {
-    await writeFile(tmp, content, {
-      encoding: "utf8",
-      flag: "wx",
-      mode: mode === null ? 0o666 : 0o600,
-    });
-    if (mode !== null && process.platform !== "win32") await chmod(tmp, mode);
+    await writeFile(tmp, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    if (mode !== null && posix) await chmod(tmp, mode);
+    assertTarget();
     await rename(tmp, target);
   } catch (e) {
     await unlink(tmp).catch(() => {});
@@ -998,7 +1039,7 @@ api.post("/files/write", async (c) => {
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
   if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
   try {
-    await withFileLock(path, () => atomicWrite(resolve(path), content));
+    await withFileLock(path, () => atomicWrite(resolve(path), content, root));
     return c.json({ ok: true });
   } catch (e) {
     return serverError(c, e);
@@ -1446,7 +1487,7 @@ api.post("/edit/apply", async (c) => {
         }
         const before = beforeBytes.toString("utf8");
         const appliedContent = withBom(p.proposed, p.hadBom);
-        await atomicWrite(p.file, appliedContent);
+        await atomicWrite(p.file, appliedContent, root);
         if (!isCurrentProject(root, epoch)) {
           return c.json(
             { error: "プロジェクトが切り替わったため中断しました" },
@@ -1542,7 +1583,7 @@ api.post("/edit/undo", async (c) => {
             409
           );
         }
-        await atomicWrite(entry.file, entry.previousContent);
+        await atomicWrite(entry.file, entry.previousContent, root);
         if (!isCurrentProject(root, epoch)) {
           return c.json(
             { error: "プロジェクトが切り替わったため中断しました" },
@@ -1613,7 +1654,7 @@ api.post("/edit/redo", async (c) => {
             409
           );
         }
-        await atomicWrite(entry.file, entry.appliedContent);
+        await atomicWrite(entry.file, entry.appliedContent, root);
         if (!isCurrentProject(root, epoch)) {
           return c.json(
             { error: "プロジェクトが切り替わったため中断しました" },

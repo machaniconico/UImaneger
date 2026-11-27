@@ -7,9 +7,12 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2120,4 +2123,70 @@ describe("internal error details", () => {
       }
     }
   );
+});
+
+describe("file write hardening", () => {
+  const posix = process.platform !== "win32";
+
+  it.skipIf(!posix)("creates the temp file for a new file with 0600 before setting the final mode", async () => {
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const tempModes: number[] = [];
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      const result = await actualWriteFile(...args);
+      if (String(args[0]).includes(".tmp-")) {
+        tempModes.push(statSync(String(args[0])).mode & 0o777);
+      }
+      return result;
+    });
+    const target = join(root, "src", "brand-new.txt");
+    const write = await postJson<{ ok: true }>("/api/files/write", {
+      path: target,
+      content: "new",
+    });
+    expect(write.res.status).toBe(200);
+    expect(tempModes).toEqual([0o600]);
+    expect(readFileSync(target, "utf8")).toBe("new");
+  });
+
+  it.skipIf(!posix)("re-checks the resolved target after waiting for the file lock", async () => {
+    mkdirSync(join(root, "real"), { recursive: true });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    const safe = join(root, "real", "ok.txt");
+    const protectedFile = join(root, ".git", "description");
+    writeFileSync(safe, "SAFE", "utf8");
+    writeFileSync(protectedFile, "GIT_DESCRIPTION", "utf8");
+    const alias = join(root, "src", "alias.txt");
+    symlinkSync("../real/ok.txt", alias);
+
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const firstWriteStarted = deferred();
+    const releaseFirstWrite = deferred();
+    let blocked = false;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (!blocked && String(args[0]).includes(".tmp-")) {
+        blocked = true;
+        firstWriteStarted.resolve();
+        await releaseFirstWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    // 1 本目が実体のロックを握っている間に、2 本目(symlink 経由)が検査を通過してロック待ちになる。
+    const first = postJson("/api/files/write", { path: safe, content: "FIRST" });
+    await firstWriteStarted.promise;
+    const second = postJson<{ error: string }>("/api/files/write", {
+      path: alias,
+      content: "SECOND",
+    });
+    await delay(25);
+    unlinkSync(alias);
+    symlinkSync("../.git/description", alias);
+    releaseFirstWrite.resolve();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult.res.status).toBe(200);
+    expect(secondResult.res.status).toBe(403);
+    expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
 });
