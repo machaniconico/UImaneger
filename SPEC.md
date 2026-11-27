@@ -101,7 +101,7 @@ Node dependency install は lifecycle script を無効化し、5 分 timeout で
 - Runtime integration: Vite + React sample、generic Node server、bundled static server、proxy HTTP/WebSocket/streaming
 - Unit/integration: framework plan、package manager、resolver、API proposal/apply/undo、security middleware、React UI
 - Build gate: package policy、TypeScript、selftests、Vitest、Vite production build
-- Runtime matrix は `npm run runtime-matrix` で本体の自動起動、HTTP 応答、プロセスツリーとポートの解放を検証します。Vite + React、Create React App、Vue CLI、Angular は配信 JavaScript 内のマーカーも検証します。2026-11-27 の WSL2 / Node 22 での実測は 19 PASS、2 SKIP、0 FAIL です。SKIP の Rails と Phoenix は fixture あり・実プロセス未実行です。CI 対象は README の対応範囲を参照してください。
+- Runtime matrix は `npm run runtime-matrix` で本体の自動起動、HTTP 応答、プロセスツリーとポートの解放を検証します。Vite + React、Create React App、Vue CLI、Angular は配信 JavaScript 内のマーカーも検証します。2026-11-27 の WSL2 / Node 22 での実測は 19 PASS、2 SKIP、0 FAIL です。SKIP の Rails と Phoenix は CI(Ubuntu、Ruby 3.4 / Elixir 1.18)で実起動して検証します。CI 対象は README の対応範囲を参照してください。
 - Not automated: real Anthropic request、browser click-to-edit full flow、installer/signing
 
 ## Commercial Status

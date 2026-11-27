@@ -20,7 +20,7 @@
 | 実プロセス検証済み | Vite + React の同梱サンプル、静的 HTML、汎用 Node `dev` script | Windows の CI 相当テストで起動と HTTP 応答を確認 |
 | 実プロセス検証済み(CI) | Next.js、Nuxt、React Router、Remix、SvelteKit、Astro、Angular、Vue CLI、Create React App、Vite + React、静的 HTML、汎用 Node `dev` script | Ubuntu / Windows の runtime matrix で毎 push 実行(初回 PASS: 2026-11-27、commit `469ae1c`) |
 | 実プロセス検証済み(CI) | Django、Laravel、PHP (`index.php`)、Go、Spring Boot (Maven/Gradle)、ASP.NET Core | Ubuntu の runtime matrix で毎 push 実行(初回 PASS: 2026-11-27、commit `469ae1c`)。Windows では未実行 |
-| 自動起動プラン検証済み | Rails、Phoenix | Runtime matrix の fixture あり・実プロセス未実行。CI 対象外 |
+| 実プロセス検証済み(CI) | Rails、Phoenix | Ubuntu の runtime matrix(Ruby 3.4 / Elixir 1.18)で毎 push 実行(初回 PASS: 2026-11-28、commit `9d0975f`)。Windows では未実行 |
 | 手動コマンド | FastAPI/Flask の任意 entrypoint、Rust Web、Java の非 Spring 構成、独自サーバ、複数アプリの monorepo | 「起動設定」でコマンドを指定。`PORT` 環境変数が渡される |
 
 自動判定は誤起動を避けるため、強いマーカーがある構成に限定しています。Go はルートの `package main` と `func main`、PHP は `index.php`、Django は標準的な `manage.py` を確認します。monorepo でルートに起動 script がない場合は、対象アプリのディレクトリをローカルパスとして開いてください。
@@ -103,7 +103,7 @@ npm run e2e:all      # Chromium / Firefox / WebKit(WebKit は Linux で `npx pla
 
 ### Runtime matrix
 
-2026-11-27 のローカル実測は WSL2 / Node 22 で 19 PASS、2 SKIP、0 FAIL でした。Rails と Phoenix は必要なランタイムや CLI がなく SKIP でした。
+2026-11-27 のローカル実測は WSL2 / Node 22 で 19 PASS、2 SKIP、0 FAIL でした。Rails と Phoenix はローカルにランタイムが無く SKIP でしたが、CI(Ubuntu)では実起動して PASS しています。
 
 `npm run runtime-matrix` は一時ディレクトリに fixture を生成し、本体の自動検出で起動します。トップページの HTTP 200 と fixture 固有のマーカーを確認します。Vite + React、Create React App、Vue CLI、Angular は配信された JavaScript にも同じマーカーが含まれることを確認します。停止後はプロセスツリーとポートの解放を検証します。依存の取得にはネットワーク接続が必要です。Django は一時 `.venv` に導入し、本体が検出した Python で起動します。
 
