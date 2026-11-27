@@ -20,6 +20,7 @@ import { pathToFileURL } from "node:url";
 import { createApp } from "../../server/app.ts";
 import { __stores } from "../../server/routes/api.ts";
 import { openProject, stopProject } from "../../server/lib/state.ts";
+import { __resolverTestHooks } from "../../server/lib/resolver.ts";
 
 const claudeMock = vi.hoisted(() => {
   class TruncatedError extends Error {
@@ -112,6 +113,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  __resolverTestHooks.forceRgUsable(null);
   __stores.proposalStore.clear();
   __stores.undoStack.splice(0);
   __stores.redoStack.splice(0);
@@ -402,5 +404,39 @@ describe("件2 protected paths", () => {
     expect(claudeCallCount()).toBe(0);
     expect(readFileSync(join(root, ".git/config"), "utf8")).toBe("MARKER_GIT_CONFIG");
     expect(readFileSync(join(root, "node_modules/pkg/index.js"), "utf8")).toBe("MARKER_NM");
+  });
+});
+
+describe("件2 追加基準(レビュー由来)", () => {
+  it("AC-2-10 resolver_layer_b_never_offers_or_sends_hidden_files_without_rg", async () => {
+    __resolverTestHooks.forceRgUsable(false); // rg 非利用(層 B の no-ripgrep 経路)
+    put(root, "src/A.tsx", '<h1 className="zzqmarker">A</h1>');
+    put(root, "src/.secret.tsx", '<h1 className="zzqmarker">MARKER_HIDDEN_LAYERB</h1>');
+    put(root, ".hidden/B.tsx", '<h1 className="zzqmarker">MARKER_HIDDEN_DIR_B</h1>');
+    const descriptor = { tag: "h1", classes: ["zzqmarker"], attrs: {}, domPath: "html>body>h1", text: "A" };
+    const hiddenMarkers = ["MARKER_HIDDEN_LAYERB", "MARKER_HIDDEN_DIR_B"];
+
+    for (const endpoint of ["/api/edit", "/api/edit/stream"]) {
+      claudeMock.complete.mockClear();
+      claudeMock.streamComplete.mockClear();
+      const r = await post(endpoint, { descriptor, instruction: INSTRUCTION });
+      for (const m of hiddenMarkers) {
+        expect(r.text, `${endpoint} 応答に ${m}`).not.toContain(m);
+        expect(claudeSent(), `${endpoint}: Claude に ${m}`).not.toContain(m);
+      }
+      for (const mm of r.text.matchAll(/"relFile"\s*:\s*"([^"]*)"/g)) {
+        expect(
+          mm[1].split(/[\\/]/).some((seg) => seg.startsWith(".")),
+          `${endpoint}: 隠しセグメントを含む relFile ${mm[1]}`
+        ).toBe(false);
+      }
+      if (endpoint === "/api/edit") {
+        expect(r.status, `${endpoint}: src/A.tsx への提案 ${r.text.slice(0, 120)}`).toBe(200);
+        expect(r.json?.relFile, "relFile").toMatch(/src[\\/]A\.tsx$/);
+      } else {
+        expect(r.text, "stream: src/A.tsx の提案").toMatch(/A\.tsx/);
+        expect(r.text, "stream: proposalId").toContain("proposalId");
+      }
+    }
   });
 });

@@ -3,7 +3,7 @@
 // 基準: .omc/plans/r3-security-audit-acceptance.md 件3(実装者は編集禁止)
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createApp } from "../../server/app.ts";
@@ -185,5 +185,57 @@ describe.skipIf(!hasGit)("件3 git scope (git が無い環境は skip)", () => {
     expect(r.status, JSON.stringify(r.json)).toBe(200);
     expect(headFiles()).toEqual(["app/a.txt", "sibling/new.txt"]);
     expect((await getStatus()).changes).toHaveLength(0);
+  }, 20_000);
+
+  /** feat と main で conflict.txt を衝突させ、マージ中(未解消)の状態にする。 */
+  function startConflictedMerge(): void {
+    git(["checkout", "-q", "-b", "feat"], repo);
+    put(repo, "conflict.txt", "feat\n");
+    git(["add", "."], repo);
+    git(["commit", "-m", "feat"], repo);
+    git(["checkout", "-q", "-"], repo);
+    put(repo, "conflict.txt", "main\n");
+    git(["add", "."], repo);
+    git(["commit", "-m", "main"], repo);
+    const r = spawnSync("git", ["merge", "feat"], { cwd: repo, encoding: "utf8" });
+    expect(r.status, "git merge feat は衝突で失敗するはず").not.toBe(0);
+  }
+
+  it("AC-3-6 git_commit_completes_a_resolved_merge_at_repo_toplevel", async () => {
+    // 基準追加: 追加基準(レビュー由来)
+    put(repo, "conflict.txt", "base\n");
+    git(["add", "."], repo);
+    git(["commit", "-m", "base"], repo);
+    startConflictedMerge();
+    put(repo, "conflict.txt", "resolved\n"); // 衝突を解消して保存(add はしない)
+    await openProject(repo, { command: "echo test-server-ready" });
+
+    const r = await postCommit("merge");
+    expect(r.status, JSON.stringify(r.json)).toBe(200);
+    const parents = git(["rev-list", "--parents", "-n", "1", "HEAD"], repo).trim().split(" ");
+    expect(parents.length - 1, "HEAD の親の数(マージコミット)").toBe(2);
+    expect(parentStatus().trim(), "コミット後の status").toBe("");
+  }, 20_000);
+
+  it("AC-3-7 git_commit_during_merge_in_subdir_returns_409_without_side_effects", async () => {
+    put(repo, "conflict.txt", "base\n");
+    git(["add", "."], repo);
+    git(["commit", "-m", "base"], repo);
+    startConflictedMerge();
+    await openProject(join(repo, "app"), { command: "echo test-server-ready" });
+    put(repo, "app/a.txt", "a1\n");
+
+    const sha = headSha();
+    const before = parentStatus();
+    const mergeHead = join(repo, ".git", "MERGE_HEAD");
+    expect(existsSync(mergeHead), "前提: MERGE_HEAD あり").toBe(true);
+
+    const r = await postCommit("sub");
+    expect(r.status, JSON.stringify(r.json)).toBe(409);
+    expect(String(r.json?.error ?? ""), "日本語の理由").toMatch(/[\u3040-\u30ff\u4e00-\u9fff]/);
+    expect(String(r.json?.error ?? ""), "マージ中の理由").toContain("マージ");
+    expect(headSha(), "HEAD 不変").toBe(sha);
+    expect(parentStatus(), "status 不変").toBe(before);
+    expect(existsSync(mergeHead), "MERGE_HEAD 不変").toBe(true);
   }, 20_000);
 });
