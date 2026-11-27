@@ -59,6 +59,11 @@ describe.skipIf(process.platform === "win32")("path-policy fails closed when the
     expect(allowed(root, link)).toBe(false);
   });
 
+  it("treats every target as protected when the root itself cannot be resolved", () => {
+    failing.path = root;
+    expect(isProtectedPath(root, join(root, "src", "App.tsx"))).toBe(true);
+  });
+
   it("rejects a symlink loop (ELOOP)", () => {
     const loop = join(root, "src", "loop.tsx");
     symlinkSync("loop.tsx", loop);

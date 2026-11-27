@@ -112,7 +112,8 @@ export function isProtectedPath(root: string, file: string): boolean {
   try {
     realRoot = realpathSync.native(root);
   } catch {
-    return false;
+    // root の実体を解決できなければ判定できないので保護扱い(fail-closed)
+    return true;
   }
   const realFile = realpathOrNearest(abs);
   // 実体を解決できないものは保護対象として扱う(fail-closed)。
