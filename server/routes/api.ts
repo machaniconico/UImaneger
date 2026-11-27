@@ -488,9 +488,12 @@ function normalizeCommitMessage(
   return { ok: true, message: normalized };
 }
 
-async function hasStagedGitChanges(root: string): Promise<boolean> {
+async function hasStagedGitChanges(
+  root: string,
+  pathspec: readonly string[]
+): Promise<boolean> {
   try {
-    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code", "--", "."], {
+    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code", ...pathspec], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -1686,13 +1689,50 @@ ${content}
 }
 
 // --- git (MVP minimal) ---
-// root が親リポジトリのサブディレクトリの場合もあるため、status・add・ステージ判定・commit
-// はすべて pathspec `-- .`(cwd=root)でプロジェクト内に限る。
+// root が親リポジトリのサブディレクトリの場合は、status・add・ステージ判定・commit をすべて
+// pathspec `-- .`(cwd=root)でプロジェクト内に限る。root がリポジトリ直下なら pathspec は
+// 付けない(pathspec 付きの commit はマージの完了コミットを作れないため)。
+async function gitPathspec(root: string): Promise<readonly string[]> {
+  const { stdout } = await pExecFile("git", ["rev-parse", "--show-prefix"], {
+    cwd: root,
+    env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
+    timeout: GIT_OPERATION_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return stdout.trim() === "" ? [] : ["--", "."];
+}
+
+// マージ・cherry-pick・revert・rebase の途中であることを示す git ディレクトリ内の名前。
+const GIT_IN_PROGRESS_MARKERS = [
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "rebase-merge",
+  "rebase-apply",
+];
+
+async function gitOperationInProgress(root: string): Promise<boolean> {
+  const { stdout } = await pExecFile(
+    "git",
+    ["rev-parse", ...GIT_IN_PROGRESS_MARKERS.flatMap((name) => ["--git-path", name])],
+    {
+      cwd: root,
+      env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
+      timeout: GIT_OPERATION_TIMEOUT_MS,
+      windowsHide: true,
+    }
+  );
+  return stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .some((p) => existsSync(resolve(root, p)));
+}
 api.get("/git/status", async (c) => {
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   try {
-    const { stdout } = await pExecFile("git", ["status", "--porcelain", "--", "."], {
+    const pathspec = await gitPathspec(root);
+    const { stdout } = await pExecFile("git", ["status", "--porcelain", ...pathspec], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -1713,18 +1753,30 @@ api.post("/git/commit", async (c) => {
   const commitMessage = normalizeCommitMessage(message);
   if (!commitMessage.ok) return c.json({ error: commitMessage.error }, 400);
   try {
-    await pExecFile("git", ["add", "-A", "--", "."], {
+    const pathspec = await gitPathspec(root);
+    // サブディレクトリから pathspec 付きでコミットするとマージ等を完了できず、範囲外の
+    // 解決結果も扱えないため、git add の前に止める(副作用なし)。
+    if (pathspec.length > 0 && (await gitOperationInProgress(root))) {
+      return c.json(
+        {
+          error:
+            "親リポジトリでマージ(または cherry-pick・revert・rebase)が進行中のため、サブディレクトリからはコミットできません。リポジトリ直下で完了してください。",
+        },
+        409
+      );
+    }
+    await pExecFile("git", ["add", "-A", ...pathspec], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
       windowsHide: true,
     });
-    if (!(await hasStagedGitChanges(root))) {
+    if (!(await hasStagedGitChanges(root, pathspec))) {
       return c.json({ error: "コミットする変更がありません" }, 409);
     }
     await pExecFile(
       "git",
-      ["commit", "--no-gpg-sign", "-m", commitMessage.message, "--", "."],
+      ["commit", "--no-gpg-sign", "-m", commitMessage.message, ...pathspec],
       {
         cwd: root,
         env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
