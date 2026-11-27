@@ -89,23 +89,45 @@ describe("package manager command plans", () => {
 });
 
 describe("prepareCommandInvocation", () => {
-  it("routes Windows command shims through cmd.exe without shell:true args", () => {
+  it("keeps Windows npm dev output attached", () => {
+    expect(prepareCommandInvocation("npm", ["run", "dev"], {
+      platform: "win32",
+      detached: true,
+    })).toMatchObject({ shell: false, detached: false });
+  });
+
+  it("keeps Windows npm JSON output attached", () => {
+    expect(prepareCommandInvocation("npm", ["ls", "--depth=0", "--json"], {
+      platform: "win32",
+      detached: true,
+    })).toMatchObject({ shell: false, detached: false });
+  });
+
+  it("passes a verbatim cmd command line with a spaced shim path", () => {
     expect(
-      prepareCommandInvocation("npx", ["vite", "--port", "5180"], {
+      prepareCommandInvocation("C:\\Program Files\\nodejs\\npx.cmd", ["vite", "--port", "5180"], {
         platform: "win32",
         comspec: "C:\\Windows\\System32\\cmd.exe",
       })
-    ).toEqual({
+    ).toMatchObject({
       command: "C:\\Windows\\System32\\cmd.exe",
-      args: ["/d", "/s", "/c", "npx vite --port 5180"],
+      args: ["/d", "/s", "/c", '""C:\\Program Files\\nodejs\\npx.cmd" vite --port 5180"'],
       shell: false,
+      windowsVerbatimArguments: true,
     });
+  });
+
+  it("keeps the detached process group on Linux", () => {
+    expect(prepareCommandInvocation("npm", ["run", "dev"], {
+      platform: "linux",
+      detached: true,
+    })).toMatchObject({ command: "npm", args: ["run", "dev"], shell: false, detached: true });
   });
 
   it("keeps native commands direct", () => {
     expect(
       prepareCommandInvocation("python", ["manage.py"], { platform: "win32" })
-    ).toEqual({ command: "python", args: ["manage.py"], shell: false });
+    ).toEqual({ command: "python", args: ["manage.py"], shell: false, detached: false });
   });
 });
 

@@ -7,9 +7,10 @@ import { parseArgs } from "node:util";
 import { buildChildEnv } from "../server/lib/child-env.ts";
 import { prepareCommandInvocation } from "../server/lib/package-manager.ts";
 import {
-  findFreePort, killAllChildrenSync, killGroup, sleep, startTarget, TargetStartupError,
+  findFreePort, hasExited, killAllChildrenSync, killGroup, sleep, startTarget, TargetStartupError,
 } from "../server/lib/runner.ts";
 import { fixtures } from "./runtime-matrix-fixtures.mjs";
+import { treePids } from "./runtime-matrix-processes.mjs";
 
 const windows = process.platform === "win32";
 const knownRuntimes = new Set(fixtures.map(({ runtime }) => runtime));
@@ -37,8 +38,9 @@ const toolArgs = {
 };
 
 function syncCommand(command, args) {
-  const invocation = prepareCommandInvocation(command, args);
-  return spawnSync(invocation.command, invocation.args, {
+  const { command: file, args: argv, ...spawnOptions } = prepareCommandInvocation(command, args);
+  return spawnSync(file, argv, {
+    ...spawnOptions,
     encoding: "utf8", timeout: 20_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024,
   });
 }
@@ -73,11 +75,12 @@ function toolVersion(tool) {
 }
 
 let setupChild;
-function runSetup(root, env, command, args, { capture = false } = {}) {
-  const invocation = prepareCommandInvocation(command, args);
+function runSetup(root, env, command, args, { capture = false, timeoutMs = 300_000 } = {}) {
+  const { command: file, args: argv, ...spawnOptions } = prepareCommandInvocation(command, args, { detached: true });
   return new Promise((resolve, reject) => {
-    const proc = spawn(invocation.command, invocation.args, {
-      cwd: root, env: buildChildEnv({}, env), detached: true, windowsHide: true,
+    const proc = spawn(file, argv, {
+      ...spawnOptions,
+      cwd: root, env: buildChildEnv({}, env), windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     setupChild = proc;
@@ -91,13 +94,13 @@ function runSetup(root, env, command, args, { capture = false } = {}) {
     const timer = setTimeout(async () => {
       timedOut = true;
       await killGroup(proc);
-    }, 300_000);
+    }, timeoutMs);
     proc.once("error", reject);
     proc.once("close", (code, signal) => {
       clearTimeout(timer);
       setupChild = undefined;
       if (!timedOut && code === 0) resolve(capture ? Buffer.concat(stdout).toString("utf8") : undefined);
-      else reject(new Error(`${command} ${args.join(" ")} ${timedOut ? "timed out" : `exited with ${code ?? signal}`}\n${output.trim()}`));
+      else reject(new Error(`${command} ${args.join(" ")} ${timedOut ? `timed out after ${timeoutMs / 1000}s` : `exited with ${code ?? signal}`}\n${output.trim()}`));
     });
   });
 }
@@ -105,47 +108,39 @@ function runSetup(root, env, command, args, { capture = false } = {}) {
 function processSnapshot() {
   const command = windows ? "powershell.exe" : "ps";
   const args = windows
-    ? ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { '{0} {1}' -f $_.ProcessId, $_.ParentProcessId }"]
+    ? ["-NoProfile", "-NonInteractive", "-Command", "Get-CimInstance Win32_Process | Where-Object CreationDate | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }"]
     : ["-ax", "-o", "pid=,ppid=,pgid=,stat="];
   const result = syncCommand(command, args);
   if (result.error || result.status !== 0 || !result.stdout.trim()) {
     throw new Error(`Cannot inspect process tree: ${result.error ?? result.stderr}`);
   }
   return result.stdout.trim().split(/\r?\n/).map((line) => {
-    const [pid, parent, group, state] = line.trim().split(/\s+/);
-    return { pid: Number(pid), parent: Number(parent), group: Number(group), state };
+    const [pid, parent, groupOrCreation, state] = line.trim().split(/\s+/);
+    const ids = { pid: Number(pid), parent: Number(parent) };
+    return windows
+      ? { ...ids, createdAt: Number(groupOrCreation) }
+      : { ...ids, group: Number(groupOrCreation), state };
   }).filter(({ state }) => !state?.startsWith("Z")); // Zombies have already exited.
 }
 
-function treePids(snapshot, rootPid, tracked = new Set([rootPid])) {
-  // Keep observed descendants even if they are reparented during shutdown.
-  let before;
-  do {
-    before = tracked.size;
-    for (const { pid, parent, group } of snapshot) {
-      if (group === rootPid || tracked.has(parent)) tracked.add(pid);
-    }
-  } while (tracked.size !== before);
-  return snapshot.filter(({ pid }) => tracked.has(pid)).map(({ pid }) => pid);
-}
-
-async function stopAndVerify(target, port) {
-  const tracked = new Set([target.proc.pid]);
+async function stopAndVerify(target, port, startedAt) {
+  const tracked = new Map();
+  const findTracked = () => treePids(processSnapshot(), target.proc.pid, tracked, { startedAt });
   try {
-    treePids(processSnapshot(), target.proc.pid, tracked);
+    findTracked();
   } finally {
-    await killGroup(target.proc);
+    if (!windows || !hasExited(target.proc)) await killGroup(target.proc);
   }
   const ports = [...new Set([port, target.port])].filter((p) => p > 0);
   const deadline = Date.now() + 8_000;
   let remaining;
   let busy;
   do {
-    remaining = treePids(processSnapshot(), target.proc.pid, tracked);
+    remaining = findTracked();
     if (windows) {
       // taskkill /T needs a live root. After an early exit, stop surviving descendants by PID.
       for (const pid of remaining) {
-        const result = syncCommand("taskkill", ["/pid", String(pid), "/t", "/f"]);
+        const result = syncCommand("taskkill", ["/pid", String(pid), "/f"]);
         if (result.error) throw result.error;
       }
     }
@@ -202,6 +197,7 @@ async function verifyFixture(fixture, portStart, result) {
   const marker = `runtime-matrix-${randomUUID()}`;
   let target;
   let port;
+  let targetStartedAt;
   try {
     await mkdir(root);
     result.dependencies = await fixture.prepare({
@@ -210,6 +206,7 @@ async function verifyFixture(fixture, portStart, result) {
     if (interrupted) throw new Error(`Interrupted by ${interrupted}`);
     Object.assign(process.env, env);
     port = await findFreePort(portStart);
+    targetStartedAt = Date.now();
     target = await startTarget(root, port);
     result.plan = { framework: target.plan.framework, command: target.plan.command, args: target.plan.args };
     result.requestedPort = port;
@@ -226,7 +223,7 @@ async function verifyFixture(fixture, portStart, result) {
   } finally {
     if (target) {
       try {
-        await stopAndVerify(target, port);
+        await stopAndVerify(target, port, targetStartedAt);
       } catch (error) {
         result.reason = [result.reason, error.message].filter(Boolean).join("\n");
       }

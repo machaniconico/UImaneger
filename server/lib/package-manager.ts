@@ -132,6 +132,8 @@ export interface CommandInvocation {
   command: string;
   args: string[];
   shell: boolean;
+  detached: boolean;
+  windowsVerbatimArguments?: true;
 }
 
 export function prepareCommandInvocation(
@@ -139,13 +141,17 @@ export function prepareCommandInvocation(
   args: string[],
   options: {
     shell?: boolean;
+    detached?: boolean;
     platform?: NodeJS.Platform;
     comspec?: string;
   } = {}
 ): CommandInvocation {
-  if (options.shell) return { command, args, shell: true };
-
   const platform = options.platform ?? process.platform;
+  // Without a console, cmd.exe can drop stdio for commands launched by a batch shim.
+  // Windows tree cleanup uses taskkill, so only POSIX needs a detached process group.
+  const detached = platform !== "win32" && options.detached === true;
+  if (options.shell) return { command, args, shell: true, detached };
+
   if (
     platform === "win32" &&
     // nosemgrep: ajinabraham.njsscan.dos.regex_dos.regex_dos -- 固定の拡張子照合で量指定子なし
@@ -154,10 +160,13 @@ export function prepareCommandInvocation(
     const commandLine = [command, ...args].map(quoteCmdToken).join(" ");
     return {
       command: options.comspec || process.env.ComSpec || "cmd.exe",
-      args: ["/d", "/s", "/c", commandLine],
+      // cmd /s strips the outer quotes. Pass the inner token quotes verbatim.
+      args: ["/d", "/s", "/c", `"${commandLine}"`],
       shell: false,
+      detached,
+      windowsVerbatimArguments: true,
     };
   }
 
-  return { command, args, shell: false };
+  return { command, args, shell: false, detached };
 }

@@ -53,7 +53,7 @@ jobs:
           - os: windows-latest
             runtimes: node
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 35
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 35 }}
     env:
       RUNTIME_MATRIX_REQUIRE: ${{ matrix.runtimes }}
     steps:
@@ -61,7 +61,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
+          cache: ${{ runner.os == 'Linux' && 'npm' || '' }}
+      - name: Locate Windows npm cache
+        if: runner.os == 'Windows'
+        id: windows-npm-cache
+        shell: pwsh
+        run: '"path=$(npm config get cache)" >> $env:GITHUB_OUTPUT'
+      - uses: actions/cache@v4
+        if: runner.os == 'Windows'
+        with:
+          path: ${{ steps.windows-npm-cache.outputs.path }}
+          key: ${{ runner.os }}-${{ runner.arch }}-runtime-npm-${{ hashFiles('package-lock.json', 'scripts/runtime-matrix-fixtures.mjs') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-runtime-npm-
       - uses: actions/setup-go@v6
         if: runner.os == 'Linux'
         with:

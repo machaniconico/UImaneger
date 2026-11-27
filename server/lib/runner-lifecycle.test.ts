@@ -285,6 +285,26 @@ describe("startTarget", () => {
     }
   }, 30_000);
 
+  itIfLoopback("discovers the port logged by npm run dev", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "uim-runner-logged-"));
+    let target;
+    try {
+      writeFileSync(join(tmp, "package.json"), JSON.stringify({ scripts: { dev: "node server.cjs" } }));
+      writeFileSync(join(tmp, "server.cjs"), `
+        const http = require("node:http");
+        const server = http.createServer((_req, res) => res.end("logged port"));
+        server.listen(0, "127.0.0.1", () => console.log("Listening on " + server.address().port));
+      `);
+      target = await startTarget(tmp, 0);
+      expect(target.logs).toContain(`Listening on ${target.port}`);
+      const response = await fetch(`http://127.0.0.1:${target.port}`);
+      expect(await response.text()).toBe("logged port");
+    } finally {
+      if (target) await killGroup(target.proc);
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 75_000);
+
   itIfLoopback("serves static projects without downloading an external package", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "uim-runner-static-"));
     writeFileSync(join(tmp, "index.html"), "<!doctype html><h1>Static preview</h1>");
@@ -304,7 +324,7 @@ describe("startTarget", () => {
     }
   }, 30_000);
 
-  itIfLoopback("killAllChildrenSync kills a live detached target registered by startTarget", async () => {
+  itIfLoopback("killAllChildrenSync kills a live target registered by startTarget", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "uim-runner-live-"));
     try {
       writeFileSync(

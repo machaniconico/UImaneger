@@ -19,16 +19,26 @@ function nodeApp(name, framework, dependencies, files, { scripts, checkPath } = 
   return {
     name, framework, runtime: "node", checkPath,
     tools: scripts || installDependencies ? ["node", "npm"] : ["node"],
-    async prepare({ root, marker, run }) {
+    async prepare({ root, marker, run, platform = process.platform }) {
       await writeFiles(root, {
         "package.json": JSON.stringify({ private: true, dependencies, scripts }),
         ...files(marker),
       });
       if (!installDependencies) return {};
       const plan = packageInstallPlan(detectPackageManager(root));
-      await run(plan.command, plan.args);
-      const listing = await run("npm", ["ls", "--depth=0", "--json"], { capture: true });
-      return Object.fromEntries(Object.entries(JSON.parse(listing).dependencies)
+      const installArgs = [...plan.args, "--no-audit", "--no-fund", "--loglevel=warn"];
+      await run(plan.command, installArgs, { timeoutMs: platform === "win32" ? 600_000 : 300_000 });
+      const lsArgs = ["ls", "--depth=0", "--json"];
+      const listing = await run("npm", lsArgs, { capture: true });
+      if (!listing.trim()) throw new Error(`npm ${lsArgs.join(" ")} returned no stdout`);
+      let installed;
+      try {
+        installed = JSON.parse(listing)?.dependencies;
+      } catch (error) {
+        throw new Error(`npm ${lsArgs.join(" ")} returned invalid JSON: ${error.message}`, { cause: error });
+      }
+      if (!installed) throw new Error(`npm ${lsArgs.join(" ")} returned no dependencies`);
+      return Object.fromEntries(Object.entries(installed)
         .map(([name, { version }]) => [name, version]));
     },
   };

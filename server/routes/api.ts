@@ -689,14 +689,14 @@ api.post("/project/clone", async (c) => {
     if (existsSync(join(dest, "package.json"))) {
       const packageManager = detectPackageManager(dest);
       const installPlan = packageInstallPlan(packageManager);
-      const installInvocation = prepareCommandInvocation(
+      const { command, args, ...spawnOptions } = prepareCommandInvocation(
         installPlan.command,
         installPlan.args
       );
       if (!hasInstalledDependencies(dest, packageManager.name)) {
-        await pExecFile(installInvocation.command, installInvocation.args, {
+        await pExecFile(command, args, {
+          ...spawnOptions,
           cwd: dest,
-          shell: installInvocation.shell,
           env: buildChildEnv({
             CI: "1",
             YARN_ENABLE_SCRIPTS: "false",

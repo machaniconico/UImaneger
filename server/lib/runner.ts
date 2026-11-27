@@ -705,15 +705,16 @@ export async function startTarget(
     throw new Error(`対象の起動ポート ${port} は既に使用されています。`);
   }
 
-  const invocation = prepareCommandInvocation(plan.command, plan.args, {
+  const { command, args, ...spawnOptions } = prepareCommandInvocation(plan.command, plan.args, {
     shell: plan.shell,
+    detached: true,
   });
 
-  const proc = spawn(invocation.command, invocation.args, {
+  const proc = spawn(command, args, {
+    ...spawnOptions,
     cwd: root,
     env: buildChildEnv({ ...plan.env, FORCE_COLOR: "0" }),
-    shell: invocation.shell,
-    detached: true,
+    windowsHide: true,
   });
   registerChild(proc);
 
