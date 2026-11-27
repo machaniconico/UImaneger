@@ -1192,11 +1192,11 @@ describe("edit proposal API", () => {
   it("rejects reads and writes that escape the root through a symlink", async () => {
     const outside = mkdtempSync(join(tmpdir(), "uim-symlink-outside-"));
     try {
-      writeFileSync(join(outside, "secret.txt"), "outside", "utf8");
+      writeFileSync(join(outside, "outside-target.txt"), "outside", "utf8");
       try {
         // Windows の一般ユーザーでも作れる junction を使う(POSIX では type は無視される)。
         symlinkSync(outside, join(root, "src", "escape-dir"), "junction");
-        symlinkSync(join(outside, "secret.txt"), join(root, "src", "escape-file.txt"));
+        symlinkSync(join(outside, "outside-target.txt"), join(root, "src", "escape-file.txt"));
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "EPERM") return; // symlink 権限が無い環境
         throw err;
@@ -1208,7 +1208,7 @@ describe("edit proposal API", () => {
       expect(readViaFileLink.res.status).toBe(403);
 
       const readViaDirLink = await getJson<{ error: string }>(
-        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-dir", "secret.txt"))}`
+        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-dir", "outside-target.txt"))}`
       );
       expect(readViaDirLink.res.status).toBe(403);
 
@@ -1224,7 +1224,7 @@ describe("edit proposal API", () => {
         content: "overwritten",
       });
       expect(writeViaFileLink.res.status).toBe(403);
-      expect(readFileSync(join(outside, "secret.txt"), "utf8")).toBe("outside");
+      expect(readFileSync(join(outside, "outside-target.txt"), "utf8")).toBe("outside");
     } finally {
       rmSync(join(root, "src", "escape-dir"), { force: true });
       rmSync(join(root, "src", "escape-file.txt"), { force: true });

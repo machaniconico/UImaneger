@@ -44,7 +44,7 @@ React の private `fiber._debugSource` は React/version/build 設定に依存�
 
 ## セットアップ
 
-前提は Node.js 22.12 以上 25 未満、npm 10 以上です。対象プロジェクト側の runtime と依存関係は別途必要です。
+前提は Node.js 22.18 以上 25 未満(TypeScript の型注釈除去を既定で使うため)、npm 10 以上です。対象プロジェクト側の runtime と依存関係は別途必要です。
 
 ```bash
 npm install
