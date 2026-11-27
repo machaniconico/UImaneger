@@ -989,7 +989,7 @@ async function runEditFlow(
     };
   }
 
-  const relFile = relative(root, resolved.file);
+  const relFile = portableRelative(root, resolved.file);
   hooks.onGenerating?.(relFile);
   const result = await buildProposalForFile(
     root,
