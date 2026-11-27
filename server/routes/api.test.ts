@@ -9,6 +9,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -327,7 +328,9 @@ beforeEach(async () => {
   __stores.historyLog.splice(0);
   __stores.inFlight.clear();
 
-  root = mkdtempSync(join(tmpdir(), "uim-api-"));
+  // tmpdir が symlink の環境(macOS の /var → /private/var)でも、atomicWrite が書く実体パスと
+  // テストの filePath(fs モックの比較対象)が一致するよう、root は実体パスで作る。
+  root = realpathSync(mkdtempSync(join(tmpdir(), "uim-api-")));
   mkdirSync(join(root, "src"), { recursive: true });
   filePath = join(root, "src", "App.tsx");
   writeFileSync(filePath, originalContent, "utf8");
