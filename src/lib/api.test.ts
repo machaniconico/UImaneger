@@ -212,3 +212,30 @@ describe("api.editStream", () => {
     ).rejects.toThrow("最終結果を受信できませんでした");
   });
 });
+
+describe("api.editCandidate", () => {
+  it("選択モデルを候補確定の JSON body に含める", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, proposalId: "p2" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const candidate = { file: "src/App.tsx", line: 4, preview: "x" };
+
+    await api.editCandidate(candidate, descriptor, "赤くして", "claude-haiku-4-5");
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/edit/candidate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        file: "src/App.tsx",
+        line: 4,
+        descriptor,
+        instruction: "赤くして",
+        model: "claude-haiku-4-5",
+      }),
+    });
+  });
+});

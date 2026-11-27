@@ -244,13 +244,15 @@ export const api = {
   editCandidate: (
     candidate: Candidate,
     descriptor: DomDescriptor,
-    instruction: string
+    instruction: string,
+    model?: string
   ) =>
     post<EditProposal>("/api/edit/candidate", {
       file: candidate.file,
       line: candidate.line,
       descriptor,
       instruction,
+      ...(model ? { model } : {}),
     }),
   /** 提案を適用(実書き込み)。 */
   applyEdit: (proposalId: string) =>

@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { resolve, join, relative, isAbsolute, basename, dirname } from "node:path";
+import { resolve, join, relative, isAbsolute, basename, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { env } from "../lib/env.ts";
 import { buildChildEnv } from "../lib/child-env.ts";
@@ -134,7 +134,30 @@ function serverErrorPayload(c: Context, e: unknown, relFile?: string) {
       status: err?.status,
     })
   );
-  return { error: sanitizeForLog((e as Error)?.message ?? e) };
+  return { error: clientErrorMessage(e, relFile) };
+}
+
+const FS_READ_SYSCALLS = new Set(["open", "read", "stat", "lstat", "fstat", "scandir", "readlink", "access"]);
+const FS_WRITE_SYSCALLS = new Set(["write", "rename", "unlink", "mkdir", "rmdir", "copyfile", "chmod"]);
+
+/**
+ * クライアントへ返すエラー文。OS のファイル操作例外 (code: EACCES 等) は絶対パスを含むため
+ * 分類済みの汎用文に置き換え、詳細はサーバログ (serverErrorPayload) のみに残す。
+ * それ以外の例外も API キーを伏せ、プロジェクトルートの絶対パスは相対表記にする。
+ */
+function clientErrorMessage(e: unknown, relFile?: string): string {
+  const err = e as { code?: unknown; syscall?: unknown; message?: unknown };
+  const where = relFile ? ` (${relFile})` : "";
+  if (typeof err?.code === "string" && /^E[A-Z0-9]+$/.test(err.code)) {
+    const syscall = typeof err.syscall === "string" ? err.syscall : "";
+    if (FS_WRITE_SYSCALLS.has(syscall)) return `ファイルを書き込めませんでした${where}`;
+    if (FS_READ_SYSCALLS.has(syscall)) return `ソースファイルを読めませんでした${where}`;
+    return `ファイル操作に失敗しました${where}`;
+  }
+  let message = sanitizeForLog(err?.message ?? e);
+  const root = getRoot();
+  if (root) message = message.split(root + sep).join("").split(root).join(".");
+  return message;
 }
 
 function serverError(c: Context, e: unknown, relFile?: string) {
@@ -671,6 +694,22 @@ api.get("/models", (c) => {
   return c.json({ models, default: env.editModel });
 });
 
+/**
+ * ルート切替は apply/undo/redo と同じ履歴ロック内で行う。書き込み中に切り替わると
+ * 旧プロジェクトのファイルだけ書き換わり、応答 409・履歴なしになるため、進行中の
+ * 書き込みと履歴記録が終わるまで切替を待たせる。
+ */
+function switchProject(path: string, command: string | undefined) {
+  return withHistoryLock(async () => {
+    try {
+      return await openAndStart(path, { command });
+    } finally {
+      // 起動失敗でもルートは切り替わり得るので、ストアは常に現在のルートへ合わせる
+      ensureStoresForCurrentRoot();
+    }
+  });
+}
+
 api.post("/project/open", async (c) => {
   const body = await readJsonBody<{
     path: string;
@@ -702,8 +741,7 @@ api.post("/project/open", async (c) => {
     return c.json({ error: `パスが存在しません: ${path}` }, 400);
   }
   try {
-    const info = await openAndStart(projectPath, { command: runCommand });
-    ensureStoresForCurrentRoot();
+    const info = await switchProject(projectPath, runCommand);
     return c.json({ info });
   } catch (e) {
     return serverError(c, e);
@@ -807,8 +845,7 @@ api.post("/project/clone", async (c) => {
         });
       }
     }
-    const info = await openAndStart(dest, { command: runCommand });
-    ensureStoresForCurrentRoot();
+    const info = await switchProject(dest, runCommand);
     return c.json(
       installError
         ? {
@@ -1209,11 +1246,17 @@ api.post("/edit/candidate", async (c) => {
     line?: number;
     descriptor?: DomDescriptor;
     instruction: string;
+    model?: string;
   }>(c);
   if (body instanceof Response) return body;
-  const { file, line, descriptor: rawDescriptor } = body;
+  const { file, line, descriptor: rawDescriptor, model } = body;
   if (typeof file !== "string" || !file)
     return c.json({ error: "file が必要です" }, 400);
+  if (
+    model !== undefined &&
+    (typeof model !== "string" || !isAllowedEditModel(model))
+  )
+    return c.json({ error: "許可されていないモデルです" }, 400);
   const normalizedInstruction = normalizeInstruction(body.instruction);
   if (!normalizedInstruction.ok)
     return c.json({ error: normalizedInstruction.error }, 400);
@@ -1251,7 +1294,7 @@ api.post("/edit/candidate", async (c) => {
       desc,
       instruction,
       "medium",
-      { projectEpoch: epoch }
+      { projectEpoch: epoch, model }
     );
     return c.json(result);
   } catch (e) {

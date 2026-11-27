@@ -507,6 +507,32 @@ describe("edit proposal API", () => {
     expect(claudeMock.complete).not.toHaveBeenCalled();
   });
 
+  it("passes the chosen edit model through candidate selection", async () => {
+    claudeMock.complete.mockResolvedValueOnce(editedContent);
+    const result = await postJson<{ ok: boolean }>("/api/edit/candidate", {
+      file: filePath,
+      line: 8,
+      descriptor: descriptorFor(filePath),
+      instruction: "Change it",
+      model: "claude-haiku-4-5",
+    });
+    expect(result.res.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+    expect(claudeMock.streamComplete).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ model: "claude-haiku-4-5" }),
+      undefined
+    );
+
+    const rejected = await postJson<{ error: string }>("/api/edit/candidate", {
+      file: filePath,
+      instruction: "Change it",
+      model: "gpt-unknown",
+    });
+    expect(rejected.res.status).toBe(400);
+    expect(rejected.body.error).toBe("許可されていないモデルです");
+  });
+
   it("rejects invalid candidate line numbers", async () => {
     const result = await postJson<{ error: string }>("/api/edit/candidate", {
       file: filePath,
@@ -1877,4 +1903,112 @@ describe("git API", () => {
     );
     expect(String(runGit(["status", "--porcelain"]).stdout).trim()).toBe("");
   }, 15_000);
+});
+
+describe("project switch while a history write is in flight", () => {
+  it.each(["apply", "undo", "redo"] as const)(
+    "lets %s finish and record history before /project/open switches the root",
+    async (kind) => {
+      const proposal = await requestProposal();
+      if (kind !== "apply") {
+        await postJson("/api/edit/apply", { proposalId: proposal.proposalId });
+      }
+      if (kind === "redo") await postJson("/api/edit/undo", {});
+
+      const actualRename = fsPromisesMock.actual.rename;
+      const renameStarted = deferred();
+      const releaseRename = deferred();
+      let delayed = false;
+      fsPromisesMock.rename.mockImplementation(async (...args: any[]) => {
+        if (!delayed && String(args[1]) === filePath) {
+          delayed = true;
+          renameStarted.resolve();
+          await releaseRename.promise;
+        }
+        return actualRename(...args);
+      });
+
+      const oldRoot = root;
+      const oldFilePath = filePath;
+      const writePromise = postJson<{ ok?: boolean; error?: string }>(
+        kind === "apply" ? "/api/edit/apply" : `/api/edit/${kind}`,
+        kind === "apply" ? { proposalId: proposal.proposalId } : {}
+      );
+      await renameStarted.promise;
+
+      const nextRoot = mkdtempSync(join(tmpdir(), "uim-api-switch-"));
+      mkdirSync(join(nextRoot, "src"), { recursive: true });
+      writeFileSync(join(nextRoot, "src", "App.tsx"), originalContent, "utf8");
+      const openPromise = postJson<{ info?: { root: string } }>(
+        "/api/project/open",
+        { path: nextRoot, runCommand: "echo test-server-ready" },
+        { host: "localhost:5174" }
+      );
+      await delay(100);
+      // 書き込み完了前にルートが切り替わってはならない
+      const rootDuringWrite = state.getRoot();
+      releaseRename.resolve();
+      const result = await writePromise;
+      const opened = await openPromise;
+      expect(rootDuringWrite).toBe(oldRoot);
+      expect(result.res.status).toBe(200);
+      expect(result.body).toMatchObject({
+        ok: true,
+        undoDepth: kind === "undo" ? 0 : 1,
+      });
+      expect(readFileSync(oldFilePath, "utf8")).toBe(
+        kind === "undo" ? originalContent : editedContent
+      );
+
+      // "echo" は常駐しないので起動自体は失敗し得る。検証対象はルート切替の順序のみ
+      expect([200, 500]).toContain(opened.res.status);
+      expect(state.getRoot()).toBe(nextRoot);
+      root = nextRoot;
+      filePath = join(nextRoot, "src", "App.tsx");
+      rmSync(oldRoot, { recursive: true, force: true });
+    }
+  );
+});
+
+describe("internal error details", () => {
+  function eacces(path: string): Error {
+    return Object.assign(
+      new Error(`EACCES: permission denied, open '${path}'`),
+      { code: "EACCES", errno: -13, syscall: "open", path }
+    );
+  }
+
+  it.each(["/api/edit", "/api/edit/stream"] as const)(
+    "%s returns a classified message instead of the absolute path on EACCES",
+    async (route) => {
+      fsPromisesMock.readFile.mockImplementation(async (...args: any[]) => {
+        // 提案生成のバイト読み (encoding 指定なし) だけを失敗させる。resolver の utf8 読みは通す
+        if (String(args[0]) === filePath && args.length === 1) throw eacces(filePath);
+        return fsPromisesMock.actual.readFile(...args);
+      });
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const request = {
+          descriptor: descriptorFor(filePath),
+          instruction: "Change the button label.",
+        };
+        let error: unknown;
+        if (route === "/api/edit") {
+          const { body } = await postJson<{ error: string }>(route, request);
+          error = body.error;
+        } else {
+          const { events } = await postSse(route, request);
+          error = events.find((event) => event.type === "result")?.error;
+        }
+
+        expect(error).toEqual(expect.stringContaining("ソースファイルを読めませんでした"));
+        expect(String(error)).not.toContain(root);
+        expect(String(error)).not.toContain("EACCES");
+        const logged = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+        expect(logged).toContain("EACCES");
+      } finally {
+        errorSpy.mockRestore();
+      }
+    }
+  );
 });

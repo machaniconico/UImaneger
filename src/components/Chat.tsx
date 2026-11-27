@@ -212,14 +212,18 @@ export function Chat({
         }
       );
       handleProposal(result, text);
-      if (!result.ok) {
+      // 前の提案を戻すのは同じ要素への追い込み失敗だけ。別要素への指示や候補選択待ち
+      // (low) では前の提案を破棄し、候補確定がこの指示の descriptor を使うようにする
+      if (!result.ok && previousProposalId && !result.candidates?.length) {
         setProposal(previousProposal);
-        if (previousProposal) setEditDescriptor(previousEditDescriptor);
+        setEditDescriptor(previousEditDescriptor);
       }
     } catch (e) {
       setInstruction(text);
-      setProposal(previousProposal);
-      if (previousProposal) setEditDescriptor(previousEditDescriptor);
+      if (previousProposalId) {
+        setProposal(previousProposal);
+        setEditDescriptor(previousEditDescriptor);
+      }
       log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
       setGeneration(null);
@@ -233,7 +237,12 @@ export function Chat({
     setBusy(true);
     try {
       handleProposal(
-        await api.editCandidate(c, desc, lastInstruction),
+        await api.editCandidate(
+          c,
+          desc,
+          lastInstruction,
+          editModelRef.current || undefined
+        ),
         lastInstruction
       );
     } catch (e) {
