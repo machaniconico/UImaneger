@@ -611,6 +611,7 @@ export function extractPortForRunnerOutput(
   line: string,
   knownPort: boolean
 ): number | null {
+  // nosemgrep: ajinabraham.njsscan.dos.regex_dos.regex_dos -- 選択肢の列挙のみで入れ子の量指定子なし
   if (knownPort && !KNOWN_PORT_OVERRIDE_LINE_PATTERN.test(line)) {
     return null;
   }

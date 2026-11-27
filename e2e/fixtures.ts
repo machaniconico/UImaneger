@@ -11,6 +11,7 @@ import { test as base, expect } from "@playwright/test";
 const repo = fileURLToPath(new URL("../", import.meta.url));
 const host = "127.0.0.1";
 export const model = "claude-e2e";
+// nosemgrep: ajinabraham.njsscan.generic.hardcoded_secrets.node_api_key -- 偽 Anthropic サーバ専用のダミー値
 export const apiKey = "e2e-fake-key";
 export const originalHeading = "サンプルアプリ";
 export const editedHeading = "ブラウザE2Eで編集済み";

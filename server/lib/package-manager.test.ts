@@ -81,7 +81,10 @@ describe("package manager command plans", () => {
     expect(packageInstallPlan({ name: "pnpm" }).args).toEqual([
       "install",
       "--ignore-scripts",
+      "--ignore-pnpmfile",
     ]);
+    expect(packageInstallPlan({ name: "npm" }).args).toEqual(["install", "--ignore-scripts"]);
+    expect(packageInstallPlan({ name: "bun" }).args).toEqual(["install", "--ignore-scripts"]);
   });
 });
 

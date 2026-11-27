@@ -88,6 +88,10 @@ export function packageInstallPlan(info: PackageManagerInfo): CommandPlan {
   if (info.name === "yarn" && (yarnMajor(info.version) ?? 1) >= 2) {
     return { command: "yarn", args: ["install", "--mode=skip-build"] };
   }
+  if (info.name === "pnpm") {
+    // .pnpmfile.cjs は install 時に任意コードを実行できるため、lifecycle script と同様に無効化する。
+    return { command: "pnpm", args: ["install", "--ignore-scripts", "--ignore-pnpmfile"] };
+  }
   return { command: info.name, args: ["install", "--ignore-scripts"] };
 }
 
@@ -144,6 +148,7 @@ export function prepareCommandInvocation(
   const platform = options.platform ?? process.platform;
   if (
     platform === "win32" &&
+    // nosemgrep: ajinabraham.njsscan.dos.regex_dos.regex_dos -- 固定の拡張子照合で量指定子なし
     (WINDOWS_COMMAND_SHIMS.has(commandBase(command)) || /\.(?:cmd|bat)$/i.test(command))
   ) {
     const commandLine = [command, ...args].map(quoteCmdToken).join(" ");

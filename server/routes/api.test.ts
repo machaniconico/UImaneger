@@ -1133,6 +1133,7 @@ describe("edit proposal API", () => {
 
   it("logs a structured server error line without leaking the API key", async () => {
     const previousKey = process.env.ANTHROPIC_API_KEY;
+    // nosemgrep: ajinabraham.njsscan.generic.hardcoded_secrets.node_api_key -- 伏せ字化の検証用ダミー値
     process.env.ANTHROPIC_API_KEY = "sk-ant-test-secret";
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {

@@ -63,7 +63,7 @@ UI の Vite は `strictPort` で起動するため、5173(`UIM_CLIENT_PORT`)が�
 
 ビルド済み UI をサーバ 1 つで配信する場合は `npm run start:prod` を使います(`npm run build` の後に `--production` 付きで起動)。このモードでは UI と API が同一 origin(既定 [http://localhost:5174](http://localhost:5174))になり、5173 の Origin は信頼しません。`npm start` 単独は API のみの開発用モードです。
 
-Git clone 後の Node 依存導入は npm/pnpm/Yarn/Bun を検出し、lifecycle script を無効にして実行します。Ruby、Python、PHP、Go、Java、.NET、Elixir などの依存導入は自動化していません。
+Git clone 後の Node 依存導入は npm/pnpm/Yarn/Bun を検出し、lifecycle script を無効にして実行します(pnpm は `.pnpmfile.cjs` も無効)。Yarn 2 以降はリポジトリの `.yarnrc.yml` が指す `yarnPath` や plugin を Yarn 自身が読み込むため、install 時点でそのリポジトリのコードが動く可能性があります。Ruby、Python、PHP、Go、Java、.NET、Elixir などの依存導入は自動化していません。
 Clone URL は HTTPS、SSH URL、scp-like `git@host:path` のみ受け付けます。平文の Git protocol、ローカル `file:`、Git ext transport は拒否します。
 
 ## セキュリティ
@@ -78,7 +78,7 @@ Clone URL は HTTPS、SSH URL、scp-like `git@host:path` のみ受け付けま�
 - 対象 dev server のポートへの直接アクセスはプレビュープロキシを通らないため、Host 検査は対象フレームワーク側に依存します。
 - 開発サーバ、git、依存インストールなどの子プロセスには、`ANTHROPIC_*`、`UIM_*` と `.env` から読み込んだキーを渡しません。
 - 任意の起動コマンドは、サーバ自体もループバック bind の場合にだけ許可します。
-- Clone したプロジェクトの install script は無効化します。ただし開発サーバを起動すると、そのプロジェクトのコードが現在ユーザー権限で実行されます。信頼できるコードだけを開いてください。
+- Clone したプロジェクトの install では lifecycle script と pnpm の `.pnpmfile.cjs` を無効化します。ただし Yarn 2 以降の `yarnPath`・plugin は install 時に読み込まれ、clone 後は検出した開発サーバも自動起動するため、そのプロジェクトのコードが現在ユーザー権限で実行されます。信頼できるリポジトリだけを開いてください。
 - 編集時は対象ファイル全体、指示、DOM の補助情報が Anthropic API へ送信されます。秘密、個人情報、契約上送信できないコードを対象にしないでください。
 - `UIM_HOST` による LAN 公開はサポート対象外です。認証やTLSなしで外部公開しないでください。
 
