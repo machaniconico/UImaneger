@@ -37,7 +37,7 @@ UImaneger は **ローカル単一ユーザー** 向けのツールです。利�
 | T11 | 依存パッケージの既知脆弱性、コードに混入した秘密、危険なコードパターン | CI の `audit`(moderate 以上)、`secret-scan`(gitleaks、git 履歴全体)、`sast`(semgrep)の各 job | `.github/workflows/ci.yml` |
 | T12 | Static 配信で、`\`・`%2F`・`//`・ドットセグメント・二重エンコード・大小文字・symlink などの別表記により `.env`・`.git`・`node_modules` を読む | request-target を 1 回だけデコードし、`\` と NUL を含めば 404。正規化後のセグメントと、realpath 後の root 相対パスの両方で隠し名(`.well-known` を除く)と `node_modules` を大小文字無視で拒否する。Windows では末尾のドット・空白と `:`(ADS)も拒否する | `tests/acceptance/static-hidden-paths.test.ts` |
 | T13 | プレビュー内のスクリプトが source ヒントを偽装し、`.git`・`.env`・`node_modules` の内容を Claude に送らせる、または書き換えさせる(`.git` への書き込みは、このツール自身が実行する git によってコード実行に昇格する) | `server/lib/path-policy.ts` が root 相対パスを字面と realpath の両方で見て、`.git`・`node_modules`・先頭ドットのセグメントを大小文字無視で拒否する(403)。edit 系・files 系の全経路と、apply・undo・redo の実行時に判定する。層 A は保護パスを指すヒントを無視して層 B に進む | `tests/acceptance/protected-paths.test.ts` |
-| T14 | 親リポジトリのサブディレクトリを開いた時に、範囲外の変更やステージ済みの変更までコミットする | git の status・add・ステージ判定・commit すべてに pathspec `-- .`(cwd=root)を付ける | `tests/acceptance/git-scope.test.ts` |
+| T14 | 親リポジトリのサブディレクトリを開いた時に、範囲外の変更やステージ済みの変更までコミットする | root がリポジトリのサブディレクトリなら、git の status・add・ステージ判定・commit すべてに pathspec `-- .`(cwd=root)を付ける。root がリポジトリ直下なら pathspec を付けない(マージ完了コミットを妨げないため)。サブディレクトリでマージ・cherry-pick・revert・rebase の途中なら、`git add` より前に 409 で止める | `tests/acceptance/git-scope.test.ts` |
 | T15 | 別ポートの localhost ページがプレビューを iframe に埋め込み、inspector の選択結果を受け取る | CSP `frame-ancestors` を `'self'` と UI の origin(dev は clientPort、production は serverPort)だけにする。inspector は配信時に埋め込まれた同じ origin の一覧と完全一致した親だけを信頼し、最初に信頼した origin に固定する。`/__uim/inspector.js` は `cache-control: no-store` | `tests/acceptance/preview-parent-origin.test.ts`、`server/inspector-client.test.ts` |
 
 ## 受容したリスク(非目標)
@@ -53,6 +53,8 @@ UImaneger は **ローカル単一ユーザー** 向けのツールです。利�
 - **所有者**: 書き込みは一時ファイルの rename なので、元ファイルの uid・gid は引き継がず、サーバを動かすユーザーの所有になります。
 - **隠しでない設定ファイル**: `package.json`・`vite.config.ts` などは編集対象のままです。これらの変更は次の dev server 起動時に実行されます。
 - **Git hooks**: commit 時にはリポジトリの hooks が実行されます(`.git` への書き込み経路は T13 で塞いでいます)。
+- **検査から書き込み・読み取りまでの競合(TOCTOU)**: 保護パス・root 内の検査と、書き込み(rename)・静的配信・ソース読み取りの間に、親ディレクトリやリンク先を並行して差し替えられる窓が残ります。rename 直前の再検査、検査した実体の fd での配信、`O_NONBLOCK` での open で窓は狭めていますが、ゼロにはできません。差し替えにはプロジェクト内に書き込めるローカルプロセスが必要で、上の「同一 OS ユーザーのローカルプロセス」に含まれます。
+- **umask 測定用の一時ファイル**: 新規ファイルを書くとき、最終 mode を決めるために同じディレクトリに `.uim-umask-<uuid>` を一瞬作って消します。dev server のファイル監視が反応することがあり、強制終了時には空のファイルが残り得ます。
 
 ## 見直す条件
 
