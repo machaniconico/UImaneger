@@ -22,7 +22,7 @@ function isProtectedSegment(segment: string): boolean {
 /** root 配下の相対パスに保護セグメントがあるか。root の外(..)は判定しない(範囲外判定は別途)。 */
 function relHasProtectedSegment(rootPath: string, filePath: string): boolean {
   const rel = relative(rootPath, filePath);
-  if (rel === "" || isAbsolute(rel) || rel === ".." || /^\.\.[\\/]/.test(rel)) {
+  if (rel === "" || isOutsideRel(rel)) {
     return false;
   }
   return rel.split(/[\\/]+/).some(isProtectedSegment);
@@ -43,6 +43,40 @@ export function realpathOrNearest(abs: string): string | null {
       cur = parent;
     }
   }
+}
+
+/** root からの相対パスが root の外(`..` 始まり・別ドライブ)か。隠しセグメントの判定とは別。 */
+function isOutsideRel(rel: string): boolean {
+  return isAbsolute(rel) || rel === ".." || /^\.\.[\\/]/.test(rel);
+}
+
+/**
+ * file が root 配下(root 自身は除く)か。root と file を同じ方式(realpathSync.native)で
+ * 実体に解決してから比べる。JS 実装の realpathSync は Windows の 8.3 短縮名を展開しないため、
+ * 片方だけ native で解決すると `..\..\runneradmin\...` のように root 外と誤判定する。
+ * 未存在のファイルは親ディレクトリが存在する時だけ認める。win32 の比較は path.relative が
+ * 大小文字を無視する。
+ */
+export function isInsideRoot(root: string, file: string): boolean {
+  let realRoot: string;
+  let realFile: string;
+  const abs = resolve(file);
+  try {
+    realRoot = realpathSync.native(root);
+  } catch {
+    return false;
+  }
+  try {
+    realFile = realpathSync.native(abs);
+  } catch {
+    try {
+      realFile = join(realpathSync.native(dirname(abs)), basename(abs));
+    } catch {
+      return false;
+    }
+  }
+  const rel = relative(realRoot, realFile);
+  return rel !== "" && !isOutsideRel(rel);
 }
 
 /**

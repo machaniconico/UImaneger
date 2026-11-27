@@ -32,6 +32,7 @@ import {
 } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
 import {
+  isInsideRoot,
   isProtectedPath,
   PROTECTED_PATH_ERROR,
   realpathOrNearest,
@@ -696,26 +697,7 @@ function pushHistory(entry: HistoryEntry): void {
  */
 function inRoot(root: string, file: string): boolean {
   if (typeof root !== "string" || typeof file !== "string") return false;
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(root);
-  } catch {
-    return false;
-  }
-  const abs = resolve(file);
-  let realFile: string;
-  try {
-    realFile = realpathSync(abs);
-  } catch {
-    try {
-      const realParent = realpathSync(dirname(abs));
-      realFile = join(realParent, basename(abs));
-    } catch {
-      return false;
-    }
-  }
-  const rel = relative(realRoot, realFile);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return isInsideRoot(root, file);
 }
 
 /**
