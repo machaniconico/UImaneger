@@ -481,7 +481,7 @@ function normalizeCommitMessage(
 
 async function hasStagedGitChanges(root: string): Promise<boolean> {
   try {
-    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code"], {
+    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code", "--", "."], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -1656,11 +1656,13 @@ ${content}
 }
 
 // --- git (MVP minimal) ---
+// root が親リポジトリのサブディレクトリの場合もあるため、status・add・ステージ判定・commit
+// はすべて pathspec `-- .`(cwd=root)でプロジェクト内に限る。
 api.get("/git/status", async (c) => {
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   try {
-    const { stdout } = await pExecFile("git", ["status", "--porcelain"], {
+    const { stdout } = await pExecFile("git", ["status", "--porcelain", "--", "."], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -1681,7 +1683,7 @@ api.post("/git/commit", async (c) => {
   const commitMessage = normalizeCommitMessage(message);
   if (!commitMessage.ok) return c.json({ error: commitMessage.error }, 400);
   try {
-    await pExecFile("git", ["add", "-A"], {
+    await pExecFile("git", ["add", "-A", "--", "."], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -1692,7 +1694,7 @@ api.post("/git/commit", async (c) => {
     }
     await pExecFile(
       "git",
-      ["commit", "--no-gpg-sign", "-m", commitMessage.message],
+      ["commit", "--no-gpg-sign", "-m", commitMessage.message, "--", "."],
       {
         cwd: root,
         env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
