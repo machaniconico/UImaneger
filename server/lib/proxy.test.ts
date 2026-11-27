@@ -652,6 +652,42 @@ describeIfLoopback("proxy transport fidelity", () => {
     }
   });
 
+  it("adds frame-ancestors to responses that cannot be identified as HTML", async () => {
+    const encoded = gzipSync("<!doctype html><html><body>compressed</body></html>");
+    const upstream = http.createServer((req, res) => {
+      if (req.url === "/image.png") {
+        res.writeHead(200, { "content-type": "image/png" });
+        res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        return;
+      }
+      // Content-Type なし・gzip の HTML(sniff できない)
+      res.writeHead(200, {
+        "content-encoding": "gzip",
+        "content-length": String(encoded.byteLength),
+      });
+      res.end(encoded);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+    const expected =
+      "frame-ancestors 'self' http://localhost:5173 http://127.0.0.1:5173 http://[::1]:5173";
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort, "127.0.0.1", {
+        parentOrigins: previewParentOrigins({ serverPort: 5174, clientPort: 5173 }),
+      });
+      for (const path of ["/", "/image.png"]) {
+        const response = await requestViaProxy(proxyPort, path);
+        expect(response.headers["content-security-policy"], path).toContain(expected);
+        expect(response.body.toString("latin1"), path).not.toContain("data-uim-inspector");
+      }
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
   it("serves the inspector from the proxy origin without contacting upstream", async () => {
     let upstreamRequests = 0;
     const upstream = http.createServer((_req, res) => {

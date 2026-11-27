@@ -411,9 +411,10 @@ export function startProxy(
 
     const responseHeaders = (isHtml: boolean): http.OutgoingHttpHeaders => {
       const next: http.OutgoingHttpHeaders = { ...headers };
-      if (!isHtml) return next;
-      // HTML 文書だけフレーム許可を補正する。既存 CSP の他ディレクティブは維持する。
-      delete next["x-frame-options"];
+      // HTML と判定できない応答(Content-Type なしの圧縮応答など)や非 HTML も、埋め込める
+      // 親を UI の origin に限るため frame-ancestors を付ける。既存 CSP の他ディレクティブは
+      // 維持する。x-frame-options を外す(UI からの埋め込みを許す)のは HTML 文書だけ。
+      if (isHtml) delete next["x-frame-options"];
       setOutgoingHeader(
         next,
         "content-security-policy",
