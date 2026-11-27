@@ -1,0 +1,406 @@
+// @vitest-environment node
+// R3 受け入れテスト(件2): 編集・ファイル API の保護パス(.git / node_modules / 先頭ドット)。
+// 基準: .omc/plans/r3-security-audit-acceptance.md 件2(実装者は編集禁止)
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createApp } from "../../server/app.ts";
+import { __stores } from "../../server/routes/api.ts";
+import { openProject, stopProject } from "../../server/lib/state.ts";
+
+const claudeMock = vi.hoisted(() => {
+  class TruncatedError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = "TruncatedError";
+    }
+  }
+  return { complete: vi.fn(), streamComplete: vi.fn(), TruncatedError };
+});
+
+vi.mock("../../server/lib/claude.ts", () => ({
+  complete: claudeMock.complete,
+  streamComplete: claudeMock.streamComplete,
+  hasKey: () => true,
+  stripCodeFence: (text: string) => text.trim(),
+  TruncatedError: claudeMock.TruncatedError,
+}));
+
+const app = createApp({ production: false, useLogger: false, serverPort: 5174, clientPort: 5173 });
+
+const C0 = 'export const App = () => <div>C0</div>;';
+const C1 = 'export const App = () => <div>C1</div>;';
+const WRITE_BODY = "OVERWRITTEN_BY_ACCEPTANCE_TEST";
+const INSTRUCTION = "Change the label.";
+
+const MARKERS = [
+  "MARKER_GIT_DESCRIPTION",
+  "MARKER_GIT_CONFIG",
+  "MARKER_GIT_HOOK",
+  "MARKER_ENV",
+  "MARKER_ENV_LOCAL",
+  "MARKER_NM",
+  "MARKER_HIDDEN_DIR",
+  "MARKER_HIDDEN_FILE",
+];
+
+let root = "";
+let symlinksOk = true;
+const extraRoots: string[] = [];
+
+function put(base: string, rel: string, content: string): void {
+  const p = join(base, rel);
+  mkdirSync(dirname(p), { recursive: true });
+  writeFileSync(p, content, "utf8");
+}
+
+function mkRoot(prefix = "uim-prot-"): string {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+  extraRoots.push(d);
+  return d;
+}
+
+function buildFixtureP(base: string): void {
+  put(base, "src/App.tsx", C0);
+  put(base, ".git/description", "MARKER_GIT_DESCRIPTION");
+  put(base, ".git/config", "MARKER_GIT_CONFIG");
+  put(base, ".git/hooks/pre-commit", "MARKER_GIT_HOOK");
+  put(base, ".env", "API_TOKEN=MARKER_ENV");
+  put(base, ".env.local", "MARKER_ENV_LOCAL");
+  put(base, "node_modules/pkg/index.js", "MARKER_NM");
+  put(base, ".vitepress/theme/Layout.vue", "MARKER_HIDDEN_DIR");
+  put(base, "src/.secret.ts", "MARKER_HIDDEN_FILE");
+  try {
+    symlinkSync("../.git", join(base, "src/link-git"));
+    symlinkSync("../.git/description", join(base, "src/link-desc.tsx"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EPERM") throw err;
+    symlinksOk = false;
+  }
+}
+
+beforeEach(async () => {
+  claudeMock.complete.mockReset();
+  claudeMock.streamComplete.mockReset();
+  // 現状実装(保護なし)で Claude に届いた場合に提案が成立するよう、C1 を返す。
+  claudeMock.complete.mockResolvedValue(C1);
+  claudeMock.streamComplete.mockImplementation((prompt: string, opts: unknown, onProgress?: unknown) =>
+    claudeMock.complete(prompt, opts, onProgress)
+  );
+  __stores.proposalStore.clear();
+  __stores.undoStack.splice(0);
+  __stores.redoStack.splice(0);
+  __stores.historyLog.splice(0);
+  __stores.inFlight.clear();
+  symlinksOk = true;
+  root = mkRoot();
+  buildFixtureP(root);
+  await openProject(root, { command: "echo test-server-ready" });
+});
+
+afterEach(async () => {
+  __stores.proposalStore.clear();
+  __stores.undoStack.splice(0);
+  __stores.redoStack.splice(0);
+  __stores.historyLog.splice(0);
+  __stores.inFlight.clear();
+  await stopProject();
+  for (const d of extraRoots.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+async function post(path: string, body: unknown): Promise<{ status: number; text: string; json: any }> {
+  const res = await app.request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json: any = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    /* SSE など */
+  }
+  return { status: res.status, text, json };
+}
+
+async function readApi(path: string): Promise<{ status: number; text: string }> {
+  const res = await app.request(`/api/files/read?path=${encodeURIComponent(path)}`);
+  return { status: res.status, text: await res.text() };
+}
+
+function claudeSent(): string {
+  return JSON.stringify([...claudeMock.complete.mock.calls, ...claudeMock.streamComplete.mock.calls]);
+}
+
+function claudeCallCount(): number {
+  // streamComplete のモックは complete に委譲するので、両方の呼び出しを数える
+  return claudeMock.complete.mock.calls.length + claudeMock.streamComplete.mock.calls.length;
+}
+
+const DESC = { tag: "div", classes: [] as string[], attrs: {} as Record<string, string>, domPath: "html>body>div" };
+
+function descWithSource(fileName: string) {
+  return { ...DESC, source: { fileName, lineNumber: 1 } };
+}
+
+/** AC-2-1 の不変条件: 保護パスを指す source ヒントは Claude に送られず、提案にもならない。 */
+async function expectSourceHintRefused(fileName: string, marker: string, label: string): Promise<void> {
+  for (const endpoint of ["/api/edit", "/api/edit/stream"]) {
+    claudeMock.complete.mockClear();
+    claudeMock.streamComplete.mockClear();
+    const r = await post(endpoint, { descriptor: descWithSource(fileName), instruction: INSTRUCTION });
+    const tag = `${endpoint} source=${label}`;
+    expect(claudeSent(), `${tag}: Claude に送られた`).not.toContain(marker);
+    expect(claudeCallCount(), `${tag}: Claude 呼び出し`).toBe(0);
+    if (endpoint === "/api/edit") {
+      const refused = r.status === 403 || (r.status === 200 && r.json?.ok === false);
+      expect(refused, `${tag}: status=${r.status} body=${r.text.slice(0, 120)}`).toBe(true);
+    }
+    expect(r.text, `${tag}: proposalId`).not.toContain("proposalId");
+    expect(r.text, `${tag}: .git/ relFile`).not.toMatch(/"relFile"\s*:\s*"\.git\//);
+  }
+}
+
+function sameContent(p: string, expected: string): boolean {
+  return readFileSync(p, "utf8") === expected;
+}
+
+describe("件2 protected paths", () => {
+  it("AC-2-1 edit_source_hint_into_dot_git_is_never_sent_to_claude_nor_proposed", async (ctx) => {
+    const desc = join(root, ".git/description");
+    const hints: Array<[string, string]> = [
+      [desc, "absolute"],
+      [pathToFileURL(desc).href, "file-url"],
+      [".git/description", "relative"],
+      [join(root, "src/../.git/description"), "dotdot"],
+    ];
+    if (symlinksOk) hints.push([join(root, "src/link-desc.tsx"), "symlink"]);
+    else if (hints.length === 0) return ctx.skip();
+    for (const [x, label] of hints) {
+      await expectSourceHintRefused(x, "MARKER_GIT_DESCRIPTION", label);
+    }
+    expect(readFileSync(desc, "utf8")).toBe("MARKER_GIT_DESCRIPTION");
+  });
+
+  it("AC-2-2 edit_candidate_rejects_dot_git_paths", async () => {
+    for (const file of [
+      join(root, ".git/description"),
+      join(root, ".git/config"),
+      join(root, ".git/hooks/pre-commit"),
+      join(root, ".git"),
+      join(root, "src/../.git/description"),
+    ]) {
+      const r = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
+      expect(r.status, `candidate ${file}: ${r.text.slice(0, 100)}`).toBe(403);
+    }
+    expect(claudeCallCount()).toBe(0);
+  });
+
+  it("AC-2-3 edit_candidate_and_files_reject_symlink_into_dot_git", async (ctx) => {
+    if (!symlinksOk) return ctx.skip(); // symlink 作成不可の環境(win32 EPERM)
+    for (const file of [join(root, "src/link-git/description"), join(root, "src/link-desc.tsx")]) {
+      const c = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
+      expect(c.status, `candidate ${file}`).toBe(403);
+      const rd = await readApi(file);
+      expect(rd.status, `files/read ${file}`).toBe(403);
+      const w = await post("/api/files/write", { path: file, content: WRITE_BODY });
+      expect(w.status, `files/write ${file}`).toBe(403);
+    }
+    expect(claudeCallCount()).toBe(0);
+    expect(readFileSync(join(root, ".git/description"), "utf8")).toBe("MARKER_GIT_DESCRIPTION");
+  });
+
+  it("AC-2-4 files_read_write_reject_dot_git_including_gitfile_and_new_files", async () => {
+    const rd = await readApi(join(root, ".git/config"));
+    expect(rd.status, "read .git/config").toBe(403);
+    expect(rd.text).not.toContain("MARKER_GIT_CONFIG");
+
+    const w = await post("/api/files/write", { path: join(root, ".git/config"), content: WRITE_BODY });
+    expect(w.status, "write .git/config").toBe(403);
+    expect(readFileSync(join(root, ".git/config"), "utf8")).toBe("MARKER_GIT_CONFIG");
+
+    const neu = join(root, ".git/hooks/post-checkout");
+    const w2 = await post("/api/files/write", { path: neu, content: WRITE_BODY });
+    expect(w2.status, "write new .git/hooks/post-checkout").toBe(403);
+    expect(existsSync(neu), "post-checkout が作られた").toBe(false);
+
+    // .git が `gitdir: /x` の通常ファイルである別 fixture
+    await stopProject();
+    const root2 = mkRoot("uim-prot-gitfile-");
+    put(root2, "src/App.tsx", C0);
+    put(root2, ".git", "gitdir: /x");
+    await openProject(root2, { command: "echo test-server-ready" });
+    const rd2 = await readApi(join(root2, ".git"));
+    expect(rd2.status, "read gitfile").toBe(403);
+    const w3 = await post("/api/files/write", { path: join(root2, ".git"), content: WRITE_BODY });
+    expect(w3.status, "write gitfile").toBe(403);
+    expect(readFileSync(join(root2, ".git"), "utf8")).toBe("gitdir: /x");
+  });
+
+  it("AC-2-5 edit_and_files_reject_node_modules", async () => {
+    const file = join(root, "node_modules/pkg/index.js");
+    const c = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
+    expect(c.status, "candidate").toBe(403);
+    const rd = await readApi(file);
+    expect(rd.status, "files/read").toBe(403);
+    expect(rd.text).not.toContain("MARKER_NM");
+    const w = await post("/api/files/write", { path: file, content: WRITE_BODY });
+    expect(w.status, "files/write").toBe(403);
+    await expectSourceHintRefused(file, "MARKER_NM", "node_modules");
+    expect(readFileSync(file, "utf8")).toBe("MARKER_NM");
+  });
+
+  it("AC-2-6 edit_and_files_reject_hidden_segments_including_env", async () => {
+    const targets: Array<[string, string]> = [
+      [".env", "API_TOKEN=MARKER_ENV"],
+      [".env.local", "MARKER_ENV_LOCAL"],
+      [".vitepress/theme/Layout.vue", "MARKER_HIDDEN_DIR"],
+      ["src/.secret.ts", "MARKER_HIDDEN_FILE"],
+    ];
+    for (const [rel, content] of targets) {
+      const file = join(root, rel);
+      const c = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
+      expect(c.status, `candidate ${rel}`).toBe(403);
+      const rd = await readApi(file);
+      expect(rd.status, `files/read ${rel}`).toBe(403);
+      for (const m of MARKERS) expect(rd.text, `read ${rel} に ${m}`).not.toContain(m);
+      const w = await post("/api/files/write", { path: file, content: WRITE_BODY });
+      expect(w.status, `files/write ${rel}`).toBe(403);
+      await expectSourceHintRefused(file, content.replace("API_TOKEN=", ""), rel);
+    }
+    for (const m of MARKERS) expect(claudeSent(), `Claude に ${m}`).not.toContain(m);
+    for (const [rel, content] of targets) expect(sameContent(join(root, rel), content), `${rel} 不変`).toBe(true);
+  });
+
+  it("AC-2-7 apply_undo_redo_refuse_when_target_now_resolves_to_protected_path", async (ctx) => {
+    if (!symlinksOk) return ctx.skip(); // symlink 作成不可の環境(win32 EPERM)
+    const app_ = join(root, "src/App.tsx");
+    const gitDesc = join(root, ".git/description");
+    const swapToLink = () => {
+      unlinkSync(app_);
+      symlinkSync("../.git/description", app_);
+    };
+    const propose = async (): Promise<string> => {
+      claudeMock.complete.mockResolvedValueOnce(C1);
+      const r = await post("/api/edit/candidate", { file: app_, instruction: INSTRUCTION });
+      expect(r.status, `candidate: ${r.text.slice(0, 100)}`).toBe(200);
+      return r.json.proposalId as string;
+    };
+
+    // apply
+    writeFileSync(gitDesc, C0, "utf8");
+    const pid = await propose();
+    swapToLink();
+    const a = await post("/api/edit/apply", { proposalId: pid });
+    expect(a.status, "apply").toBe(403);
+    expect(readFileSync(gitDesc, "utf8"), "apply 後の .git/description").toBe(C0);
+
+    // undo
+    unlinkSync(app_);
+    writeFileSync(app_, C0, "utf8");
+    __stores.undoStack.splice(0);
+    __stores.redoStack.splice(0);
+    const pid2 = await propose();
+    expect((await post("/api/edit/apply", { proposalId: pid2 })).status, "通常 apply").toBe(200);
+    expect(readFileSync(app_, "utf8")).toBe(C1);
+    writeFileSync(gitDesc, C1, "utf8");
+    swapToLink();
+    const u = await post("/api/edit/undo", {});
+    expect(u.status, "undo").toBe(403);
+    expect(readFileSync(gitDesc, "utf8"), "undo 後の .git/description").toBe(C1);
+
+    // redo
+    unlinkSync(app_);
+    writeFileSync(app_, C1, "utf8");
+    __stores.undoStack.splice(0);
+    __stores.redoStack.splice(0);
+    writeFileSync(app_, C0, "utf8");
+    const pid3 = await propose();
+    expect((await post("/api/edit/apply", { proposalId: pid3 })).status, "redo 用 apply").toBe(200);
+    expect((await post("/api/edit/undo", {})).status, "redo 用 undo").toBe(200);
+    expect(readFileSync(app_, "utf8")).toBe(C0);
+    writeFileSync(gitDesc, C0, "utf8");
+    swapToLink();
+    const rr = await post("/api/edit/redo", {});
+    expect(rr.status, "redo").toBe(403);
+    expect(readFileSync(gitDesc, "utf8"), "redo 後の .git/description").toBe(C0);
+  });
+
+  it("AC-2-8 policy_is_relative_to_root_and_has_no_false_positives", async () => {
+    await stopProject();
+    const parent = mkRoot("uim-prot-parent-");
+    const root2 = join(parent, ".hidden-parent", "node_modules", "proj");
+    mkdirSync(root2, { recursive: true });
+    const real = realpathSync(root2);
+    const files: Array<[string, string]> = [
+      ["src/App.tsx", C0],
+      ["src/my.git.notes.md", "NOTES_GIT"],
+      ["src/gitignore.txt", "GITIGNORE"],
+      ["src/node_modules_readme.md", "NM_README"],
+      ["docs/v1.2/a.b.c.md", "DOTTED"],
+      ["src/git/x.txt", "GITDIR_NOT_DOT"],
+    ];
+    for (const [rel, content] of files) put(real, rel, content);
+    await openProject(real, { command: "echo test-server-ready" });
+
+    for (const [rel, content] of files) {
+      const p = join(real, rel);
+      const rd = await readApi(p);
+      expect(rd.status, `read ${rel}`).toBe(200);
+      expect(JSON.parse(rd.text).content, `read ${rel} content`).toBe(content);
+      const w = await post("/api/files/write", { path: p, content: `${content}!` });
+      expect(w.status, `write ${rel}`).toBe(200);
+      expect(readFileSync(p, "utf8"), `write ${rel} 反映`).toBe(`${content}!`);
+    }
+    writeFileSync(join(real, "src/App.tsx"), C0, "utf8");
+    claudeMock.complete.mockResolvedValueOnce(C1);
+    const c = await post("/api/edit/candidate", { file: join(real, "src/App.tsx"), instruction: INSTRUCTION });
+    expect(c.status, `candidate: ${c.text.slice(0, 100)}`).toBe(200);
+    const ap = await post("/api/edit/apply", { proposalId: c.json.proposalId });
+    expect(ap.status, "apply").toBe(200);
+    expect(readFileSync(join(real, "src/App.tsx"), "utf8")).toBe(C1);
+  });
+
+  it("AC-2-9 protected_name_aliases_are_rejected (条件付き: 別名が同実体を指す環境のみ)", async (ctx) => {
+    const cases: Array<[string, string]> = [];
+    const add = (p: string, marker: string) => cases.push([p, marker]);
+    // 大小文字無視 FS(macOS / win32)のみ。Linux ext4 では existsSync が false で skip される。
+    if (existsSync(join(root, ".GIT", "config"))) add(join(root, ".GIT", "config"), "MARKER_GIT_CONFIG");
+    if (existsSync(join(root, "NODE_MODULES", "pkg", "index.js"))) add(join(root, "NODE_MODULES", "pkg", "index.js"), "MARKER_NM");
+    if (process.platform === "win32") {
+      add(`${root}\\.git.\\config`, "MARKER_GIT_CONFIG");
+      add(`${root}\\.git \\config`, "MARKER_GIT_CONFIG");
+      add(`${root}\\node_modules.\\pkg\\index.js`, "MARKER_NM");
+      add(`${root}\\.git::$INDEX_ALLOCATION\\config`, "MARKER_GIT_CONFIG");
+      if (existsSync(`${root}\\GIT~1\\config`)) add(`${root}\\GIT~1\\config`, "MARKER_GIT_CONFIG");
+      if (existsSync(`${root}\\NODE_M~1\\pkg\\index.js`)) add(`${root}\\NODE_M~1\\pkg\\index.js`, "MARKER_NM");
+    }
+    if (cases.length === 0) return ctx.skip(); // この環境には該当する別名なし
+    for (const [p, marker] of cases) {
+      const rd = await readApi(p);
+      expect(rd.status, `read ${p}`).toBe(403);
+      expect(rd.text).not.toContain(marker);
+      const w = await post("/api/files/write", { path: p, content: WRITE_BODY });
+      expect(w.status, `write ${p}`).toBe(403);
+      const c = await post("/api/edit/candidate", { file: p, instruction: INSTRUCTION });
+      expect(c.status, `candidate ${p}`).toBe(403);
+    }
+    expect(claudeCallCount()).toBe(0);
+    expect(readFileSync(join(root, ".git/config"), "utf8")).toBe("MARKER_GIT_CONFIG");
+    expect(readFileSync(join(root, "node_modules/pkg/index.js"), "utf8")).toBe("MARKER_NM");
+  });
+});
