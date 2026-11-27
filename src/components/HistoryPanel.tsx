@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../lib/api.ts";
 import type { HistoryEntry } from "../lib/types.ts";
 
@@ -6,6 +6,12 @@ const kindIcon: Record<HistoryEntry["kind"], string> = {
   apply: "✓",
   undo: "↩",
   redo: "↪",
+};
+
+const kindLabel: Record<HistoryEntry["kind"], string> = {
+  apply: "適用",
+  undo: "元に戻す",
+  redo: "やり直し",
 };
 
 const kindColor: Record<HistoryEntry["kind"], string> = {
@@ -26,15 +32,44 @@ function formatTime(value: string) {
   ).padStart(2, "0")}`;
 }
 
-export function HistoryPanel() {
+interface Props {
+  /** 開いているプロジェクトの root。変わったら前の履歴を捨てて取得し直す */
+  root?: string;
+}
+
+export function HistoryPanel({ root }: Props) {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [offline, setOffline] = useState(false);
+  const [open, setOpen] = useState(false);
+  // 古いリクエストの遅い応答(切替前プロジェクトの履歴)で上書きしないための世代番号
+  const requestIdRef = useRef(0);
 
   const refresh = useCallback(() => {
+    const requestId = ++requestIdRef.current;
     api
       .editHistory()
-      .then((res) => setHistory(res.history))
-      .catch(() => {});
+      .then((res) => {
+        if (requestId !== requestIdRef.current) return;
+        setHistory(res.history);
+        setOffline(false);
+      })
+      .catch(() => {
+        if (requestId !== requestIdRef.current) return;
+        // 古い履歴を出し続けない
+        setHistory([]);
+        setOffline(true);
+      });
   }, []);
+
+  const mountedRoot = useRef(root);
+  useEffect(() => {
+    if (mountedRoot.current === root) return;
+    mountedRoot.current = root;
+    requestIdRef.current++;
+    setHistory([]);
+    setOffline(false);
+    if (open) refresh();
+  }, [root, open, refresh]);
 
   useEffect(() => {
     window.addEventListener("uim:applied", refresh);
@@ -45,6 +80,7 @@ export function HistoryPanel() {
     <details
       className="border-t border-neutral-800 bg-neutral-950 px-3 py-2 text-[11px] text-neutral-400"
       onToggle={(event) => {
+        setOpen(event.currentTarget.open);
         if (event.currentTarget.open) refresh();
       }}
     >
@@ -52,12 +88,20 @@ export function HistoryPanel() {
         編集履歴
       </summary>
       <div className="mt-2 max-h-36 space-y-1 overflow-y-auto">
-        {history.length === 0 ? (
+        {offline ? (
+          <div role="alert" className="text-red-300">
+            サーバに接続できません
+          </div>
+        ) : history.length === 0 ? (
           <div className="text-neutral-600">まだ編集はありません</div>
         ) : (
           history.map((entry) => (
             <div key={entry.id} className="flex items-start gap-1.5 rounded px-1 py-0.5 transition-colors duration-150 hover:bg-neutral-900">
-              <span className={`shrink-0 font-semibold ${kindColor[entry.kind]}`}>
+              <span
+                role="img"
+                aria-label={kindLabel[entry.kind]}
+                className={`shrink-0 font-semibold ${kindColor[entry.kind]}`}
+              >
                 {kindIcon[entry.kind]}
               </span>
               <div className="min-w-0 flex-1">

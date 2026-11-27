@@ -53,6 +53,9 @@ export function Chat({
   const [editModels, setEditModels] = useState<EditModel[]>([]);
   const [editModel, setEditModel] = useState("");
   const editModelRef = useRef("");
+  // 実行中の生成・適用・undo/redo を中止するためのコントローラ
+  const abortRef = useRef<AbortController | null>(null);
+  const [cancellable, setCancellable] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [generation, setGeneration] = useState<{
@@ -128,6 +131,25 @@ export function Chat({
     };
   }, []);
 
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  function beginAbortable() {
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setCancellable(true);
+    return ac;
+  }
+
+  function endAbortable(ac: AbortController) {
+    if (abortRef.current !== ac) return;
+    abortRef.current = null;
+    setCancellable(false);
+  }
+
+  function cancelCurrent() {
+    abortRef.current?.abort();
+  }
+
   function log(m: Msg) {
     setMsgs((prev) => [...prev, m]);
   }
@@ -186,6 +208,7 @@ export function Chat({
     log({ role: "user", text });
     setBusy(true);
     setGeneration({ stage: "resolving" });
+    const ac = beginAbortable();
     try {
       const result = await api.editStream(
         {
@@ -209,7 +232,8 @@ export function Chat({
               chars,
               tail,
             })),
-        }
+        },
+        { signal: ac.signal }
       );
       handleProposal(result, text);
       // 前の提案を戻すのは同じ要素への追い込み失敗だけ。別要素への指示や候補選択待ち
@@ -224,8 +248,10 @@ export function Chat({
         setProposal(previousProposal);
         setEditDescriptor(previousEditDescriptor);
       }
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
+      endAbortable(ac);
       setGeneration(null);
       setBusy(false);
     }
@@ -235,19 +261,23 @@ export function Chat({
     const desc = editDescriptor ?? selected;
     if (!desc || busy) return;
     setBusy(true);
+    const ac = beginAbortable();
     try {
       handleProposal(
         await api.editCandidate(
           c,
           desc,
           lastInstruction,
-          editModelRef.current || undefined
+          editModelRef.current || undefined,
+          ac.signal
         ),
         lastInstruction
       );
     } catch (e) {
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
+      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -255,8 +285,9 @@ export function Chat({
   async function apply() {
     if (!proposal?.proposalId || busy) return;
     setBusy(true);
+    const ac = beginAbortable();
     try {
-      const res = await api.applyEdit(proposal.proposalId);
+      const res = await api.applyEdit(proposal.proposalId, ac.signal);
       if (res.ok) {
         log({
           role: "system",
@@ -273,9 +304,11 @@ export function Chat({
         // proposal を保持したまま → 再試行可能
       }
     } catch (e) {
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました（サーバ側で処理が済んでいる場合があります。編集履歴で確認してください）" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       // proposal を保持したまま → 再試行可能
     } finally {
+      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -298,8 +331,9 @@ export function Chat({
   async function undo() {
     if (busy || undoDepth <= 0) return;
     setBusy(true);
+    const ac = beginAbortable();
     try {
-      const res = await api.undoEdit();
+      const res = await api.undoEdit(ac.signal);
       if (res.ok) {
         log({
           role: "system",
@@ -320,11 +354,13 @@ export function Chat({
         }
       }
     } catch (e) {
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました（サーバ側で処理が済んでいる場合があります。編集履歴で確認してください）" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshUndoDepth().catch((statusError) => {
         console.error(statusError);
       });
     } finally {
+      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -332,8 +368,9 @@ export function Chat({
   async function redo() {
     if (busy || redoDepth <= 0) return;
     setBusy(true);
+    const ac = beginAbortable();
     try {
-      const res = await api.redoEdit();
+      const res = await api.redoEdit(ac.signal);
       if (res.ok) {
         log({
           role: "system",
@@ -350,11 +387,13 @@ export function Chat({
         });
       }
     } catch (e) {
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました（サーバ側で処理が済んでいる場合があります。編集履歴で確認してください）" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
       await refreshDepths().catch((statusError) => {
         console.error(statusError);
       });
     } finally {
+      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -548,6 +587,15 @@ export function Chat({
             ))}
           </div>
         ) : null}
+        {cancellable && (
+          <button
+            type="button"
+            onClick={cancelCurrent}
+            className="cursor-pointer rounded-md border border-neutral-700 bg-neutral-800 px-2.5 py-1 text-xs text-neutral-300 transition-colors duration-150 hover:border-neutral-600 hover:bg-neutral-700"
+          >
+            中止
+          </button>
+        )}
 
         {hasPendingSuggestion && editDescriptor && (
           <div className="rounded-lg border border-neutral-800 bg-neutral-900 px-2.5 py-2 text-xs text-neutral-400">

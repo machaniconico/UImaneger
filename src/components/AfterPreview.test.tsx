@@ -27,7 +27,7 @@ describe("AfterPreview", () => {
     const { rerender } = render(<AfterPreview info={runningInfo} reloadKey={0} />);
 
     expect(screen.getByRole("status").textContent).toContain("起動中...");
-    fireEvent.load(screen.getByTitle("after"));
+    fireEvent.load(screen.getByTitle("変更後プレビュー"));
     expect(screen.queryByText("起動中...")).toBeNull();
 
     rerender(<AfterPreview info={runningInfo} reloadKey={1} />);
@@ -50,7 +50,7 @@ describe("AfterPreview", () => {
 
     render(<AfterPreview info={runningInfo} />);
 
-    fireEvent.load(screen.getByTitle("after"));
+    fireEvent.load(screen.getByTitle("変更後プレビュー"));
     act(() => {
       vi.advanceTimersByTime(LOAD_TIMEOUT_MS + 5000);
     });
@@ -70,5 +70,10 @@ describe("AfterPreview", () => {
     expect(screen.getByRole("alert").textContent).toContain(
       "対象アプリに接続できません — 起動ログを確認してください"
     );
+  });
+
+  it("稼働中は緑点に視覚外テキスト「稼働中」を持つ", () => {
+    render(<AfterPreview info={runningInfo} />);
+    expect(screen.getByText("稼働中")).not.toBeNull();
   });
 });

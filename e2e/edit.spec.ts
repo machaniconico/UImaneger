@@ -5,8 +5,8 @@ import { apiKey, editedHeading, model, originalHeading, relFile, test } from "./
 const instruction = `見出しを「${editedHeading}」に変更して`;
 
 test("opens, selects, proposes, applies and undoes an edit with live HMR", async ({ app, page, context }) => {
-  const before = page.frameLocator('iframe[title="before"]');
-  const live = page.frameLocator('iframe[title="after"]');
+  const before = page.frameLocator('iframe[title="編集前プレビュー"]');
+  const live = page.frameLocator('iframe[title="変更後プレビュー"]');
   const log = page.getByRole("log");
   const input = page.getByRole("textbox", { name: "編集指示" });
   const apply = page.getByRole("button", { name: "承認して適用" });
@@ -48,7 +48,7 @@ test("opens, selects, proposes, applies and undoes an edit with live HMR", async
   // Vite は HMR で更新するため、適用・undo でも iframe は作り直さない。別タブ(observer)でも
   // 見出しの更新とカウンタの保持を確認し、Fast Refresh で反映されていることを示す。
   const observer = await context.newPage();
-  const observerIframe = observer.locator('iframe[title="after"]');
+  const observerIframe = observer.locator('iframe[title="変更後プレビュー"]');
   const hmr = observerIframe.contentFrame();
   const connectedHmrHosts = new Set<string>();
   observer.on("websocket", (socket) => {

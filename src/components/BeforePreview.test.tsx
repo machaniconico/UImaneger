@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { BeforePreview } from "./BeforePreview";
+import { LOAD_TIMEOUT_MS } from "./AfterPreview";
 import type { ProjectInfo } from "../lib/types";
 
 const runningInfo: ProjectInfo = {
@@ -18,7 +19,10 @@ const runningInfo: ProjectInfo = {
 };
 
 describe("BeforePreview", () => {
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
 
   it("iframe の load まで起動中 overlay を表示する", () => {
     render(
@@ -26,7 +30,7 @@ describe("BeforePreview", () => {
     );
 
     expect(screen.getByRole("status").textContent).toContain("起動中...");
-    fireEvent.load(screen.getByTitle("before"));
+    fireEvent.load(screen.getByTitle("編集前プレビュー"));
     expect(screen.queryByText("起動中...")).toBeNull();
   });
 
@@ -71,4 +75,52 @@ describe("BeforePreview", () => {
     ).toBeNull();
   });
 
+
+  it("時間内に load しなければ接続エラー overlay と再読込ボタンを表示する", () => {
+    vi.useFakeTimers();
+    render(<BeforePreview info={runningInfo} selectMode={false} onSelect={() => {}} />);
+
+    act(() => {
+      vi.advanceTimersByTime(LOAD_TIMEOUT_MS);
+    });
+
+    expect(screen.getByRole("alert").textContent).toContain(
+      "対象アプリに接続できません — 起動ログを確認してください"
+    );
+    fireEvent.click(screen.getByRole("button", { name: "再読込" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("起動中...");
+  });
+
+  it("iframe が時間内に load したらエラーを出さない", () => {
+    vi.useFakeTimers();
+    render(<BeforePreview info={runningInfo} selectMode={false} onSelect={() => {}} />);
+
+    fireEvent.load(screen.getByTitle("編集前プレビュー"));
+    act(() => {
+      vi.advanceTimersByTime(LOAD_TIMEOUT_MS + 5000);
+    });
+
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("停止中(running=false)は接続エラーに上書きしない", () => {
+    vi.useFakeTimers();
+    render(
+      <BeforePreview
+        info={{ ...runningInfo, running: false }}
+        selectMode={false}
+        onSelect={() => {}}
+      />
+    );
+    act(() => {
+      vi.advanceTimersByTime(LOAD_TIMEOUT_MS + 1000);
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("稼働中は緑点に視覚外テキスト「稼働中」を持つ", () => {
+    render(<BeforePreview info={runningInfo} selectMode={false} onSelect={() => {}} />);
+    expect(screen.getByText("稼働中")).not.toBeNull();
+  });
 });

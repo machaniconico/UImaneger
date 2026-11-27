@@ -114,7 +114,10 @@ export function GitPanel({ info }: Props) {
         )}
 
         {available && error && (
-          <div className="whitespace-pre-wrap rounded bg-red-950/50 px-2 py-1 text-red-300">
+          <div
+            role="alert"
+            className="whitespace-pre-wrap rounded bg-red-950/50 px-2 py-1 text-red-300"
+          >
             {error}
           </div>
         )}
