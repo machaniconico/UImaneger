@@ -457,6 +457,7 @@ describeIfLoopback("proxy transport fidelity", () => {
     const defaultSource = "default-src https://cdn.example";
     const scriptSources = "script-src 'none'; script-src-elem https://cdn.example";
     const upstream = http.createServer((req, res) => {
+      // nosemgrep: ajinabraham.njsscan.headers.header_injection.generic_header_injection -- req.url は CSP の選択にだけ使い、ヘッダ値はテスト内の固定文字列
       res.writeHead(200, {
         "content-type": "application/javascript",
         "content-security-policy":
