@@ -3,13 +3,14 @@
 // 実プロセス・実ポートを使う node 環境テスト。jsdom 不要。
 import { describe, it, expect } from "vitest";
 import http from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   isListening,
   findFreePort,
   startTarget,
+  TargetStartupError,
   sleep,
   killGroup,
   killAllChildrenSync,
@@ -206,6 +207,42 @@ describe("startTarget", () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it.skipIf(!hasLoopback || process.platform === "win32")(
+    "stops a surviving process group when the target exits before readiness",
+    async () => {
+      const tmp = mkdtempSync(join(tmpdir(), "uim-runner-early-exit-"));
+      const childInfo = join(tmp, "child.json");
+      writeFileSync(join(tmp, "launcher.cjs"), `
+        const child = require("node:child_process").fork("server.cjs");
+        child.on("message", (port) => {
+          require("node:fs").writeFileSync("child.json", JSON.stringify({ pid: child.pid, port }));
+          process.exit(42);
+        });
+      `);
+      writeFileSync(join(tmp, "server.cjs"), `
+        const server = require("node:http").createServer();
+        server.listen(0, "127.0.0.1", () => process.send(server.address().port));
+      `);
+      try {
+        await expect(startTarget(tmp, 0, { command: "exec node launcher.cjs" }))
+          .rejects.toThrow(TargetStartupError);
+        const { port } = JSON.parse(readFileSync(childInfo, "utf8"));
+        expect(await waitUntilFalse(() => isListening(port), 3_000)).toBe(true);
+      } catch (error) {
+        try {
+          const { pid } = JSON.parse(readFileSync(childInfo, "utf8"));
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // 子が作成される前に失敗したか、既に停止している。
+        }
+        throw error;
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    },
+    15_000
+  );
 
   itIfLoopback("starts an auto-detected Vite target through the platform command shim", async () => {
     const root = join(process.cwd(), "examples", "sample-app");

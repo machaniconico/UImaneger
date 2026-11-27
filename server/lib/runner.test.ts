@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  detectRunner,
   detectRunnerFromFacts,
   extractPort,
   extractPortForRunnerOutput,
@@ -212,6 +213,122 @@ describe("detectRunnerFromFacts — 非 Node プロジェクト判別", () => {
 });
 
 describe("readFacts — backend project markers", () => {
+  it("prefers executable project Python in .venv, then venv, for Django", () => {
+    const root = mkdtempSync(join(tmpdir(), "uim-django-runner-"));
+    const [bin, executable] = process.platform === "win32"
+      ? ["Scripts", "python.exe"]
+      : ["bin", "python"];
+    const previousPath = process.env.PATH;
+    const fakeBin = mkdtempSync(join(tmpdir(), "uim-fake-bin-"));
+    try {
+      // ホストの PATH に依存しないよう、python だけがある PATH に固定する。
+      writeFileSync(join(fakeBin, "python"), "", { mode: 0o755 });
+      process.env.PATH = fakeBin;
+      writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+      expect(detectRunner(root, 8000).command).toBe("python");
+
+      const venv = join(root, "venv", bin);
+      const dotVenv = join(root, ".venv", bin);
+      const venvPython = join(venv, executable);
+      const dotVenvPython = join(dotVenv, executable);
+      mkdirSync(venv, { recursive: true });
+      mkdirSync(dotVenv, { recursive: true });
+      writeFileSync(venvPython, "", { mode: 0o755 });
+      mkdirSync(dotVenvPython);
+      expect(detectRunner(root, 8000).command).toBe(venvPython);
+
+      rmSync(dotVenvPython, { recursive: true });
+      writeFileSync(dotVenvPython, "", { mode: 0o755 });
+      expect(detectRunner(root, 8000).command).toBe(dotVenvPython);
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(fakeBin, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "falls back to python3 when no venv exists and only python3 is on PATH",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "uim-django-python3-"));
+      const fakeBin = mkdtempSync(join(tmpdir(), "uim-fake-bin-"));
+      const previousPath = process.env.PATH;
+      try {
+        writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+        writeFileSync(join(fakeBin, "python3"), "", { mode: 0o755 });
+        process.env.PATH = fakeBin;
+        expect(detectRunner(root, 8000).command).toBe("python3");
+
+        // python が PATH にあればそれを優先する(実行権限のないファイルは数えない)
+        writeFileSync(join(fakeBin, "python"), "", { mode: 0o644 });
+        expect(detectRunner(root, 8000).command).toBe("python3");
+        chmodSync(join(fakeBin, "python"), 0o755);
+        expect(detectRunner(root, 8000).command).toBe("python");
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+        rmSync(fakeBin, { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "resolves empty and relative PATH entries against the project root",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "uim-django-relpath-"));
+      const previousPath = process.env.PATH;
+      try {
+        writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+        writeFileSync(join(root, "python3"), "", { mode: 0o755 });
+        process.env.PATH = ":/nonexistent";
+        expect(detectRunner(root, 8000).command).toBe("python3");
+        mkdirSync(join(root, "bin"));
+        rmSync(join(root, "python3"));
+        writeFileSync(join(root, "bin", "python3"), "", { mode: 0o755 });
+        process.env.PATH = "bin";
+        expect(detectRunner(root, 8000).command).toBe("python3");
+
+        // PATH 未定義は「既定パス」で、プロジェクト直下は探さない
+        delete process.env.PATH;
+        const hostHasPython = existsSync("/usr/bin/python") || existsSync("/bin/python");
+        const hostHasPython3 = existsSync("/usr/bin/python3") || existsSync("/bin/python3");
+        expect(detectRunner(root, 8000).command).toBe(
+          !hostHasPython && hostHasPython3 ? "python3" : "python"
+        );
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+        else process.env.PATH = previousPath;
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "skips non-executable and dangling venv interpreters",
+    () => {
+      const root = mkdtempSync(join(tmpdir(), "uim-django-badvenv-"));
+      const fakeBin = mkdtempSync(join(tmpdir(), "uim-fake-bin-"));
+      const previousPath = process.env.PATH;
+      try {
+        writeFileSync(join(root, "manage.py"), "DJANGO_SETTINGS_MODULE\nexecute_from_command_line\n");
+        writeFileSync(join(fakeBin, "python"), "", { mode: 0o755 });
+        process.env.PATH = fakeBin;
+        mkdirSync(join(root, ".venv", "bin"), { recursive: true });
+        writeFileSync(join(root, ".venv", "bin", "python"), "", { mode: 0o644 });
+        mkdirSync(join(root, "venv", "bin"), { recursive: true });
+        symlinkSync(join(root, "missing-python"), join(root, "venv", "bin", "python"));
+        expect(detectRunner(root, 8000).command).toBe("python");
+      } finally {
+        if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+        rmSync(fakeBin, { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+
   it("reads Spring Boot, ASP.NET Core, and Phoenix markers from project files", () => {
     const root = mkdtempSync(join(tmpdir(), "uim-runner-facts-"));
     try {

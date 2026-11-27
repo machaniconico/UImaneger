@@ -24,7 +24,8 @@
     "verify": "npm run policy && node scripts/third-party-notices.mjs --check && npm run typecheck && npm run test:ci && npm run build",
     "audit": "npm audit --audit-level=moderate",
     "e2e": "playwright test",
-    "notices": "node scripts/third-party-notices.mjs"
+    "notices": "node scripts/third-party-notices.mjs",
+    "runtime-matrix": "node --import tsx scripts/runtime-matrix.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.106.0",

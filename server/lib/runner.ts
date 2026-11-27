@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { delimiter, join, resolve } from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { buildChildEnv } from "./child-env.ts";
@@ -38,6 +38,7 @@ export interface ProjectFacts {
   hasGemfile: boolean;
   hasRailsBin: boolean;
   hasManagePy: boolean;
+  djangoPython?: string;
   hasGoMod: boolean;
   hasGoMain: boolean;
   hasComposerJson: boolean;
@@ -86,7 +87,7 @@ export function detectRunnerFromFacts(
   if (facts.hasManagePy) {
     return {
       framework: "Django",
-      command: "python",
+      command: facts.djangoPython ?? "python",
       args: ["manage.py", "runserver", String(port)],
       knownPort: true,
     };
@@ -345,6 +346,40 @@ function hasGoEntrypoint(root: string): boolean {
   return /^\s*package\s+main\b/m.test(source) && /\bfunc\s+main\s*\(/m.test(source);
 }
 
+function findProjectPython(root: string): string | undefined {
+  const interpreter = process.platform === "win32" ? ["Scripts", "python.exe"] : ["bin", "python"];
+  for (const directory of [".venv", "venv"]) {
+    const path = resolve(root, directory, ...interpreter);
+    try {
+      if (!statSync(path).isFile()) continue;
+      accessSync(path, constants.X_OK);
+      return path;
+    } catch {
+      // 実行できる Python が見つかるまで次の候補を調べる。
+    }
+  }
+  // venv が無い POSIX 環境では `python` が無く `python3` だけのディストリビューション(Ubuntu 等)が多い。
+  if (process.platform !== "win32" && !isOnPath("python", root) && isOnPath("python3", root)) {
+    return "python3";
+  }
+}
+
+/** POSIX の PATH 探索。空要素と相対要素は spawn の cwd(プロジェクト root)基準で解決する。 */
+function isOnPath(command: string, cwd: string): boolean {
+  // PATH 未定義時は spawn(execvp)と同じく既定の探索パスを使う。空文字列は「cwd のみ」を意味する。
+  for (const directory of (process.env.PATH ?? "/usr/bin:/bin").split(delimiter)) {
+    try {
+      const path = resolve(cwd, directory || ".", command);
+      if (!statSync(path).isFile()) continue;
+      accessSync(path, constants.X_OK);
+      return true;
+    } catch {
+      // 次の PATH 要素へ
+    }
+  }
+  return false;
+}
+
 /** ファイルシステムから ProjectFacts を構築する。 */
 export function readFacts(root: string): ProjectFacts {
   const pkg = readPkg(root);
@@ -358,6 +393,9 @@ export function readFacts(root: string): ProjectFacts {
   ].join("\n");
   const mix = readProjectText(root, "mix.exs");
   const managePy = readProjectText(root, "manage.py");
+  const hasManagePy =
+    /DJANGO_SETTINGS_MODULE/.test(managePy) &&
+    /execute_from_command_line/.test(managePy);
   return {
     hasPackageJson: pkg != null,
     packageManager: detectPackageManager(root, pkg?.packageManager).name,
@@ -369,9 +407,8 @@ export function readFacts(root: string): ProjectFacts {
     pkgName: pkg?.name,
     hasGemfile: existsSync(join(root, "Gemfile")),
     hasRailsBin: existsSync(join(root, "bin/rails")),
-    hasManagePy:
-      /DJANGO_SETTINGS_MODULE/.test(managePy) &&
-      /execute_from_command_line/.test(managePy),
+    hasManagePy,
+    djangoPython: hasManagePy ? findProjectPython(root) : undefined,
     hasGoMod: existsSync(join(root, "go.mod")),
     hasGoMain: hasGoEntrypoint(root),
     hasComposerJson: existsSync(join(root, "composer.json")),
@@ -447,6 +484,16 @@ export interface RunningTarget {
   /** 実際に待受を確認できたループバックアドレス。 */
   host?: LoopbackHost;
   logs: string[];
+}
+
+export class TargetStartupError extends Error {
+  readonly target: RunningTarget;
+
+  constructor(message: string, target: RunningTarget) {
+    super(message);
+    this.name = "TargetStartupError";
+    this.target = target;
+  }
 }
 
 export type LoopbackHost = "127.0.0.1" | "::1";
@@ -699,6 +746,10 @@ export async function startTarget(
   }
 
   let detectedPort = plan.knownPort ? port : 0;
+  const failStartup = async (message: string): Promise<never> => {
+    await killGroup(proc);
+    throw new TargetStartupError(message, { proc, plan, port: detectedPort || port, logs });
+  };
   const appendLog = (line: string) => {
     logs.push(line);
     if (logs.length > 500) logs.shift();
@@ -739,17 +790,16 @@ export async function startTarget(
       // spawn 直後の失敗: pid が無ければプロセスグループ kill は意味を持たず、
       // 発火しない exit イベントを待ってブロックすると即 reject すべきテストが
       // 壊れるため、best-effort/非ブロッキングで抜ける。
-      if (proc.pid) signalGroup(proc, "SIGTERM");
-      throw new Error(
-        `${plan.command} を起動できません: ${spawnErrorMessage}`
-      );
+      const message = `${plan.command} を起動できません: ${spawnErrorMessage}`;
+      if (proc.pid) return failStartup(message);
+      throw new Error(message);
     }
     if (hasExited(proc)) {
       const exitDetail =
         proc.exitCode !== null
           ? `exit ${proc.exitCode}`
           : `signal ${proc.signalCode ?? "unknown"}`;
-      throw new Error(
+      return failStartup(
         `対象の起動に失敗しました (${exitDetail}).\n` +
           logs.slice(-15).join("\n")
       );
@@ -766,8 +816,7 @@ export async function startTarget(
     await sleep(300);
   }
   // deadline 超過: プロセスグループを確実に停止してから reject。
-  await killGroup(proc);
-  throw new Error(
+  return failStartup(
     "対象 dev server が時間内に起動しませんでした。\n" + logs.slice(-15).join("\n")
   );
 }

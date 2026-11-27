@@ -25,7 +25,7 @@ UImaneger は、信頼できるコードをローカルで扱う単一ユーザ�
 - Backend: Rails、Django、Laravel、PHP、Go、Spring Boot Maven/Gradle、ASP.NET Core、Phoenix
 - Static: 同梱の read-only HTTP server
 
-汎用ライブラリをサーバとして誤起動しないため、Go はルートの `package main` と `func main`、PHP は `index.php`、Django は標準的な `manage.py` を要求します。
+汎用ライブラリをサーバとして誤起動しないため、Go はルートの `package main` と `func main`、PHP は `index.php`、Django は標準的な `manage.py` を要求します。Django はプロジェクト直下の `.venv`、`venv`、PATH 上の `python` の順に起動用の Python を選びます。
 
 Node の package manager は `packageManager`、pnpm/Yarn/Bun lockfile、npm fallback の順で決めます。Windows の `.cmd`/`.bat` と package-manager shim は `cmd.exe` 経由で起動します。待受は `127.0.0.1` と `::1` の実アドレスを確認し、既存 listener を対象プロセスと誤認しません。
 
@@ -101,7 +101,8 @@ Node dependency install は lifecycle script を無効化し、5 分 timeout で
 - Runtime integration: Vite + React sample、generic Node server、bundled static server、proxy HTTP/WebSocket/streaming
 - Unit/integration: framework plan、package manager、resolver、API proposal/apply/undo、security middleware、React UI
 - Build gate: package policy、TypeScript、selftests、Vitest、Vite production build
-- Not automated: real Anthropic request、browser click-to-edit full flow、Rails/Django/PHP/Go/Java/.NET/Elixir runtime matrix、installer/signing
+- Runtime matrix は `npm run runtime-matrix` で本体の自動起動、HTTP 応答、プロセスツリーとポートの解放を検証します。Vite + React、Create React App、Vue CLI、Angular は配信 JavaScript 内のマーカーも検証します。2026-11-27 の WSL2 / Node 22 での実測は 19 PASS、2 SKIP、0 FAIL です。SKIP の Rails と Phoenix は fixture あり・実プロセス未実行です。CI 対象は README の対応範囲を参照してください。
+- Not automated: real Anthropic request、browser click-to-edit full flow、installer/signing
 
 ## Commercial Status
 
