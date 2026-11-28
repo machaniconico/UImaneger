@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           npx vitest run tests/acceptance --reporter=json --outputFile=acceptance-report.json
-          node -e "const r=require('./acceptance-report.json'); const s=r.numPendingTests+r.numTodoTests; if (s) { console.error('skipped acceptance tests: '+s); process.exit(1); } console.log('acceptance: '+r.numPassedTests+' passed, 0 skipped');"
+          node scripts/acceptance-gate.mjs acceptance-report.json
   e2e:
     strategy:
       fail-fast: false
