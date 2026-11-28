@@ -172,6 +172,48 @@ describe("prepareBefore / cleanup", () => {
     20_000
   );
 
+  it.skipIf(process.platform === "win32")(
+    "does not serve outside the worktree when HEAD has the opened subdirectory as a symlink",
+    async (ctx) => {
+      if (!gitAvailable()) {
+        ctx.skip();
+        return;
+      }
+      const base = mkdtempSync(join(tmpdir(), "uim-wt-escape-"));
+      const repo = join(base, "repo");
+      const outside = join(base, "outside");
+      try {
+        mkdirSync(repo);
+        mkdirSync(outside);
+        writeFileSync(join(outside, "index.html"), "<h1>OUTSIDE</h1>");
+        writeFileSync(join(repo, "index.html"), "<h1>REPO ROOT</h1>");
+        // HEAD では app → 外部ディレクトリの symlink
+        symlinkSync(outside, join(repo, "app"));
+        if (!gitInitAndCommit(repo)) {
+          ctx.skip();
+          return;
+        }
+        // 作業ツリーでは app を通常のディレクトリに置き換える(未コミット)
+        rmSync(join(repo, "app"));
+        mkdirSync(join(repo, "app"));
+        writeFileSync(join(repo, "app", "index.html"), "<h1>APP</h1>");
+
+        const h = prepareBefore(join(repo, "app"));
+        try {
+          expect(h.mode).not.toBe("worktree");
+          if (h.dir) {
+            expect(readFileSync(join(h.dir, "index.html"), "utf8")).not.toBe("<h1>OUTSIDE</h1>");
+          }
+        } finally {
+          cleanup(h);
+        }
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+    20_000
+  );
+
   it("degrades to snapshot or none (no throw) when the dir is not a git repo", () => {
     const root = mkdtempSync(join(tmpdir(), "uim-nogit-"));
     try {

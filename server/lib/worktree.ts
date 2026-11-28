@@ -177,18 +177,15 @@ export function prepareBefore(root: string): BeforeHandle {
         const gitRoot = top.ok ? resolve(top.out) : absRoot;
         // git は実体パスを返す(macOS の /var → /private/var、Windows の 8.3 短縮名 RUNNER~1 の展開)。
         // 字面のまま比べると relative が ".." 始まりになり、サブディレクトリでも worktree 全体を配信してしまう。
-        const real = (p: string) => {
-          try {
-            return realpathSync.native(p);
-          } catch {
-            return p;
-          }
-        };
-        const rel = relative(real(gitRoot), real(absRoot));
-        const beforeDir =
-          rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
-            ? join(wtDir, rel)
-            : wtDir;
+        // 解決できない・範囲外なら worktree を諦めて snapshot に落とす(広い範囲を配信しない)。
+        const isOutside = (r: string) =>
+          r === ".." || r.startsWith(`..${sep}`) || isAbsolute(r);
+        const rel = relative(realpathSync.native(gitRoot), realpathSync.native(absRoot));
+        if (isOutside(rel)) throw new Error("project is not inside its git toplevel");
+        const beforeDir = rel ? join(wtDir, rel) : wtDir;
+        // HEAD 側で途中のディレクトリが symlink(例: app → /outside)だと worktree の外を配信してしまう
+        const relInWt = relative(realpathSync.native(wtDir), realpathSync.native(beforeDir));
+        if (isOutside(relInWt)) throw new Error("before dir escapes the worktree");
         writeWorktreeSourceMarker(wtDir, gitRoot);
         // 依存解決のため node_modules を symlink:
         //  - git ルート側 (モノレポ/hoisted 依存) を worktree ルートへ
