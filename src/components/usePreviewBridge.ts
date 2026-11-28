@@ -46,12 +46,16 @@ function restoreFocusToChat(): () => void {
 
 /** 候補テキストから制御文字・双方向制御文字を除く(読み上げ領域・表示の汚染防止) */
 function stripUnsafeText(v: string): string {
-  return v.replace(
-    // 制御文字、ALM(U+061C)、ゼロ幅・方向マーク(U+200B-200F)、埋め込み/上書き(U+202A-202E)、
-    // 不可視演算子・方向分離(U+2060-206F)、BOM(U+FEFF)
-    /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g,
-    ""
-  );
+  return v
+    .replace(
+      // 制御文字(改行・タブ U+0009-000D は単語区切りとして残す)、ALM(U+061C)、ゼロ幅・方向マーク(U+200B-200F)、
+      // 埋め込み/上書き(U+202A-202E)、不可視演算子・方向分離(U+2060-206F)、BOM(U+FEFF)
+      /[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g,
+      ""
+    )
+    // \s は U+FEFF にも一致するので、不可視文字の除去の後で空白を正規化する
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /**

@@ -287,6 +287,17 @@ describe("usePreviewBridge", () => {
       textarea.remove();
     });
 
+    it("受信側でも改行・タブは空白 1 つにし、不可視文字だけを除く", () => {
+      const onCandidate = vi.fn();
+      const { iframe } = mountWithIframe({ selectMode: true }, { onCandidate });
+      dispatchMessage(
+        EXPECTED_ORIGIN,
+        { type: "uim:hover-candidate", tag: "h1", text: "a\u061Cb\uFEFFc\td\ne" },
+        iframe.contentWindow
+      );
+      expect(onCandidate).toHaveBeenCalledWith({ tag: "h1", text: "abc d e" });
+    });
+
     it("選択モードを抜けた後に遅れて届いた uim:select は確定しない", () => {
       const onSelect = vi.fn();
       const { iframe, rerender } = mountWithIframe({ selectMode: true }, { onSelect });
