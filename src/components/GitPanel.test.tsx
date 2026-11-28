@@ -153,4 +153,13 @@ describe("GitPanel", () => {
     expect(screen.queryByText("src/OldApp.tsx")).toBeNull();
     expect(screen.getByText("src/NewApp.tsx")).not.toBeNull();
   });
+
+  it("エラー表示は role=alert で読み上げられる", async () => {
+    vi.mocked(api.gitStatus).mockRejectedValue(new Error("git が失敗しました"));
+
+    render(<GitPanel info={info} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("git が失敗しました");
+  });
 });

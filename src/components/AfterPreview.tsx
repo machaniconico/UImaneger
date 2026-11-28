@@ -66,6 +66,7 @@ export function AfterPreview({ info, reloadKey = 0 }: Props) {
                 : "bg-neutral-600"
             }`}
           />
+          {info?.running && <span className="sr-only">稼働中</span>}
           <span>変更後 (ライブ)</span>
         </div>
         {url && (
@@ -87,7 +88,7 @@ export function AfterPreview({ info, reloadKey = 0 }: Props) {
             key={`${reloadKey}-${manualReload}`}
             ref={iframeRef}
             src={url}
-            title="after"
+            title="変更後プレビュー"
             onLoad={() => {
               clearLoadTimeout();
               setLoaded(true);

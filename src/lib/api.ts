@@ -5,6 +5,37 @@ import type {
   HistoryEntry,
   ProjectInfo,
 } from "./types.ts";
+import { SERVER_UNREACHABLE_MESSAGE, isNetworkError } from "./network.ts";
+
+/** ステータス取得のタイムアウト(超えたら接続不可として扱う) */
+export const STATUS_TIMEOUT_MS = 10_000;
+/** 編集ストリームが何も受信しない時間の上限 */
+export const STREAM_IDLE_TIMEOUT_MS = 120_000;
+
+function abortError(): DOMException {
+  return new DOMException("中止しました", "AbortError");
+}
+
+export function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+/** fetch の通信失敗を日本語の案内にする(中断・その他はそのまま)。 */
+function translateFetchError(error: unknown): unknown {
+  return isNetworkError(error) ? new Error(SERVER_UNREACHABLE_MESSAGE) : error;
+}
+
+/** ステータスコード別の日本語メッセージ。サーバが分かる日本語を返していればそれを優先する。 */
+function httpErrorMessage(status: number, serverError: string): string {
+  const english = new Set(["forbidden", "unsupported media type"]);
+  if (serverError && !english.has(serverError.toLowerCase())) return serverError;
+  if (status === 403)
+    return "この操作は許可されていません（HTTP 403）。アクセス元のオリジンを確認してください";
+  if (status === 413) return "送信内容が大きすぎます（HTTP 413）";
+  if (status === 415) return "対応していない形式のリクエストです（HTTP 415）";
+  if (status >= 500) return `サーバでエラーが発生しました（HTTP ${status}）`;
+  return `リクエストに失敗しました（HTTP ${status}）`;
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -56,30 +87,96 @@ async function parseJson<T>(res: Response): Promise<T> {
     } catch {
       // ボディ読み取り失敗は status のみを表示する
     }
-    throw new ApiError(
-      serverError || `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}`,
-      {
-        status: res.status,
-        statusText: res.statusText,
-        serverError,
-        bodyText,
-      }
-    );
+    throw new ApiError(httpErrorMessage(res.status, serverError), {
+      status: res.status,
+      statusText: res.statusText,
+      serverError,
+      bodyText,
+    });
   }
   try {
     return (await res.json()) as T;
-  } catch (e: any) {
-    throw new Error(`HTTP ${res.status}: invalid JSON (${e?.message || e})`);
+  } catch {
+    throw new Error(`サーバの応答を解析できませんでした（HTTP ${res.status}）`);
   }
 }
 
-async function post<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
+/** GET。通信失敗だけ日本語の案内にする。timeoutMs 指定時は超過で「接続できません」扱い。 */
+async function get<T>(url: string, timeoutMs?: number): Promise<T> {
+  const controller = timeoutMs ? new AbortController() : undefined;
+  let timedOut = false;
+  const timer = controller
+    ? setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs)
+    : undefined;
+  try {
+    const res = controller
+      ? await fetch(url, { signal: controller.signal })
+      : await fetch(url);
+    return await parseJson<T>(res);
+  } catch (e) {
+    if (timedOut) throw new Error(SERVER_UNREACHABLE_MESSAGE);
+    throw translateFetchError(e);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+interface PostOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+/**
+ * POST。サーバ側で書き込みが完了し得る操作(apply / undo / redo / open / clone)は
+ * 中止もタイムアウトも付けない(表示と実状態がずれるため)。
+ * 書き込みを伴わない生成系だけ options で signal / timeoutMs を渡す。
+ */
+async function post<T>(
+  url: string,
+  body: unknown,
+  options: PostOptions = {}
+): Promise<T> {
+  const { signal, timeoutMs } = options;
+  const init: RequestInit = {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  });
-  return parseJson<T>(res);
+  };
+  if (!signal && !timeoutMs) {
+    try {
+      return await parseJson<T>(await fetch(url, init));
+    } catch (e) {
+      throw translateFetchError(e);
+    }
+  }
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = timeoutMs
+    ? setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs)
+    : undefined;
+  const onAbort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    return await parseJson<T>(res);
+  } catch (e) {
+    if (timedOut)
+      throw new Error(
+        `サーバの応答がありません（${(timeoutMs ?? 0) / 1000}秒でタイムアウトしました）`
+      );
+    if (signal?.aborted) throw abortError();
+    throw translateFetchError(e);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 export interface StatusResp {
@@ -117,33 +214,78 @@ export interface EditStreamHandlers {
   onProgress: (event: { chars: number; tail: string }) => void;
 }
 
+export interface EditStreamOptions {
+  /** 呼び出し側からの中止用 */
+  signal?: AbortSignal;
+}
+
 async function editStream(
   body: EditStreamBody,
-  handlers: EditStreamHandlers
+  handlers: EditStreamHandlers,
+  options: EditStreamOptions = {}
 ): Promise<EditProposal> {
-  const res = await fetch("/api/edit/stream", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+  const controller = new AbortController();
+  let idleTimedOut = false;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  // fetch・read のどちらが待機中でも中断を即座に伝えるため、abort を reject する Promise と競わせる
+  let rejectAborted!: (reason: unknown) => void;
+  const aborted = new Promise<never>((_, reject) => {
+    rejectAborted = reject;
   });
-  if (!res.ok) {
-    let detail = "";
-    try {
-      detail = (await res.text()).trim();
-    } catch {
-      // status だけでも十分に診断できるメッセージを返す
-    }
-    throw new Error(
-      `編集ストリームの開始に失敗しました（HTTP ${res.status}${
-        detail ? `: ${detail}` : ""
-      }）`
-    );
-  }
-  if (!res.body) {
-    throw new Error("編集ストリームの応答本文を読み取れませんでした");
-  }
+  aborted.catch(() => {});
+  const fail = (reason: unknown) => {
+    controller.abort();
+    rejectAborted(reason);
+  };
+  const resetIdle = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimedOut = true;
+      fail(
+        new Error(
+          `編集ストリームが${STREAM_IDLE_TIMEOUT_MS / 1000}秒間何も受信しなかったため中断しました`
+        )
+      );
+    }, STREAM_IDLE_TIMEOUT_MS);
+  };
+  const onAbort = () => fail(abortError());
+  if (options.signal?.aborted) onAbort();
+  else options.signal?.addEventListener("abort", onAbort, { once: true });
+  resetIdle();
 
-  const reader = res.body.getReader();
+  try {
+    let res: Response;
+    try {
+      res = await Promise.race([
+        fetch("/api/edit/stream", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        }),
+        aborted,
+      ]);
+    } catch (e) {
+      throw idleTimedOut || isAbortError(e) ? e : translateFetchError(e);
+    }
+    // 通常 POST と同じエラー整形(JSON の error だけを出す・日本語化)を使う
+    if (!res.ok) await parseJson<never>(res);
+    if (!res.body) {
+      throw new Error("編集ストリームの応答本文を読み取れませんでした");
+    }
+    return await readEditStream(res.body.getReader(), handlers, aborted, resetIdle);
+  } finally {
+    clearTimeout(idleTimer);
+    options.signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function readEditStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  handlers: EditStreamHandlers,
+  aborted: Promise<never>,
+  onChunk: () => void
+): Promise<EditProposal> {
   const decoder = new TextDecoder();
   let buffer = "";
   let result: EditProposal | undefined;
@@ -190,7 +332,8 @@ async function editStream(
 
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      onChunk();
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       let boundary = buffer.search(/\r?\n\r?\n/);
       while (boundary >= 0) {
@@ -219,10 +362,9 @@ export interface GitStatusResp {
 }
 
 export const api = {
-  getModels: (): Promise<ModelsResp> =>
-    fetch("/api/models").then((r) => parseJson<ModelsResp>(r)),
+  getModels: (): Promise<ModelsResp> => get<ModelsResp>("/api/models"),
   status: (): Promise<StatusResp> =>
-    fetch("/api/status").then((r) => parseJson<StatusResp>(r)),
+    get<StatusResp>("/api/status", STATUS_TIMEOUT_MS),
   open: (path: string, runCommand?: string) =>
     post<{ info?: ProjectInfo; error?: string }>("/api/project/open", {
       path,
@@ -245,15 +387,20 @@ export const api = {
     candidate: Candidate,
     descriptor: DomDescriptor,
     instruction: string,
-    model?: string
+    model?: string,
+    signal?: AbortSignal
   ) =>
-    post<EditProposal>("/api/edit/candidate", {
-      file: candidate.file,
-      line: candidate.line,
-      descriptor,
-      instruction,
-      ...(model ? { model } : {}),
-    }),
+    post<EditProposal>(
+      "/api/edit/candidate",
+      {
+        file: candidate.file,
+        line: candidate.line,
+        descriptor,
+        instruction,
+        ...(model ? { model } : {}),
+      },
+      { signal, timeoutMs: STREAM_IDLE_TIMEOUT_MS }
+    ),
   /** 提案を適用(実書き込み)。 */
   applyEdit: (proposalId: string) =>
     post<{
@@ -277,7 +424,7 @@ export const api = {
       {}
     ),
   gitStatus: (): Promise<GitStatusResp> =>
-    fetch("/api/git/status").then((r) => parseJson<GitStatusResp>(r)),
+    get<GitStatusResp>("/api/git/status"),
   gitCommit: (message: string) =>
     post<{ ok: boolean }>("/api/git/commit", { message }),
   redoEdit: () =>
@@ -288,8 +435,5 @@ export const api = {
       undoDepth?: number;
       redoDepth?: number;
     }>("/api/edit/redo", {}),
-  editHistory: () =>
-    fetch("/api/edit/history").then((r) =>
-      parseJson<{ history: HistoryEntry[] }>(r)
-    ),
+  editHistory: () => get<{ history: HistoryEntry[] }>("/api/edit/history"),
 };

@@ -12,8 +12,10 @@ vi.mock("./lib/api", () => ({
 }));
 
 vi.mock("./components/ProjectBar.tsx", () => ({
-  ProjectBar: ({ info, hasKey, selectMode, setSelectMode }: any) => (
+  ProjectBar: ({ info, hasKey, selectMode, setSelectMode, onError, onWarning }: any) => (
     <section aria-label="project-bar">
+      <button onClick={() => onError("エラー本文")}>emit-error</button>
+      <button onClick={() => onWarning("警告本文")}>emit-warning</button>
       <div>project:{info?.name ?? "none"}</div>
       <div>has-key:{String(hasKey)}</div>
       <button onClick={() => setSelectMode(!selectMode)}>
@@ -65,7 +67,7 @@ vi.mock("./components/GitPanel.tsx", () => ({
 }));
 
 vi.mock("./components/HistoryPanel.tsx", () => ({
-  HistoryPanel: () => <section aria-label="history-panel" />,
+  HistoryPanel: ({ root }: any) => <section aria-label="history-panel">history-root:{root ?? "none"}</section>,
 }));
 
 vi.mock("./components/StatusPanel.tsx", () => ({
@@ -177,5 +179,49 @@ describe("App", () => {
     expect(hasDevServerHmr("React Router", "npx react-router dev --port 6100")).toBe(true);
     // 起動設定で任意コマンドを指定した場合は framework が "custom" になり再読込する
     expect(hasDevServerHmr("custom", "node server.js")).toBe(false);
+  });
+
+  it("起動時の通信失敗は英語の Failed to fetch でなく日本語で案内し、再試行で復旧できる", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.status).mockRejectedValue(new TypeError("Failed to fetch"));
+
+    render(<App />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000);
+    });
+
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("サーバに接続できません");
+    expect(alert.textContent).toContain("npm run dev");
+    expect(alert.textContent).not.toContain("Failed to fetch");
+
+    vi.mocked(api.status).mockResolvedValue({ info, hasKey: true, logs: [], undoDepth: 0 });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "再試行" }));
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("button", { name: "再試行" })).toBeNull();
+    expect(screen.getByText("project:demo")).not.toBeNull();
+  });
+
+  it("エラー帯は role=alert、warning は赤いエラーでなく role=status の警告で表示する", async () => {
+    vi.mocked(api.status).mockResolvedValue({ info, hasKey: true, logs: [], undoDepth: 0 });
+    render(<App />);
+    await screen.findByText("project:demo");
+
+    fireEvent.click(screen.getByText("emit-warning"));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status").textContent).toContain("警告本文");
+
+    fireEvent.click(screen.getByText("emit-error"));
+    expect(screen.getByRole("alert").textContent).toContain("エラー本文");
+  });
+
+  it("現在のプロジェクト root を HistoryPanel に渡す", async () => {
+    vi.mocked(api.status).mockResolvedValue({ info, hasKey: true, logs: [], undoDepth: 0 });
+    render(<App />);
+    expect(await screen.findByText("history-root:/demo")).not.toBeNull();
   });
 });

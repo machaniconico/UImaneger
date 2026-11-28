@@ -42,6 +42,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     setBusy: vi.fn(),
     onInfo: vi.fn(),
     onError: vi.fn(),
+    onWarning: vi.fn(),
     selectMode: false,
     setSelectMode: vi.fn(),
     ...overrides,
@@ -250,7 +251,10 @@ describe("ProjectBar.stop()", () => {
     await user.click(screen.getByRole("button", { name: "Clone & 起動" }));
 
     await waitFor(() => expect(props.onInfo).toHaveBeenCalledWith(runningInfo));
-    expect(props.onError).toHaveBeenLastCalledWith(
+    expect(props.onWarning).toHaveBeenLastCalledWith(
+      "依存関係のインストールに失敗しました"
+    );
+    expect(props.onError).not.toHaveBeenCalledWith(
       "依存関係のインストールに失敗しました"
     );
   });
@@ -280,5 +284,11 @@ describe("ProjectBar.stop()", () => {
     expect(message).toBe("指定されたパスを開けませんでした");
     expect(message).not.toContain("HTTP 400:");
     if (originalFetch) vi.stubGlobal("fetch", originalFetch);
+  });
+
+  it("停止中(他操作の busy)に「起動中…」を出さず、開く操作中だけ出す", async () => {
+    setup({ busy: true });
+    expect(screen.queryByText("起動中…")).toBeNull();
+    expect(screen.getByRole("button", { name: "開く" })).not.toBeNull();
   });
 });

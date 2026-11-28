@@ -112,8 +112,9 @@ describe("Chat", () => {
 
     expect(api.editStream).toHaveBeenCalledWith(
       { descriptor, instruction: "赤くして", model: "claude-sonnet-5" },
-      expect.any(Object)
-    );
+      expect.any(Object),
+      { signal: expect.any(AbortSignal) }
+);
   });
 
   it("保存済みモデルが無効ならサーバー既定値へ戻す", async () => {
@@ -138,8 +139,9 @@ describe("Chat", () => {
     expect(screen.queryByRole("combobox", { name: "編集モデル" })).toBeNull();
     expect(api.editStream).toHaveBeenCalledWith(
       { descriptor, instruction: "赤くして" },
-      expect.any(Object)
-    );
+      expect.any(Object),
+      { signal: expect.any(AbortSignal) }
+);
   });
 
   it("指示送信 → api.editStream が EditProposal を返し DiffView に差分表示(まだ applyEdit は呼ばれない)", async () => {
@@ -158,8 +160,9 @@ describe("Chat", () => {
       expect.objectContaining({
         onStage: expect.any(Function),
         onProgress: expect.any(Function),
-      })
-    );
+      }),
+      { signal: expect.any(AbortSignal) }
+);
     expect(await screen.findByText("承認して適用")).not.toBeNull();
     await waitFor(() =>
       expect(screen.getByRole("log").textContent).toContain(
@@ -196,8 +199,9 @@ describe("Chat", () => {
           instruction: "赤くして",
           model: "claude-opus-4-8",
         },
-        expect.any(Object)
-      )
+        expect.any(Object),
+      { signal: expect.any(AbortSignal) }
+)
     );
   });
 
@@ -250,8 +254,9 @@ describe("Chat", () => {
         previousProposalId: "pending-1",
         model: "claude-opus-4-8",
       },
-      expect.any(Object)
-    );
+      expect.any(Object),
+      { signal: expect.any(AbortSignal) }
+);
   });
 
   it.each([
@@ -353,6 +358,34 @@ describe("Chat", () => {
     expect(screen.queryByRole("button", { name: /redo/ })).toBeNull();
   });
 
+  it.each(["成功", "失敗"] as const)(
+    "初回の status が適用より後に%sしても、適用で確定した undo/redo の件数を上書きしない",
+    async (outcome) => {
+      const user = userEvent.setup();
+      let settleStatus!: () => void;
+      vi.mocked(api.status).mockReturnValueOnce(
+        new Promise((resolve, reject) => {
+          settleStatus = () =>
+            outcome === "成功"
+              ? resolve({ info: null, hasKey: true, logs: [], undoDepth: 0, redoDepth: 0 })
+              : reject(new Error("サーバに接続できません"));
+        })
+      );
+      vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+      vi.mocked(api.applyEdit).mockResolvedValue({ ok: true, relFile: "src/App.tsx", undoDepth: 1 });
+      render(<Chat selected={descriptor} hasKey={true} />);
+
+      await sendInstruction(user, "赤くして");
+      await user.click(await screen.findByRole("button", { name: "承認して適用" }));
+      expect(await screen.findByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
+
+      await act(async () => {
+        settleStatus();
+      });
+      expect(screen.getByRole("button", { name: /undo \(1\)/ })).not.toBeNull();
+    }
+  );
+
   // ★最重要: apply 失敗時の回帰テスト(Codex確認済みの修正)
   it("api.applyEdit が ok:false を返したとき proposal を保持し再試行可能・busy解除される", async () => {
     const user = userEvent.setup();
@@ -450,8 +483,9 @@ describe("Chat", () => {
       candidate,
       descriptor,
       "赤くして",
-      "claude-opus-4-8"
-    );
+      "claude-opus-4-8",
+      expect.any(AbortSignal)
+);
   });
 
   it("undo ボタンで api.undoEdit が呼ばれる", async () => {
@@ -647,8 +681,9 @@ describe("Chat", () => {
       candidate,
       otherDescriptor,
       "青くして",
-      "claude-opus-4-8"
-    );
+      "claude-opus-4-8",
+      expect.any(AbortSignal)
+);
   });
 
   it("候補確定の要求にも選択中の編集モデルを載せる", async () => {
@@ -669,8 +704,9 @@ describe("Chat", () => {
       candidate,
       descriptor,
       "赤くして",
-      "claude-haiku-4-5"
-    );
+      "claude-haiku-4-5",
+      expect.any(AbortSignal)
+);
   });
 
   it("選択要素が変わっても保留中提案は生成時 descriptor を参照し、不一致ヒントを表示する", async () => {
@@ -803,5 +839,76 @@ describe("App", () => {
     expect(screen.getByTestId("project-bar").textContent).toBe("Retry Project:key");
     expect(screen.queryByText(/temporary status failure/)).toBeNull();
     expect(status).toHaveBeenCalledTimes(2);
+  });
+
+  describe("中止ボタン", () => {
+    function pendingUntilAbort() {
+      return (_body: unknown, _handlers: unknown, opts?: { signal?: AbortSignal }) =>
+        new Promise<never>((_resolve, reject) => {
+          opts?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("aborted", "AbortError"))
+          );
+        });
+    }
+
+    it("busy 中だけ「中止」が出て、押すと中止ログを出し busy を戻す", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.editStream).mockImplementation(pendingUntilAbort() as any);
+      render(<Chat selected={descriptor} hasKey={true} />);
+
+      expect(screen.queryByRole("button", { name: "中止" })).toBeNull();
+      await sendInstruction(user, "赤くして");
+      const stop = await screen.findByRole("button", { name: "中止" });
+      await user.click(stop);
+
+      expect(await screen.findByText("中止しました")).not.toBeNull();
+      expect(screen.queryByRole("button", { name: "中止" })).toBeNull();
+      const textarea = screen.getByRole("textbox", { name: "編集指示" }) as HTMLTextAreaElement;
+      expect(textarea.disabled).toBe(false);
+      expect(textarea.value).toBe("赤くして");
+    });
+
+    it("適用・undo・redo 中は中止ボタンを出さず、signal も渡さない", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.status).mockResolvedValue({
+        info: null, hasKey: true, logs: [], undoDepth: 1, redoDepth: 1,
+      });
+      vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+      vi.mocked(api.applyEdit).mockReturnValue(new Promise<never>(() => {}));
+      vi.mocked(api.undoEdit).mockReturnValue(new Promise<never>(() => {}));
+      render(<Chat selected={descriptor} hasKey={true} />);
+
+      await user.click(await screen.findByRole("button", { name: /undo/ }));
+      expect(api.undoEdit).toHaveBeenCalledWith();
+      expect(screen.queryByRole("button", { name: "中止" })).toBeNull();
+    });
+
+    it("適用中は中止ボタンが出ない", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.editStream).mockResolvedValue(goodProposal());
+      vi.mocked(api.applyEdit).mockReturnValue(new Promise<never>(() => {}));
+      render(<Chat selected={descriptor} hasKey={true} />);
+
+      await sendInstruction(user, "赤くして");
+      await user.click(await screen.findByRole("button", { name: "承認して適用" }));
+      expect(api.applyEdit).toHaveBeenCalledWith("p1");
+      expect(screen.queryByRole("button", { name: "中止" })).toBeNull();
+    });
+
+    it("別要素への生成を中止しても前要素の提案が混ざらない", async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.editStream).mockResolvedValueOnce(goodProposal());
+      const { rerender } = render(<Chat selected={descriptor} hasKey={true} />);
+      await sendInstruction(user, "赤くして");
+      await screen.findByRole("button", { name: "承認して適用" });
+
+      vi.mocked(api.editStream).mockImplementation(pendingUntilAbort() as any);
+      rerender(<Chat selected={otherDescriptor} hasKey={true} />);
+      await sendInstruction(user, "青くして");
+      await user.click(await screen.findByRole("button", { name: "中止" }));
+      await screen.findByText("中止しました");
+      expect(screen.queryByRole("button", { name: "承認して適用" })).toBeNull();
+      expect(screen.queryByText(/提案対象/)).toBeNull();
+    });
   });
 });

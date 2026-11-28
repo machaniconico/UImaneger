@@ -50,9 +50,14 @@ export function Chat({
   const [lastInstruction, setLastInstruction] = useState("");
   const [undoDepth, setUndoDepth] = useState(0);
   const [redoDepth, setRedoDepth] = useState(0);
+  /** 操作の応答で undo/redo 件数を更新するたびに進める(初回 status の古い結果を捨てるため) */
+  const depthVersionRef = useRef(0);
   const [editModels, setEditModels] = useState<EditModel[]>([]);
   const [editModel, setEditModel] = useState("");
   const editModelRef = useRef("");
+  // 実行中の生成・適用・undo/redo を中止するためのコントローラ
+  const abortRef = useRef<AbortController | null>(null);
+  const [cancellable, setCancellable] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [generation, setGeneration] = useState<{
@@ -109,24 +114,42 @@ export function Chat({
 
   useEffect(() => {
     let alive = true;
+    // 初回取得より後に適用・undo・redo の応答で件数が確定していたら、古い取得結果では上書きしない
+    const versionAtStart = depthVersionRef.current;
+    const isStale = () => !alive || depthVersionRef.current !== versionAtStart;
     api
       .status()
       .then((s) => {
-        if (alive) {
-          setUndoDepth(s.undoDepth ?? 0);
-          setRedoDepth(s.redoDepth ?? 0);
-        }
+        if (isStale()) return;
+        setUndoDepth(s.undoDepth ?? 0);
+        setRedoDepth(s.redoDepth ?? 0);
       })
       .catch(() => {
-        if (alive) {
-          setUndoDepth(0);
-          setRedoDepth(0);
-        }
+        // 取得に失敗しても件数は初期値 0 のまま。後から確定した値を 0 で消さない
       });
     return () => {
       alive = false;
     };
   }, []);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  function beginAbortable() {
+    const ac = new AbortController();
+    abortRef.current = ac;
+    setCancellable(true);
+    return ac;
+  }
+
+  function endAbortable(ac: AbortController) {
+    if (abortRef.current !== ac) return;
+    abortRef.current = null;
+    setCancellable(false);
+  }
+
+  function cancelCurrent() {
+    abortRef.current?.abort();
+  }
 
   function log(m: Msg) {
     setMsgs((prev) => [...prev, m]);
@@ -134,11 +157,13 @@ export function Chat({
 
   async function refreshUndoDepth() {
     const s = await api.status();
+    depthVersionRef.current++;
     setUndoDepth(s.undoDepth ?? 0);
   }
 
   async function refreshDepths() {
     const s = await api.status();
+    depthVersionRef.current++;
     setUndoDepth(s.undoDepth ?? 0);
     setRedoDepth(s.redoDepth ?? 0);
   }
@@ -186,6 +211,7 @@ export function Chat({
     log({ role: "user", text });
     setBusy(true);
     setGeneration({ stage: "resolving" });
+    const ac = beginAbortable();
     try {
       const result = await api.editStream(
         {
@@ -209,7 +235,8 @@ export function Chat({
               chars,
               tail,
             })),
-        }
+        },
+        { signal: ac.signal }
       );
       handleProposal(result, text);
       // 前の提案を戻すのは同じ要素への追い込み失敗だけ。別要素への指示や候補選択待ち
@@ -224,8 +251,10 @@ export function Chat({
         setProposal(previousProposal);
         setEditDescriptor(previousEditDescriptor);
       }
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
+      endAbortable(ac);
       setGeneration(null);
       setBusy(false);
     }
@@ -235,19 +264,23 @@ export function Chat({
     const desc = editDescriptor ?? selected;
     if (!desc || busy) return;
     setBusy(true);
+    const ac = beginAbortable();
     try {
       handleProposal(
         await api.editCandidate(
           c,
           desc,
           lastInstruction,
-          editModelRef.current || undefined
+          editModelRef.current || undefined,
+          ac.signal
         ),
         lastInstruction
       );
     } catch (e) {
-      log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
+      if (ac.signal.aborted) log({ role: "system", text: "中止しました" });
+      else log({ role: "system", ok: false, text: "✗ " + getErrorMessage(e) });
     } finally {
+      endAbortable(ac);
       setBusy(false);
     }
   }
@@ -263,6 +296,7 @@ export function Chat({
           ok: true,
           text: `✓ ${res.relFile || proposal.relFile} に適用しました`,
         });
+        depthVersionRef.current++;
         setUndoDepth((depth) => res.undoDepth ?? depth + 1);
         setRedoDepth(0);
         window.dispatchEvent(new CustomEvent("uim:applied"));
@@ -307,11 +341,13 @@ export function Chat({
           text: `↩ ${res.relFile || ""} を元に戻しました`,
         });
         window.dispatchEvent(new CustomEvent("uim:applied"));
+        depthVersionRef.current++;
         setUndoDepth(res.undoDepth ?? 0);
         setRedoDepth((depth) => res.redoDepth ?? depth + 1);
       } else {
         log({ role: "system", ok: false, text: "✗ " + (res.error || "undo失敗") });
         if (res.undoDepth != null) {
+          depthVersionRef.current++;
           setUndoDepth(res.undoDepth);
         } else {
           await refreshUndoDepth().catch((statusError) => {
@@ -341,6 +377,7 @@ export function Chat({
           text: `↪ ${res.relFile || ""} をやり直しました`,
         });
         window.dispatchEvent(new CustomEvent("uim:applied"));
+        depthVersionRef.current++;
         setUndoDepth((depth) => res.undoDepth ?? depth + 1);
         setRedoDepth(res.redoDepth ?? 0);
       } else {
@@ -548,6 +585,15 @@ export function Chat({
             ))}
           </div>
         ) : null}
+        {cancellable && (
+          <button
+            type="button"
+            onClick={cancelCurrent}
+            className="cursor-pointer rounded-md border border-neutral-700 bg-neutral-800 px-2.5 py-1 text-xs text-neutral-300 transition-colors duration-150 hover:border-neutral-600 hover:bg-neutral-700"
+          >
+            中止
+          </button>
+        )}
 
         {hasPendingSuggestion && editDescriptor && (
           <div className="rounded-lg border border-neutral-800 bg-neutral-900 px-2.5 py-2 text-xs text-neutral-400">

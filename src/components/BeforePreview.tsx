@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { DomDescriptor, ProjectInfo } from "../lib/types.ts";
 import { PreviewOverlay } from "./PreviewOverlay.tsx";
+import { LOAD_TIMEOUT_MS } from "./AfterPreview.tsx";
 import { usePreviewBridge } from "./usePreviewBridge.ts";
 
 interface Props {
@@ -12,6 +13,8 @@ interface Props {
 /** 中央ペイン: 編集前(HEAD)。要素選択の基準はこちら。 */
 export function BeforePreview({ info, selectMode, onSelect }: Props) {
   const [loaded, setLoaded] = useState(false);
+  const [manualReload, setManualReload] = useState(0);
+  const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const url =
     info?.beforeProxyPort != null
       ? `http://localhost:${info.beforeProxyPort}/`
@@ -31,10 +34,28 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
     onSelect,
   });
 
+  const clearLoadTimeout = () => {
+    if (loadTimeoutRef.current != null) {
+      clearTimeout(loadTimeoutRef.current);
+      loadTimeoutRef.current = null;
+    }
+  };
+
   useEffect(() => {
+    clearLoadTimeout();
     setLoaded(false);
     setLoadFailed(false);
-  }, [url]);
+    // 停止中(running===false)はタイムアウトを張らず「停止中」表示を接続エラーで上書きしない
+    if (!url || info?.running === false) return;
+
+    loadTimeoutRef.current = setTimeout(() => {
+      setLoaded(false);
+      setLoadFailed(true);
+      loadTimeoutRef.current = null;
+    }, LOAD_TIMEOUT_MS);
+
+    return clearLoadTimeout;
+  }, [url, manualReload, info?.running]);
 
   return (
     <div className="relative flex h-full w-full flex-col bg-white">
@@ -47,8 +68,22 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
                 : "bg-neutral-600"
             }`}
           />
+          {info?.running && <span className="sr-only">稼働中</span>}
           <span>編集前 (HEAD)</span>
         </div>
+        <div className="flex items-center gap-2">
+        {url && (
+          <button
+            onClick={() => {
+              setLoaded(false);
+              setLoadFailed(false);
+              setManualReload((n) => n + 1);
+            }}
+            className="rounded-md px-2 py-1 text-[10px] text-neutral-400 hover:bg-raised hover:text-neutral-200"
+          >
+            再読込
+          </button>
+        )}
         {info?.gitMode && (
           <span className="text-[10px] text-neutral-500">
             {info.gitMode === "worktree"
@@ -58,6 +93,7 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
               : "git無し(後と同一)"}
           </span>
         )}
+        </div>
       </div>
       <div className="relative min-h-0 flex-1">
         {selectMode && (
@@ -67,10 +103,15 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
         )}
         {url ? (
           <iframe
+            key={manualReload}
             ref={iframeRef}
             src={url}
-            title="before"
-            onLoad={() => setLoaded(true)}
+            title="編集前プレビュー"
+            onLoad={() => {
+              clearLoadTimeout();
+              setLoaded(true);
+              setLoadFailed(false);
+            }}
             onError={() => setLoadFailed(true)}
             className="h-full w-full border-0"
           />

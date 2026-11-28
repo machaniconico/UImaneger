@@ -9,6 +9,8 @@ interface Props {
   setBusy: (b: boolean) => void;
   onInfo: (i: ProjectInfo | null) => void;
   onError: (m: string) => void;
+  /** clone 後の依存インストール失敗など、続行できる警告(赤いエラーにしない) */
+  onWarning: (m: string) => void;
   selectMode: boolean;
   setSelectMode: (b: boolean) => void;
 }
@@ -20,11 +22,14 @@ export function ProjectBar({
   setBusy,
   onInfo,
   onError,
+  onWarning,
   selectMode,
   setSelectMode,
 }: Props) {
   const [value, setValue] = useState("");
   const [runCommand, setRunCommand] = useState("");
+  // 「起動中…」は開く/clone 操作中だけ。停止など他操作の busy では出さない
+  const [opening, setOpening] = useState(false);
 
   const isRepo = /^(https?:\/\/|ssh:\/\/|git:\/\/|git@)/.test(value.trim());
 
@@ -41,7 +46,9 @@ export function ProjectBar({
     const v = value.trim();
     if (!v || busy) return;
     setBusy(true);
+    setOpening(true);
     onError("");
+    onWarning("");
     try {
       const command = runCommand.trim() || undefined;
       const res = isRepo
@@ -56,12 +63,13 @@ export function ProjectBar({
           "warning" in res && typeof res.warning === "string"
             ? res.warning
             : undefined;
-        if (warning) onError(warning);
+        if (warning) onWarning(warning);
       }
     } catch (e) {
       onError(getErrorMessage(e));
       await reconcileInfo();
     } finally {
+      setOpening(false);
       setBusy(false);
     }
   }
@@ -122,7 +130,7 @@ export function ProjectBar({
           disabled={busy}
           className="shrink-0 border-l border-neutral-700 bg-accent-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-accent-500 disabled:opacity-50"
         >
-          {busy ? "起動中…" : isRepo ? "Clone & 起動" : "開く"}
+          {opening ? "起動中…" : isRepo ? "Clone & 起動" : "開く"}
         </button>
       </div>
       <details className="group border-t border-neutral-800 pt-2">

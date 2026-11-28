@@ -18,14 +18,31 @@ function classify(logs: string[]): string | null {
 
 export function StatusPanel() {
   const [st, setSt] = useState<StatusResp | null>(null);
+  // 取得に失敗している間は古い running / API key OK を出さない。復旧は次のポーリングで自動で戻る
+  const [offline, setOffline] = useState(false);
 
   useEffect(() => {
     let alive = true;
-    const tick = () =>
+    // 前回の取得が未完了(api 側の 10 秒タイムアウト待ち)の間は次を発行しない。
+    // 未完了 GET の積み上がりと、応答順の逆転で古い成功が新しい失敗を消すのを防ぐ
+    let inFlight = false;
+    const tick = () => {
+      if (inFlight) return;
+      inFlight = true;
       api
         .status()
-        .then((s) => alive && setSt(s))
-        .catch(() => {});
+        .then((s) => {
+          if (!alive) return;
+          setSt(s);
+          setOffline(false);
+        })
+        .catch(() => {
+          if (alive) setOffline(true);
+        })
+        .finally(() => {
+          inFlight = false;
+        });
+    };
     tick();
     const t = setInterval(tick, 3000);
     return () => {
@@ -34,8 +51,8 @@ export function StatusPanel() {
     };
   }, []);
 
-  const info = st?.info;
-  const logs = st?.logs ?? [];
+  const info = offline ? null : st?.info;
+  const logs = offline ? [] : st?.logs ?? [];
   const hint = classify(logs);
 
   const gitModeLabel: Record<string, string> = {
@@ -48,12 +65,22 @@ export function StatusPanel() {
     <div className="border-t border-neutral-800 bg-neutral-950 px-3 py-2 text-[11px] text-neutral-400">
       <div className="mb-1 flex items-center justify-between">
         <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">ステータス</span>
+        {offline ? (
+          <span className="rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-medium text-red-400 ring-1 ring-inset ring-red-500/20">
+            接続不可
+          </span>
+        ) : (
         <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${st?.hasKey ? "bg-green-500/10 text-green-400 ring-green-500/20" : "bg-red-500/10 text-red-400 ring-red-500/20"}`}>
           {st?.hasKey ? "API key OK" : "API key 未設定"}
         </span>
+        )}
       </div>
 
-      {info ? (
+      {offline ? (
+        <div role="alert" className="rounded bg-red-950/50 px-2 py-1 text-red-300">
+          サーバに接続できません
+        </div>
+      ) : info ? (
         <div className="space-y-0.5">
           <div>
             FW: <span className="text-neutral-300">{info.framework}</span>

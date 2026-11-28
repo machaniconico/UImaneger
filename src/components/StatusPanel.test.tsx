@@ -85,4 +85,67 @@ describe("StatusPanel", () => {
     });
     expect(api.status).toHaveBeenCalledTimes(3);
   });
+
+  it("ステータス取得が失敗したら古い running / API key OK を消して「サーバに接続できません」を出す", async () => {
+    render(<StatusPanel />);
+    await flushInitial();
+    expect(screen.getByText(/running/)).not.toBeNull();
+
+    vi.mocked(api.status).mockRejectedValue(new Error("Failed to fetch"));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+
+    expect(screen.getByRole("alert").textContent).toContain("サーバに接続できません");
+    expect(screen.queryByText(/running/)).toBeNull();
+    expect(screen.queryByText("API key OK")).toBeNull();
+  });
+
+  it("接続が復旧したら自動で通常表示に戻る", async () => {
+    vi.mocked(api.status).mockRejectedValueOnce(new Error("Failed to fetch"));
+    render(<StatusPanel />);
+    await flushInitial();
+    expect(screen.getByRole("alert").textContent).toContain("サーバに接続できません");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("API key OK")).not.toBeNull();
+    expect(screen.getByText(/running/)).not.toBeNull();
+  });
+
+  it("前回の取得が未完了なら次のポーリングを飛ばし、未完了 GET を積み上げない", async () => {
+    vi.mocked(api.status).mockReturnValue(new Promise<never>(() => {}));
+    render(<StatusPanel />);
+    await flushInitial();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(9000);
+    });
+
+    expect(api.status).toHaveBeenCalledTimes(1);
+  });
+
+  it("タイムアウト(reject)後は次のポーリングで再取得して復旧する", async () => {
+    let rejectFirst!: (e: Error) => void;
+    vi.mocked(api.status).mockReturnValueOnce(
+      new Promise<never>((_, reject) => {
+        rejectFirst = reject;
+      })
+    );
+    render(<StatusPanel />);
+    await flushInitial();
+    await act(async () => {
+      rejectFirst(new Error("サーバに接続できません"));
+    });
+    expect(screen.getByRole("alert").textContent).toContain("サーバに接続できません");
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(api.status).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
 });
