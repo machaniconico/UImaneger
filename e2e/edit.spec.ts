@@ -23,6 +23,20 @@ test("opens, selects, proposes, applies and undoes an edit with live HMR", async
     await expect(live.getByRole("heading", { name: originalHeading, exact: true })).toBeVisible();
   });
 
+  await test.step("Select the heading with the keyboard only", async () => {
+    await page.getByRole("button", { name: "要素を選択" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("button", { name: "選択中…" })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByText(/矢印キーで移動、Enter で選択、Esc で終了/)).toBeVisible();
+    // 初期候補は #root。↓ で外側 div → カード → 見出しへ降りる。
+    for (let i = 0; i < 3; i++) await page.keyboard.press("ArrowDown");
+    await expect(page.locator('[aria-live="polite"]').filter({ hasText: `h1 "${originalHeading}"` })).toBeAttached();
+    await page.keyboard.press("Enter");
+    await expect(page.getByText("<h1>", { exact: true })).toBeVisible();
+    await expect(input).toBeEnabled();
+    await expect(input).toBeFocused();
+  });
+
   await test.step("Select the heading in the before iframe", async () => {
     await page.getByRole("button", { name: "要素を選択" }).click();
     await expect(page.getByRole("button", { name: "選択中…" })).toHaveAttribute("aria-pressed", "true");

@@ -156,6 +156,7 @@ export function ProjectBar({
           <div className="flex items-center gap-2">
             <button
               onClick={() => setSelectMode(!selectMode)}
+              data-uim-select-button
               aria-pressed={selectMode}
               disabled={busy}
               className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium ${

@@ -8,10 +8,13 @@ interface Props {
   info: ProjectInfo | null;
   selectMode: boolean;
   onSelect: (d: DomDescriptor) => void;
+  /** iframe 内で Esc により選択モードが取り消された */
+  onCancel?: () => void;
 }
 
 /** 中央ペイン: 編集前(HEAD)。要素選択の基準はこちら。 */
-export function BeforePreview({ info, selectMode, onSelect }: Props) {
+export function BeforePreview({ info, selectMode, onSelect, onCancel }: Props) {
+  const [candidate, setCandidate] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [manualReload, setManualReload] = useState(0);
   const loadTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -32,7 +35,13 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
     selectMode,
     acceptSelect: true,
     onSelect,
+    onCancel,
+    onCandidate: (c) => setCandidate(c.text ? `${c.tag} "${c.text}"` : c.tag),
   });
+
+  useEffect(() => {
+    if (!selectMode) setCandidate("");
+  }, [selectMode]);
 
   const clearLoadTimeout = () => {
     if (loadTimeoutRef.current != null) {
@@ -98,9 +107,12 @@ export function BeforePreview({ info, selectMode, onSelect }: Props) {
       <div className="relative min-h-0 flex-1">
         {selectMode && (
           <div className="pointer-events-none absolute left-1/2 top-3 z-10 -translate-x-1/2 rounded-full bg-accent-600 px-3 py-1 text-xs text-white shadow-lg shadow-accent-950/20">
-            選択モード: 変更したい要素をクリック
+            選択モード: クリック、または 矢印キーで移動、Enter で選択、Esc で終了
           </div>
         )}
+        <div aria-live="polite" className="sr-only">
+          {candidate}
+        </div>
         {url ? (
           <iframe
             key={manualReload}

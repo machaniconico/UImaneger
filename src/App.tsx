@@ -190,6 +190,7 @@ export function App() {
           info={info}
           selectMode={selectMode}
           onSelect={onSelect}
+          onCancel={() => setSelectMode(false)}
         />
       </main>
 

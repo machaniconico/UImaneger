@@ -492,9 +492,7 @@
     if (index < 0) index = delta < 0 ? 0 : -1;
     var nextIndex = (index + delta + candidates.length) % candidates.length;
     var next = candidates[nextIndex];
-    setCurrentEl(next);
-    revealKeyboardCandidate(next);
-    scheduleOverlayFollow();
+    focusCandidate(next);
   }
 
   function selectElement(el) {
@@ -537,23 +535,141 @@
     return false;
   }
 
+  // --- キーボード: ツリー移動(↑親 ↓最初の子 ←→前後の兄弟) ---
+  function isTreeNode(el) {
+    var tag = el && el.nodeName ? el.nodeName.toLowerCase() : "";
+    return tag !== "html" && tag !== "body" && isKeyboardCandidate(el);
+  }
+
+  function siblingCandidate(el, dir) {
+    var n = dir > 0 ? el.nextElementSibling : el.previousElementSibling;
+    while (n && !isTreeNode(n)) {
+      n = dir > 0 ? n.nextElementSibling : n.previousElementSibling;
+    }
+    return n;
+  }
+
+  function firstVisibleChild(parent) {
+    var n = parent.firstElementChild;
+    while (n && !isTreeNode(n)) n = n.nextElementSibling;
+    return n;
+  }
+
+  // open shadowRoot があればその最初の可視子へ、なければ通常の子へ降りる
+  function firstChildCandidate(el) {
+    if (el.shadowRoot) {
+      var inner = firstVisibleChild(el.shadowRoot);
+      if (inner) return inner;
+    }
+    return firstVisibleChild(el);
+  }
+
+  // shadowRoot の最上位からはホストへ上がる
+  function parentOf(n) {
+    if (n.parentElement) return n.parentElement;
+    var root = n.getRootNode ? n.getRootNode() : null;
+    return root && root.host ? root.host : null;
+  }
+
+  function parentCandidate(el) {
+    var n = parentOf(el);
+    while (n && !isTreeNode(n)) n = parentOf(n);
+    return n;
+  }
+
+  function deepActiveElement() {
+    var a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) {
+      a = a.shadowRoot.activeElement;
+    }
+    return a;
+  }
+
+  function initialCandidate() {
+    var active = deepActiveElement();
+    if (active && active !== document.body && isTreeNode(active)) return active;
+    return document.body ? firstChildCandidate(document.body) : null;
+  }
+
+  function describeCandidate(el) {
+    var text = textWithBoundaries(el)
+      // 制御文字・双方向制御文字・不可視文字は読み上げ領域に混ぜない(\s は U+FEFF にも一致するので空白の正規化より先に除く。改行・タブは単語区切りなので残して空白に正規化する)
+      .replace(/[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return { tag: el.nodeName.toLowerCase(), text: text.slice(0, 60) };
+  }
+
+  function focusCandidate(el) {
+    if (!el) return;
+    setCurrentEl(el);
+    revealKeyboardCandidate(el);
+    scheduleOverlayFollow();
+    var d = describeCandidate(el);
+    postToParent({ type: "uim:hover-candidate", tag: d.tag, text: d.text });
+  }
+
+  function isEditableTarget(el) {
+    if (!el || el.nodeType !== 1) return false;
+    var tag = el.nodeName.toLowerCase();
+    return (
+      tag === "input" ||
+      tag === "textarea" ||
+      tag === "select" ||
+      el.isContentEditable === true ||
+      el.getAttribute("contenteditable") === "" ||
+      el.getAttribute("contenteditable") === "true"
+    );
+  }
+
   function onKeyDown(e) {
     if (!enabled) return;
-    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    // IME 変換中・修飾キー付き(Shift+矢印の文字選択など)はページ本来の操作
+    if (e.isComposing || e.keyCode === 229) return;
+    // Shift+Tab(逆順移動)だけは例外。それ以外の修飾キー付き(Shift+矢印の文字選択など)は奪わない
+    var shiftTab = e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+    if (!shiftTab && (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey)) return;
 
     var key = e.key;
+    var realTarget = e.target;
+    try {
+      var path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      if (path.length && path[0] && path[0].nodeType === 1) realTarget = path[0];
+    } catch (err) {}
+    var editing = isEditableTarget(realTarget) || isEditableTarget(deepActiveElement());
     var handled = false;
-    if (key === "Tab" || key === "ArrowRight" || key === "ArrowLeft") {
-      handled = true;
-      moveKeyboardSelection(key === "ArrowLeft" || (key === "Tab" && e.shiftKey) ? -1 : 1);
-    } else if (key === "Enter" || key === " " || key === "Spacebar") {
-      handled = true;
-      if (currentEl && currentEl.isConnected) selectElement(currentEl);
-    } else if (key === "Escape") {
+    if (key === "Escape") {
       handled = true;
       setCurrentEl(null);
       hideOverlay();
       postToParent({ type: "uim:cancel" });
+    } else if (editing) {
+      // 入力欄ではタイピング・カーソル移動・確定キーを奪わない
+      return;
+    } else if (
+      key === "ArrowUp" ||
+      key === "ArrowDown" ||
+      key === "ArrowLeft" ||
+      key === "ArrowRight"
+    ) {
+      handled = true;
+      if (!currentEl || !currentEl.isConnected) {
+        focusCandidate(initialCandidate());
+      } else {
+        var next =
+          key === "ArrowUp"
+            ? parentCandidate(currentEl)
+            : key === "ArrowDown"
+            ? firstChildCandidate(currentEl)
+            : siblingCandidate(currentEl, key === "ArrowLeft" ? -1 : 1);
+        if (next) focusCandidate(next);
+      }
+    } else if (key === "Tab") {
+      handled = true;
+      moveKeyboardSelection(shiftTab ? -1 : 1);
+    } else if (key === "Enter" || key === " " || key === "Spacebar") {
+      handled = true;
+      if (currentEl && currentEl.isConnected) selectElement(currentEl);
     }
 
     if (!handled) return;
@@ -562,12 +678,16 @@
   }
 
   function setEnabled(v) {
+    var was = enabled;
     enabled = v;
     document.documentElement.style.cursor = v ? "crosshair" : "";
     if (!v) {
       hideOverlay();
       observeCurrent(null);
       currentEl = null;
+    } else if (!was) {
+      // 選択モード開始時の初期候補(親は 1 秒ごとに再送するので遷移時だけ)
+      focusCandidate(initialCandidate());
     }
   }
 
