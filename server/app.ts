@@ -20,8 +20,11 @@ export interface CreateAppOptions {
 
 function shouldServeSpaFallback(path: string, method: string, accept: string): boolean {
   if (method !== "GET" && method !== "HEAD") return false;
-  if (path === "/api" || path.startsWith("/api/")) return false;
-  if (path.startsWith("/assets/")) return false;
+  // `/API/...` や `//api/...` を SPA の 200 で返さないよう、先頭の重複スラッシュを畳み、
+  // 大文字小文字を無視して API・assets の接頭辞を判定する。
+  const normalized = path.replace(/^\/+/, "/").toLowerCase();
+  if (normalized === "/api" || normalized.startsWith("/api/")) return false;
+  if (normalized.startsWith("/assets/")) return false;
   const lastSegment = path.split("/").pop() ?? "";
   if (lastSegment.includes(".")) return false;
   return !accept || accept.includes("text/html") || accept.includes("*/*");

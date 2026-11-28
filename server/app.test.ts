@@ -152,6 +152,35 @@ describe("createApp", () => {
     });
     expect(missingFile.status).toBe(404);
   });
+
+  it("does not serve the SPA fallback for case-variant or duplicate-slash API and asset paths", async () => {
+    const distRoot = createDistFixture();
+    const app = createApp({
+      distRoot,
+      distExists: true,
+      production: true,
+      useLogger: false,
+    });
+
+    for (const path of [
+      "/API/files/read",
+      "/Api",
+      "//api/files",
+      "//api/files/read",
+      "///api",
+      "//assets/missing",
+      "/ASSETS/missing",
+    ]) {
+      for (const method of ["GET", "HEAD"]) {
+        const res = await app.request(path, {
+          method,
+          headers: { host: "example.com", accept: "text/html" },
+        });
+        expect(res.status, `${method} ${path}`).toBe(404);
+        expect(await res.text(), `${method} ${path}`).not.toContain("UImaneger");
+      }
+    }
+  });
 });
 
 describe("isProduction", () => {
