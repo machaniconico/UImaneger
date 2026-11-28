@@ -79,6 +79,17 @@ describe("acceptance gate", () => {
     ]);
   });
 
+  it("does not treat AC-2-1 as present when only a longer id such as AC-2-1-1 ran", () => {
+    const report = fullReport("linux");
+    const file = report.testResults[0];
+    file.assertionResults = file.assertionResults.map((t) =>
+      /AC-2-1 /.test(t.fullName) ? { ...t, fullName: "suite > AC-2-1-1 another case" } : t
+    );
+    expect(checkAcceptanceReport(report, expected, "linux")).toEqual([
+      "acceptance criteria not run on linux: AC-2-1",
+    ]);
+  });
+
   it("fails on an unknown platform", () => {
     expect(checkAcceptanceReport(fullReport("linux"), expected, "aix")).toEqual([
       "no expectation for platform: aix",

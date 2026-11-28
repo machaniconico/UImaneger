@@ -22,7 +22,7 @@ export function checkAcceptanceReport(report, expected, platform) {
   const passedNames = report.testResults.flatMap((file) =>
     file.assertionResults.filter((t) => t.status === "passed").map((t) => t.fullName)
   );
-  const hasId = (id) => passedNames.some((name) => new RegExp(`(^|[^\\d-])${id}(?![\\d])`).test(name));
+  const hasId = (id) => passedNames.some((name) => new RegExp(`(^|[^\\w-])${id}(?![\\w-])`).test(name));
   const missing = [...expected.common, ...spec.ids].filter((id) => !hasId(id));
   if (missing.length) errors.push(`acceptance criteria not run on ${platform}: ${missing.join(", ")}`);
   if (report.numPassedTests !== spec.total) {
