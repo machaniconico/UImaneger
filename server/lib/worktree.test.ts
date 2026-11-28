@@ -107,6 +107,36 @@ describe("prepareBefore / cleanup", () => {
     }
   }, 20_000);
 
+  it("serves before from a child directory named like '..demo' inside the git repo", async (ctx) => {
+    if (!gitAvailable()) {
+      console.log("[skip] git binary is not available; cannot test worktree mode");
+      ctx.skip();
+      return;
+    }
+    const repo = mkdtempSync(join(tmpdir(), "uim-wt-dotdot-"));
+    try {
+      writeFileSync(join(repo, "index.html"), "<h1>REPO ROOT</h1>");
+      mkdirSync(join(repo, "..demo"));
+      writeFileSync(join(repo, "..demo", "index.html"), "<h1>DEMO</h1>");
+      if (!gitInitAndCommit(repo)) {
+        console.log("[skip] git commit failed in this environment; cannot test worktree mode");
+        ctx.skip();
+        return;
+      }
+
+      const h = prepareBefore(join(repo, "..demo"));
+      try {
+        expect(h.mode).toBe("worktree");
+        expect(h.dir).not.toBe(h.worktreeRoot);
+        expect(readFileSync(join(h.dir, "index.html"), "utf8")).toBe("<h1>DEMO</h1>");
+      } finally {
+        cleanup(h);
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("degrades to snapshot or none (no throw) when the dir is not a git repo", () => {
     const root = mkdtempSync(join(tmpdir(), "uim-nogit-"));
     try {

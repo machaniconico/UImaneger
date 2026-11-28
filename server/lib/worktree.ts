@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, relative } from "node:path";
+import { join, resolve, relative, isAbsolute, sep } from "node:path";
 import { buildChildEnv } from "./child-env.ts";
 
 export type GitMode = "worktree" | "snapshot" | "none";
@@ -176,7 +176,9 @@ export function prepareBefore(root: string): BeforeHandle {
         const gitRoot = top.ok ? resolve(top.out) : absRoot;
         const rel = relative(gitRoot, absRoot);
         const beforeDir =
-          rel && !rel.startsWith("..") ? join(wtDir, rel) : wtDir;
+          rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
+            ? join(wtDir, rel)
+            : wtDir;
         writeWorktreeSourceMarker(wtDir, gitRoot);
         // 依存解決のため node_modules を symlink:
         //  - git ルート側 (モノレポ/hoisted 依存) を worktree ルートへ

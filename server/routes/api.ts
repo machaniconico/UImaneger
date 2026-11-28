@@ -349,7 +349,7 @@ async function withFileLock<T>(
 
 function isWithinPath(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
 function portableRelative(parent: string, child: string): string {
