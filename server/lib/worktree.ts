@@ -20,6 +20,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -174,7 +175,16 @@ export function prepareBefore(root: string): BeforeHandle {
         // 場合は before 配信ディレクトリをそのオフセット分ずらす。
         const top = runGit(absRoot, ["rev-parse", "--show-toplevel"]);
         const gitRoot = top.ok ? resolve(top.out) : absRoot;
-        const rel = relative(gitRoot, absRoot);
+        // git は実体パスを返す(macOS の /var → /private/var、Windows の 8.3 短縮名 RUNNER~1 の展開)。
+        // 字面のまま比べると relative が ".." 始まりになり、サブディレクトリでも worktree 全体を配信してしまう。
+        const real = (p: string) => {
+          try {
+            return realpathSync.native(p);
+          } catch {
+            return p;
+          }
+        };
+        const rel = relative(real(gitRoot), real(absRoot));
         const beforeDir =
           rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)
             ? join(wtDir, rel)

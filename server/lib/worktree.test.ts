@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  symlinkSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -136,6 +137,40 @@ describe("prepareBefore / cleanup", () => {
       rmSync(repo, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it.skipIf(process.platform === "win32")(
+    "serves before from the subdirectory when the project is opened through a symlinked path",
+    async (ctx) => {
+      if (!gitAvailable()) {
+        ctx.skip();
+        return;
+      }
+      // macOS の /var → /private/var と同じ状況: git は実体パスを返し、開いたパスは symlink 経由
+      const base = mkdtempSync(join(tmpdir(), "uim-wt-link-"));
+      const repo = join(base, "real-repo");
+      try {
+        mkdirSync(join(repo, "app"), { recursive: true });
+        writeFileSync(join(repo, "index.html"), "<h1>REPO ROOT</h1>");
+        writeFileSync(join(repo, "app", "index.html"), "<h1>APP</h1>");
+        if (!gitInitAndCommit(repo)) {
+          ctx.skip();
+          return;
+        }
+        symlinkSync(repo, join(base, "link-repo"));
+        const h = prepareBefore(join(base, "link-repo", "app"));
+        try {
+          expect(h.mode).toBe("worktree");
+          expect(h.dir).not.toBe(h.worktreeRoot);
+          expect(readFileSync(join(h.dir, "index.html"), "utf8")).toBe("<h1>APP</h1>");
+        } finally {
+          cleanup(h);
+        }
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+    20_000
+  );
 
   it("degrades to snapshot or none (no throw) when the dir is not a git repo", () => {
     const root = mkdtempSync(join(tmpdir(), "uim-nogit-"));
