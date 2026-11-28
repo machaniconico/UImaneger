@@ -996,38 +996,6 @@ api.post("/project/stop", async (c) => {
   return c.json({ info: getInfo() });
 });
 
-api.get("/files/read", async (c) => {
-  const root = getRoot();
-  const path = c.req.query("path") || "";
-  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
-  if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
-  if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
-  try {
-    const content = await readFile(resolve(path), "utf8");
-    return c.json({ path: resolve(path), content });
-  } catch (e) {
-    return serverError(c, e);
-  }
-});
-
-api.post("/files/write", async (c) => {
-  const root = getRoot();
-  const body = await readJsonBody<{ path: string; content: string }>(c);
-  if (body instanceof Response) return body;
-  const { path, content } = body;
-  if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
-  if (typeof path !== "string" || typeof content !== "string")
-    return c.json({ error: "path と content は文字列である必要があります。" }, 400);
-  if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
-  if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
-  try {
-    await withFileLock(path, () => atomicWrite(resolve(path), content, root));
-    return c.json({ ok: true });
-  } catch (e) {
-    return serverError(c, e);
-  }
-});
-
 type EditRequestBody = {
   descriptor: DomDescriptor;
   instruction: string;
