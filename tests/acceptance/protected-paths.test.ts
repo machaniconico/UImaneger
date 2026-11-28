@@ -390,7 +390,7 @@ describe("件2 protected paths", () => {
     }
   });
 
-  itAliases("AC-2-9 candidate_rejects_protected_name_aliases (条件付き: 別名が同実体を指す環境のみ)", async () => {
+  itAliases("AC-2-9 protected_name_aliases_are_rejected (条件付き: 別名が同実体を指す環境のみ)", async () => {
     const cases: Array<[string, string]> = [];
     const add = (p: string, marker: string) => cases.push([p, marker]);
     // 大小文字無視 FS(macOS / win32)のみ。Linux ext4 では existsSync が false で skip される。

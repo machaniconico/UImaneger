@@ -126,6 +126,12 @@ describe("件6 files API 削除", () => {
         },
       ],
     ];
+    // 大文字小文字違い・先頭の重複スラッシュでも SPA フォールバックに落ちない
+    for (const path of ["/API/files/read", "//api/files", "//api/files/read"]) {
+      for (const method of ["GET", "HEAD"]) {
+        reqs.push([method, path, { method, headers: html }]);
+      }
+    }
     for (const [label, path, init] of reqs) {
       const res = await prod.request(path, init);
       const text = await res.text();
