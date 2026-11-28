@@ -44,7 +44,6 @@ const app = createApp({ production: false, useLogger: false, serverPort: 5174, c
 
 const C0 = 'export const App = () => <div>C0</div>;';
 const C1 = 'export const App = () => <div>C1</div>;';
-const WRITE_BODY = "OVERWRITTEN_BY_ACCEPTANCE_TEST";
 const INSTRUCTION = "Change the label.";
 
 const MARKERS = [
@@ -161,11 +160,6 @@ async function post(path: string, body: unknown): Promise<{ status: number; text
   return { status: res.status, text, json };
 }
 
-async function readApi(path: string): Promise<{ status: number; text: string }> {
-  const res = await app.request(`/api/files/read?path=${encodeURIComponent(path)}`);
-  return { status: res.status, text: await res.text() };
-}
-
 function claudeSent(): string {
   return JSON.stringify([...claudeMock.complete.mock.calls, ...claudeMock.streamComplete.mock.calls]);
 }
@@ -243,33 +237,31 @@ describe("件2 protected paths", () => {
     expect(claudeCallCount()).toBe(0);
   });
 
-  itSymlink("AC-2-3 edit_candidate_and_files_reject_symlink_into_dot_git", async () => {
+  itSymlink("AC-2-3 edit_candidate_rejects_symlink_into_dot_git", async () => {
     expect(symlinksOk, "fixture の symlink 作成").toBe(true);
     for (const file of [join(root, "src/link-git/description"), join(root, "src/link-desc.tsx")]) {
       const c = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
       expect(c.status, `candidate ${file}`).toBe(403);
-      const rd = await readApi(file);
-      expect(rd.status, `files/read ${file}`).toBe(403);
-      const w = await post("/api/files/write", { path: file, content: WRITE_BODY });
-      expect(w.status, `files/write ${file}`).toBe(403);
     }
     expect(claudeCallCount()).toBe(0);
     expect(readFileSync(join(root, ".git/description"), "utf8")).toBe("MARKER_GIT_DESCRIPTION");
   });
 
-  it("AC-2-4 files_read_write_reject_dot_git_including_gitfile_and_new_files", async () => {
-    const rd = await readApi(join(root, ".git/config"));
-    expect(rd.status, "read .git/config").toBe(403);
-    expect(rd.text).not.toContain("MARKER_GIT_CONFIG");
+  it("AC-2-4 edit_candidate_and_source_hint_reject_dot_git_gitfile_and_nonexistent_protected_paths", async () => {
+    const cfg = join(root, ".git/config");
+    const c = await post("/api/edit/candidate", { file: cfg, instruction: INSTRUCTION });
+    expect(c.status, "candidate .git/config").toBe(403);
+    expect(c.text).not.toContain("MARKER_GIT_CONFIG");
+    expect(readFileSync(cfg, "utf8")).toBe("MARKER_GIT_CONFIG");
 
-    const w = await post("/api/files/write", { path: join(root, ".git/config"), content: WRITE_BODY });
-    expect(w.status, "write .git/config").toBe(403);
-    expect(readFileSync(join(root, ".git/config"), "utf8")).toBe("MARKER_GIT_CONFIG");
-
-    const neu = join(root, ".git/hooks/post-checkout");
-    const w2 = await post("/api/files/write", { path: neu, content: WRITE_BODY });
-    expect(w2.status, "write new .git/hooks/post-checkout").toBe(403);
-    expect(existsSync(neu), "post-checkout が作られた").toBe(false);
+    // 未存在の保護パスは 404 ではなく 403(作成もされない)
+    for (const rel of [".git/hooks/post-checkout", "node_modules/none.js", ".newhidden"]) {
+      const neu = join(root, rel);
+      const r = await post("/api/edit/candidate", { file: neu, instruction: INSTRUCTION });
+      expect(r.status, `candidate 未存在 ${rel}`).toBe(403);
+      expect(existsSync(neu), `${rel} が作られた`).toBe(false);
+    }
+    expect(claudeCallCount()).toBe(0);
 
     // .git が `gitdir: /x` の通常ファイルである別 fixture
     await stopProject();
@@ -277,27 +269,24 @@ describe("件2 protected paths", () => {
     put(root2, "src/App.tsx", C0);
     put(root2, ".git", "gitdir: /x");
     await openProject(root2, { command: "echo test-server-ready" });
-    const rd2 = await readApi(join(root2, ".git"));
-    expect(rd2.status, "read gitfile").toBe(403);
-    const w3 = await post("/api/files/write", { path: join(root2, ".git"), content: WRITE_BODY });
-    expect(w3.status, "write gitfile").toBe(403);
-    expect(readFileSync(join(root2, ".git"), "utf8")).toBe("gitdir: /x");
+    const gitfile = join(root2, ".git");
+    const c2 = await post("/api/edit/candidate", { file: gitfile, instruction: INSTRUCTION });
+    expect(c2.status, "candidate gitfile").toBe(403);
+    await expectSourceHintRefused(gitfile, "gitdir", "gitfile");
+    expect(readFileSync(gitfile, "utf8")).toBe("gitdir: /x");
+    expect(claudeCallCount()).toBe(0);
   });
 
-  it("AC-2-5 edit_and_files_reject_node_modules", async () => {
+  it("AC-2-5 edit_candidate_and_source_hint_reject_node_modules", async () => {
     const file = join(root, "node_modules/pkg/index.js");
     const c = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
     expect(c.status, "candidate").toBe(403);
-    const rd = await readApi(file);
-    expect(rd.status, "files/read").toBe(403);
-    expect(rd.text).not.toContain("MARKER_NM");
-    const w = await post("/api/files/write", { path: file, content: WRITE_BODY });
-    expect(w.status, "files/write").toBe(403);
+    expect(c.text).not.toContain("MARKER_NM");
     await expectSourceHintRefused(file, "MARKER_NM", "node_modules");
     expect(readFileSync(file, "utf8")).toBe("MARKER_NM");
   });
 
-  it("AC-2-6 edit_and_files_reject_hidden_segments_including_env", async () => {
+  it("AC-2-6 edit_candidate_and_source_hint_reject_hidden_segments_including_env", async () => {
     const targets: Array<[string, string]> = [
       [".env", "API_TOKEN=MARKER_ENV"],
       [".env.local", "MARKER_ENV_LOCAL"],
@@ -308,11 +297,7 @@ describe("件2 protected paths", () => {
       const file = join(root, rel);
       const c = await post("/api/edit/candidate", { file, instruction: INSTRUCTION });
       expect(c.status, `candidate ${rel}`).toBe(403);
-      const rd = await readApi(file);
-      expect(rd.status, `files/read ${rel}`).toBe(403);
-      for (const m of MARKERS) expect(rd.text, `read ${rel} に ${m}`).not.toContain(m);
-      const w = await post("/api/files/write", { path: file, content: WRITE_BODY });
-      expect(w.status, `files/write ${rel}`).toBe(403);
+      for (const m of MARKERS) expect(c.text, `candidate ${rel} 応答に ${m}`).not.toContain(m);
       await expectSourceHintRefused(file, content.replace("API_TOKEN=", ""), rel);
     }
     for (const m of MARKERS) expect(claudeSent(), `Claude に ${m}`).not.toContain(m);
@@ -392,23 +377,20 @@ describe("件2 protected paths", () => {
 
     for (const [rel, content] of files) {
       const p = join(real, rel);
-      const rd = await readApi(p);
-      expect(rd.status, `read ${rel}`).toBe(200);
-      expect(JSON.parse(rd.text).content, `read ${rel} content`).toBe(content);
-      const w = await post("/api/files/write", { path: p, content: `${content}!` });
-      expect(w.status, `write ${rel}`).toBe(200);
-      expect(readFileSync(p, "utf8"), `write ${rel} 反映`).toBe(`${content}!`);
+      claudeMock.complete.mockClear();
+      claudeMock.streamComplete.mockClear();
+      claudeMock.complete.mockResolvedValueOnce(`${content}!`);
+      const c = await post("/api/edit/candidate", { file: p, instruction: INSTRUCTION });
+      expect(c.status, `candidate ${rel}: ${c.text.slice(0, 100)}`).toBe(200);
+      expect(c.json?.ok, `candidate ${rel} ok`).toBe(true);
+      expect(claudeSent(), `${rel}: Claude に元内容が渡る`).toContain(JSON.stringify(content).slice(1, -1));
+      const ap = await post("/api/edit/apply", { proposalId: c.json.proposalId });
+      expect(ap.status, `apply ${rel}`).toBe(200);
+      expect(readFileSync(p, "utf8"), `apply ${rel} 反映`).toBe(`${content}!`);
     }
-    writeFileSync(join(real, "src/App.tsx"), C0, "utf8");
-    claudeMock.complete.mockResolvedValueOnce(C1);
-    const c = await post("/api/edit/candidate", { file: join(real, "src/App.tsx"), instruction: INSTRUCTION });
-    expect(c.status, `candidate: ${c.text.slice(0, 100)}`).toBe(200);
-    const ap = await post("/api/edit/apply", { proposalId: c.json.proposalId });
-    expect(ap.status, "apply").toBe(200);
-    expect(readFileSync(join(real, "src/App.tsx"), "utf8")).toBe(C1);
   });
 
-  itAliases("AC-2-9 protected_name_aliases_are_rejected (条件付き: 別名が同実体を指す環境のみ)", async () => {
+  itAliases("AC-2-9 candidate_rejects_protected_name_aliases (条件付き: 別名が同実体を指す環境のみ)", async () => {
     const cases: Array<[string, string]> = [];
     const add = (p: string, marker: string) => cases.push([p, marker]);
     // 大小文字無視 FS(macOS / win32)のみ。Linux ext4 では existsSync が false で skip される。
@@ -424,13 +406,9 @@ describe("件2 protected paths", () => {
     }
     expect(cases.length, "検査対象の別名").toBeGreaterThan(0);
     for (const [p, marker] of cases) {
-      const rd = await readApi(p);
-      expect(rd.status, `read ${p}`).toBe(403);
-      expect(rd.text).not.toContain(marker);
-      const w = await post("/api/files/write", { path: p, content: WRITE_BODY });
-      expect(w.status, `write ${p}`).toBe(403);
       const c = await post("/api/edit/candidate", { file: p, instruction: INSTRUCTION });
       expect(c.status, `candidate ${p}`).toBe(403);
+      expect(c.text).not.toContain(marker);
     }
     expect(claudeCallCount()).toBe(0);
     expect(readFileSync(join(root, ".git/config"), "utf8")).toBe("MARKER_GIT_CONFIG");

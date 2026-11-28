@@ -2,7 +2,11 @@
 // R3 受け入れテスト: createApp が新しい security middleware を /api に配線していること。
 // 基準: .omc/plans/r3-csrf-acceptance.md(実装者は編集禁止)
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createApp } from "../../server/app.ts";
+import { openProject, stopProject } from "../../server/lib/state.ts";
 
 const J = { "content-type": "application/json" };
 
@@ -28,13 +32,32 @@ describe("app-wiring", () => {
     expect(noOrigin.status).toBe(415);
   });
 
-  it("blocks_files_write_no_cors_simple_request", async () => {
-    const res = await devApp().request("/api/files/write", {
-      method: "POST",
-      headers: { origin: "http://127.0.0.1:6100", "content-type": "text/plain" },
-      body: JSON.stringify({ path: "/tmp/x", content: "x" }),
-    });
-    expect(res.status).toBe(403);
+  it("blocks_edit_apply_no_cors_simple_request", async () => {
+    const app = devApp();
+    const simple = { origin: "http://127.0.0.1:6100", "content-type": "text/plain" };
+    for (const path of ["/api/edit/apply", "/api/git/commit"]) {
+      const res = await app.request(path, {
+        method: "POST",
+        headers: simple,
+        body: JSON.stringify({ proposalId: "none", message: "x" }),
+      });
+      expect(res.status, path).toBe(403);
+    }
+    // 対照: Origin なし・JSON・未知 proposalId の apply は 404(ミドルウェアは通過する)。
+    // プロジェクト未オープンだと 400 になるので、一時プロジェクトを開いて確かめる。
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), "uim-wiring-")));
+    try {
+      await openProject(tmp, { command: "echo test-server-ready" });
+      const ctl = await app.request("/api/edit/apply", {
+        method: "POST",
+        headers: J,
+        body: JSON.stringify({ proposalId: "unknown" }),
+      });
+      expect(ctl.status).toBe(404);
+    } finally {
+      await stopProject();
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it("blocks_img_triggered_git_status", async () => {
