@@ -29,6 +29,7 @@ import {
   isLoopbackBindHost,
   JSON_BODY_MAX_BYTES,
   atomicWrite,
+  WriteTargetRejectedError,
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
@@ -2252,6 +2253,50 @@ describe("file write hardening", () => {
     await atomicWrite(target, "new", root);
     expect(tempModes).toEqual([0o600]);
     expect(readFileSync(target, "utf8")).toBe("new");
+  });
+
+  it.skipIf(!posix)("atomicWrite re-checks the resolved target after a concurrent write to the same file through an alias", async () => {
+    mkdirSync(join(root, "real"), { recursive: true });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    const safe = join(root, "real", "ok.txt");
+    const protectedFile = join(root, ".git", "description");
+    writeFileSync(safe, "SAFE", "utf8");
+    writeFileSync(protectedFile, "GIT_DESCRIPTION", "utf8");
+    const alias = join(root, "src", "alias.txt");
+    symlinkSync("../real/ok.txt", alias);
+
+    // atomicWrite 自体はロックを持たない(apply は withFileLock で包む)。ここでは両方の一時ファイル
+    // 書き込みを止めて「2 本目が 1 本目の完了を待っている」状態を作り、その間に別名を差し替える。
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const firstStarted = deferred();
+    const secondStarted = deferred();
+    const release = deferred();
+    let started = 0;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (String(args[0]).includes(".tmp-")) {
+        started += 1;
+        (started === 1 ? firstStarted : secondStarted).resolve();
+        await release.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    const first = atomicWrite(safe, "FIRST", root);
+    await firstStarted.promise;
+    const second = atomicWrite(alias, "SECOND", root);
+    await secondStarted.promise;
+    unlinkSync(alias);
+    symlinkSync("../.git/description", alias);
+    release.resolve();
+
+    const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+    expect(firstResult.status).toBe("fulfilled");
+    expect(secondResult.status).toBe("rejected");
+    expect((secondResult as PromiseRejectedResult).reason).toBeInstanceOf(WriteTargetRejectedError);
+    expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readFileSync(safe, "utf8")).toBe("FIRST");
+    expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    expect(readdirSync(join(root, "real")).filter((n) => n.includes(".tmp-"))).toEqual([]);
   });
 
   it.skipIf(!posix)("apply re-checks the resolved target when a symlink is swapped mid-write", async () => {
