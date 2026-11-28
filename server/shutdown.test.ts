@@ -9,7 +9,10 @@ const mocks = vi.hoisted(() => ({
   sweepStaleBeforeDirs: vi.fn(),
 }));
 
-vi.mock("./lib/state.ts", () => ({ stopProject: mocks.stopProject }));
+vi.mock("./lib/state.ts", () => ({
+  stopProject: mocks.stopProject,
+  setPreviewParentOrigins: () => {},
+}));
 vi.mock("./lib/runner.ts", () => ({
   killAllChildrenSync: mocks.killAllChildrenSync,
 }));
@@ -25,6 +28,7 @@ vi.mock("./middleware/security.ts", () => ({
   createSecurityMiddleware:
     () => async (_c: unknown, next: () => Promise<void>) => await next(),
   allowedApiOrigins: () => [],
+  previewParentOrigins: () => [],
 }));
 vi.mock("@hono/node-server", () => ({
   serve: () => ({
