@@ -174,7 +174,9 @@ export function prepareBefore(root: string): BeforeHandle {
         // worktree は git ルート全体を checkout する。対象がサブディレクトリの
         // 場合は before 配信ディレクトリをそのオフセット分ずらす。
         const top = runGit(absRoot, ["rev-parse", "--show-toplevel"]);
-        const gitRoot = top.ok ? resolve(top.out) : absRoot;
+        // toplevel が分からなければオフセットを決められない(ルート扱いにすると worktree 全体を配信する)
+        if (!top.ok) throw new Error("git rev-parse --show-toplevel failed");
+        const gitRoot = resolve(top.out);
         // git は実体パスを返す(macOS の /var → /private/var、Windows の 8.3 短縮名 RUNNER~1 の展開)。
         // 字面のまま比べると relative が ".." 始まりになり、サブディレクトリでも worktree 全体を配信してしまう。
         // 解決できない・範囲外なら worktree を諦めて snapshot に落とす(広い範囲を配信しない)。
