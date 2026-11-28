@@ -320,7 +320,8 @@ async function withHistoryLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-async function withFileLock<T>(
+/** テストからも使う(ロック待ちの後で書き込み先が再検査されることの回帰テスト) */
+export async function withFileLock<T>(
   file: string,
   fn: () => Promise<T>
 ): Promise<T> {

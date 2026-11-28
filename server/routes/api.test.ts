@@ -30,6 +30,7 @@ import {
   JSON_BODY_MAX_BYTES,
   atomicWrite,
   WriteTargetRejectedError,
+  withFileLock,
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
@@ -2288,6 +2289,46 @@ describe("file write hardening", () => {
     unlinkSync(alias);
     symlinkSync("../.git/description", alias);
     release.resolve();
+
+    const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+    expect(firstResult.status).toBe("fulfilled");
+    expect(secondResult.status).toBe("rejected");
+    expect((secondResult as PromiseRejectedResult).reason).toBeInstanceOf(WriteTargetRejectedError);
+    expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readFileSync(safe, "utf8")).toBe("FIRST");
+    expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    expect(readdirSync(join(root, "real")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
+
+  it.skipIf(!posix)("a writer waiting on the file lock re-checks the target after acquiring it", async () => {
+    mkdirSync(join(root, "real"), { recursive: true });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    const safe = join(root, "real", "ok.txt");
+    const protectedFile = join(root, ".git", "description");
+    writeFileSync(safe, "SAFE", "utf8");
+    writeFileSync(protectedFile, "GIT_DESCRIPTION", "utf8");
+    const alias = join(root, "src", "alias.txt");
+    symlinkSync("../real/ok.txt", alias);
+
+    // 1 本目が実体のロックを持っている間に、別名経由の 2 本目が同じ鍵(実体パス)で待つ。
+    const holding = deferred();
+    const releaseFirst = deferred();
+    const first = withFileLock(safe, async () => {
+      holding.resolve();
+      await releaseFirst.promise;
+      await atomicWrite(safe, "FIRST", root);
+    });
+    await holding.promise;
+    let secondEntered = false;
+    const second = withFileLock(alias, async () => {
+      secondEntered = true;
+      await atomicWrite(alias, "SECOND", root);
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(secondEntered).toBe(false); // 2 本目は確かにロック待ち
+    unlinkSync(alias);
+    symlinkSync("../.git/description", alias);
+    releaseFirst.resolve();
 
     const [firstResult, secondResult] = await Promise.allSettled([first, second]);
     expect(firstResult.status).toBe("fulfilled");
