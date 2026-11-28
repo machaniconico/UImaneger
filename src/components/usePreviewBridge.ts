@@ -9,6 +9,33 @@ interface Options {
   /** 選択を受け取れるか (false なら uim:select を無視) */
   acceptSelect: boolean;
   onSelect?: (d: DomDescriptor) => void;
+  /** iframe 内で Esc により選択モードが取り消された */
+  onCancel?: () => void;
+  /** キーボード移動で候補が変わった(スクリーンリーダー向けの短い説明用) */
+  onCandidate?: (c: { tag: string; text: string }) => void;
+}
+
+/** 選択確定/取消後に Chat の指示入力欄へフォーカスを戻す。入力欄が有効になるのを短く待つ。 */
+function restoreFocusToChat() {
+  let tries = 0;
+  const attempt = () => {
+    const ta = document.querySelector<HTMLTextAreaElement>(
+      'textarea[aria-label="編集指示"]'
+    );
+    if (ta && !ta.disabled) {
+      ta.focus();
+      return;
+    }
+    if (++tries < 8) {
+      setTimeout(attempt, 50);
+      return;
+    }
+    // 要素未選択のまま取り消した場合は「要素を選択」ボタンへ戻す
+    document
+      .querySelector<HTMLElement>("[data-uim-select-button]")
+      ?.focus();
+  };
+  setTimeout(attempt, 0);
 }
 
 /**
@@ -21,8 +48,21 @@ export function usePreviewBridge({
   selectMode,
   acceptSelect,
   onSelect,
+  onCancel,
+  onCandidate,
 }: Options) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
+
+  // 選択モードに入った瞬間にキーボード操作を続けられるよう iframe へフォーカスを移す
+  const wasSelectMode = useRef(false);
+  useEffect(() => {
+    if (selectMode && !wasSelectMode.current) {
+      const iframe = iframeRef.current;
+      iframe?.focus();
+      iframe?.contentWindow?.focus();
+    }
+    wasSelectMode.current = selectMode;
+  }, [selectMode]);
 
   useEffect(() => {
     if (!acceptSelect) return;
@@ -42,11 +82,21 @@ export function usePreviewBridge({
       const d = e.data || {};
       if (d.type === "uim:select" && d.payload) {
         onSelect?.(d.payload as DomDescriptor);
+        restoreFocusToChat();
+      } else if (d.type === "uim:cancel") {
+        onCancel?.();
+        restoreFocusToChat();
+      } else if (
+        d.type === "uim:hover-candidate" &&
+        typeof d.tag === "string" &&
+        typeof d.text === "string"
+      ) {
+        onCandidate?.({ tag: d.tag.slice(0, 32), text: d.text.slice(0, 80) });
       }
     }
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [acceptSelect, onSelect, url]);
+  }, [acceptSelect, onSelect, onCancel, onCandidate, url]);
 
   useEffect(() => {
     let targetOrigin: string | null = null;

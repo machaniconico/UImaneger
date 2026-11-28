@@ -144,4 +144,81 @@ describe("usePreviewBridge", () => {
 
     expect(postMessage).not.toHaveBeenCalled();
   });
+
+  describe("keyboard selection", () => {
+    function mountWithIframe(initial: { selectMode: boolean }, extra = {}) {
+      const iframe = document.createElement("iframe");
+      document.body.appendChild(iframe);
+      const props = { ...initial, ...extra };
+      const hook = renderHook(
+        (p: { selectMode: boolean }) =>
+          usePreviewBridge({
+            url: EXPECTED_ORIGIN,
+            selectMode: p.selectMode,
+            acceptSelect: true,
+            onSelect: vi.fn(),
+            ...extra,
+          }),
+        { initialProps: { selectMode: props.selectMode } }
+      );
+      (hook.result.current.iframeRef as { current: HTMLIFrameElement | null }).current =
+        iframe;
+      return { iframe, ...hook };
+    }
+
+    it("選択モードに入ると iframe と contentWindow にフォーカスを移す", () => {
+      const { iframe, rerender } = mountWithIframe({ selectMode: false });
+      const focus = vi.spyOn(iframe, "focus");
+      const winFocus = vi.spyOn(iframe.contentWindow!, "focus");
+      expect(focus).not.toHaveBeenCalled();
+      rerender({ selectMode: true });
+      expect(focus).toHaveBeenCalledTimes(1);
+      expect(winFocus).toHaveBeenCalledTimes(1);
+    });
+
+    it("期待origin の uim:hover-candidate だけ onCandidate に渡す", () => {
+      const onCandidate = vi.fn();
+      mountWithIframe({ selectMode: true }, { onCandidate });
+      dispatchMessage(EVIL_ORIGIN, { type: "uim:hover-candidate", tag: "h1", text: "x" });
+      expect(onCandidate).not.toHaveBeenCalled();
+      dispatchMessage(EXPECTED_ORIGIN, { type: "uim:hover-candidate", tag: "h1", text: "サンプルアプリ" });
+      expect(onCandidate).toHaveBeenCalledWith({ tag: "h1", text: "サンプルアプリ" });
+    });
+
+    it("uim:cancel は onCancel を呼び、編集指示欄へフォーカスを戻す", () => {
+      vi.useFakeTimers();
+      const textarea = document.createElement("textarea");
+      textarea.setAttribute("aria-label", "編集指示");
+      document.body.appendChild(textarea);
+      const onCancel = vi.fn();
+      mountWithIframe({ selectMode: true }, { onCancel });
+      dispatchMessage(EVIL_ORIGIN, { type: "uim:cancel" });
+      expect(onCancel).not.toHaveBeenCalled();
+      dispatchMessage(EXPECTED_ORIGIN, { type: "uim:cancel" });
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(onCancel).toHaveBeenCalledTimes(1);
+      expect(document.activeElement).toBe(textarea);
+      textarea.remove();
+    });
+
+    it("選択確定後は編集指示欄が有効になるのを待ってフォーカスを戻す", () => {
+      vi.useFakeTimers();
+      const textarea = document.createElement("textarea");
+      textarea.setAttribute("aria-label", "編集指示");
+      textarea.disabled = true;
+      document.body.appendChild(textarea);
+      mountWithIframe({ selectMode: true });
+      dispatchMessage(EXPECTED_ORIGIN, { type: "uim:select", payload: PAYLOAD });
+      setTimeout(() => {
+        textarea.disabled = false;
+      }, 60);
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(document.activeElement).toBe(textarea);
+      textarea.remove();
+    });
+  });
 });

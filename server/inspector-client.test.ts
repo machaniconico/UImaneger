@@ -317,18 +317,16 @@ describe("inspector-client helpers", () => {
     messages.length = 0;
 
     expect(dispatchKey(win, doc, "ArrowRight").defaultPrevented).toBe(true);
-    expect(dispatchKey(win, doc, "Tab").defaultPrevented).toBe(true);
     expect(dispatchKey(win, doc, "Enter").defaultPrevented).toBe(true);
 
-    expect(messages).toHaveLength(1);
-    expect(messages[0].targetOrigin).toBe("http://localhost:5173");
-    expect(messages[0].message).toMatchObject({
+    const selects = messages.filter(
+      (m) => (m.message as { type: string }).type === "uim:select"
+    );
+    expect(selects).toHaveLength(1);
+    expect(selects[0].targetOrigin).toBe("http://localhost:5173");
+    expect(selects[0].message).toMatchObject({
       type: "uim:select",
-      payload: {
-        tag: "button",
-        id: "second",
-        textSnippet: "Second",
-      },
+      payload: { tag: "button", id: "second", textSnippet: "Second" },
     });
   });
 
@@ -346,5 +344,145 @@ describe("inspector-client helpers", () => {
     expect(dispatchKey(win, doc, "ArrowRight").defaultPrevented).toBe(false);
     expect(dispatchKey(win, doc, "Enter").defaultPrevented).toBe(false);
     expect(messages).toEqual([]);
+  });
+});
+
+describe("inspector keyboard tree navigation", () => {
+  const PARENT = "http://localhost:5173";
+
+  function setup(html: string) {
+    const ctx = loadInspector();
+    ctx.doc.body.innerHTML = html;
+    Array.from(ctx.doc.body.querySelectorAll("*")).forEach(stubVisibleRect);
+    return ctx;
+  }
+  const enable = (ctx: ReturnType<typeof loadInspector>) => {
+    ctx.dispatchParentMessage({ type: "uim:setEnabled", value: true }, PARENT);
+  };
+  const types = (ctx: ReturnType<typeof loadInspector>) =>
+    ctx.messages.map((m) => (m.message as { type: string }).type);
+  const lastSelect = (ctx: ReturnType<typeof loadInspector>) =>
+    [...ctx.messages]
+      .reverse()
+      .find((m) => (m.message as { type: string }).type === "uim:select")
+      ?.message as { payload: { id?: string } } | undefined;
+
+  const TREE = `
+    <main id="root">
+      <h1 id="title">サンプルアプリ</h1>
+      <section id="sec"><p id="p1">one</p><p id="p2">two</p></section>
+      <div id="hidden" hidden>x</div>
+      <footer id="foot">f</footer>
+    </main>`;
+
+  it("starts at the first visible body child and ArrowDown/Up/Right/Left walk the tree", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    const { doc, win } = ctx;
+    // 初期候補 = body の最初の可視子要素 (main)
+    expect(dispatchKey(win, doc, "ArrowDown").defaultPrevented).toBe(true); // -> h1
+    dispatchKey(win, doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("title");
+    dispatchKey(win, doc, "ArrowRight"); // -> section
+    dispatchKey(win, doc, "ArrowDown"); // -> p1
+    dispatchKey(win, doc, "ArrowRight"); // -> p2
+    dispatchKey(win, doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("p2");
+    dispatchKey(win, doc, "ArrowLeft"); // -> p1
+    dispatchKey(win, doc, "ArrowUp"); // -> section
+    dispatchKey(win, doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("sec");
+  });
+
+  it("skips hidden siblings and does not climb above body's children", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    const { doc, win } = ctx;
+    dispatchKey(win, doc, "ArrowDown"); // h1
+    dispatchKey(win, doc, "ArrowRight"); // section
+    dispatchKey(win, doc, "ArrowRight"); // footer (hidden div skipped)
+    dispatchKey(win, doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("foot");
+    dispatchKey(win, doc, "ArrowUp"); // main
+    dispatchKey(win, doc, "ArrowUp"); // stays at main (body/html are skipped)
+    dispatchKey(win, doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("root");
+  });
+
+  it("prefers the focused element as the initial candidate", () => {
+    const ctx = setup(`<button id="a">A</button><button id="b">B</button>`);
+    (ctx.doc.getElementById("b") as HTMLElement).focus();
+    enable(ctx);
+    dispatchKey(ctx.win, ctx.doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("b");
+  });
+
+  it("Space confirms like Enter", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    expect(dispatchKey(ctx.win, ctx.doc, " ").defaultPrevented).toBe(true);
+    expect(lastSelect(ctx)?.payload.id).toBe("root");
+  });
+
+  it("Escape sends uim:cancel to the trusted parent", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    ctx.messages.length = 0;
+    expect(dispatchKey(ctx.win, ctx.doc, "Escape").defaultPrevented).toBe(true);
+    expect(ctx.messages).toEqual([
+      { message: { type: "uim:cancel" }, targetOrigin: PARENT },
+    ]);
+  });
+
+  it("announces each candidate to the trusted parent origin only", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    ctx.messages.length = 0;
+    dispatchKey(ctx.win, ctx.doc, "ArrowDown");
+    expect(ctx.messages).toEqual([
+      {
+        message: { type: "uim:hover-candidate", tag: "h1", text: "サンプルアプリ" },
+        targetOrigin: PARENT,
+      },
+    ]);
+    expect(ctx.messages.every((m) => m.targetOrigin !== "*")).toBe(true);
+  });
+
+  it("does not steal keys when selection mode is off", () => {
+    const ctx = setup(TREE);
+    ctx.dispatchParentMessage({ type: "uim:ping" }, PARENT);
+    ctx.messages.length = 0;
+    for (const k of ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Enter", " ", "Escape"]) {
+      expect(dispatchKey(ctx.win, ctx.doc, k).defaultPrevented, k).toBe(false);
+    }
+    expect(ctx.messages).toEqual([]);
+  });
+
+  it("leaves arrow keys to focused text inputs but still handles Escape", () => {
+    const ctx = setup(`<input id="in" type="text" /><div id="ce" contenteditable="true">t</div><button id="b">B</button>`);
+    enable(ctx);
+    for (const id of ["in", "ce"]) {
+      const el = ctx.doc.getElementById(id) as HTMLElement;
+      el.focus();
+      ctx.messages.length = 0;
+      for (const k of ["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"]) {
+        const ev = new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true });
+        el.dispatchEvent(ev);
+        expect(ev.defaultPrevented, `${id} ${k}`).toBe(false);
+      }
+      expect(ctx.messages).toEqual([]);
+      const esc = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+      el.dispatchEvent(esc);
+      expect(esc.defaultPrevented).toBe(true);
+      expect(types(ctx)).toContain("uim:cancel");
+    }
+  });
+
+  it("sends nothing from keyboard handling when the parent is untrusted", () => {
+    const ctx = setup(TREE);
+    ctx.dispatchParentMessage({ type: "uim:setEnabled", value: true }, "http://evil.test");
+    ctx.messages.length = 0;
+    for (const k of ["ArrowDown", "Enter", "Escape"]) dispatchKey(ctx.win, ctx.doc, k);
+    expect(ctx.messages).toEqual([]);
   });
 });

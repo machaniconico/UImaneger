@@ -123,4 +123,56 @@ describe("BeforePreview", () => {
     render(<BeforePreview info={runningInfo} selectMode={false} onSelect={() => {}} />);
     expect(screen.getByText("稼働中")).not.toBeNull();
   });
+
+  it("選択モード中だけ操作説明を表示する", () => {
+    const { rerender } = render(
+      <BeforePreview info={runningInfo} selectMode={false} onSelect={() => {}} />
+    );
+    expect(screen.queryByText(/矢印キーで移動、Enter で選択、Esc で終了/)).toBeNull();
+    rerender(
+      <BeforePreview info={runningInfo} selectMode={true} onSelect={() => {}} />
+    );
+    expect(screen.getByText(/矢印キーで移動、Enter で選択、Esc で終了/)).toBeTruthy();
+  });
+
+  it("選択モード開始で iframe にフォーカスを移し、候補を aria-live に出す", () => {
+    const focus = vi.spyOn(HTMLIFrameElement.prototype, "focus");
+    const { rerender, container } = render(
+      <BeforePreview info={runningInfo} selectMode={false} onSelect={() => {}} />
+    );
+    expect(focus).not.toHaveBeenCalled();
+    rerender(
+      <BeforePreview info={runningInfo} selectMode={true} onSelect={() => {}} />
+    );
+    expect(focus).toHaveBeenCalled();
+    expect(focus.mock.contexts[0]).toBe(screen.getByTitle("編集前プレビュー"));
+
+    const live = container.querySelector('[aria-live="polite"]')!;
+    expect(live.textContent).toBe("");
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: "http://localhost:5174",
+          data: { type: "uim:hover-candidate", tag: "h1", text: "サンプルアプリ" },
+        })
+      );
+    });
+    expect(live.textContent).toBe('h1 "サンプルアプリ"');
+    focus.mockRestore();
+  });
+
+  it("別 origin の候補通知は aria-live に出さない", () => {
+    const { container } = render(
+      <BeforePreview info={runningInfo} selectMode={true} onSelect={() => {}} />
+    );
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin: "http://evil.test",
+          data: { type: "uim:hover-candidate", tag: "h1", text: "x" },
+        })
+      );
+    });
+    expect(container.querySelector('[aria-live="polite"]')!.textContent).toBe("");
+  });
 });
