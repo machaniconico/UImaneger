@@ -28,6 +28,9 @@ import {
   isTrustedRunCommandHost,
   isLoopbackBindHost,
   JSON_BODY_MAX_BYTES,
+  atomicWrite,
+  WriteTargetRejectedError,
+  withFileLock,
 } from "./api.ts";
 import * as state from "../lib/state.ts";
 import { openProject, stopProject } from "../lib/state.ts";
@@ -538,7 +541,7 @@ describe("project security helpers", () => {
 
   it("returns a JSON 400 for malformed JSON request bodies", async () => {
     const result = await postRaw<{ error: string }>(
-      "/api/files/write",
+      "/api/edit/candidate",
       "{not-json"
     );
 
@@ -548,7 +551,7 @@ describe("project security helpers", () => {
 
   it("returns a JSON 400 for non-object JSON request bodies", async () => {
     const result = await postRaw<{ error: string }>(
-      "/api/files/write",
+      "/api/edit/candidate",
       "null"
     );
 
@@ -558,7 +561,7 @@ describe("project security helpers", () => {
 
   it("returns a JSON 413 for oversized JSON request bodies", async () => {
     const result = await postRaw<{ error: string }>(
-      "/api/files/write",
+      "/api/edit/candidate",
       `{"content":"${"x".repeat(JSON_BODY_MAX_BYTES)}"}`
     );
 
@@ -1750,9 +1753,11 @@ describe("edit proposal API", () => {
     process.env.ANTHROPIC_API_KEY = "sk-ant-test-secret";
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const { res, body } = await getJson<{ error: string }>(
-        `/api/files/read?path=${encodeURIComponent(dirname(filePath))}`
-      );
+      // ディレクトリを候補にすると読み込みで EISDIR になり、500 とエラーログ 1 行になる。
+      const { res, body } = await postJson<{ error: string }>("/api/edit/candidate", {
+        file: dirname(filePath),
+        instruction: "Change the button label.",
+      });
 
       expect(res.status).toBe(500);
       expect(body.error).toBeTruthy();
@@ -1761,10 +1766,11 @@ describe("edit proposal API", () => {
       const logged = JSON.parse(line) as Record<string, unknown>;
       expect(logged).toMatchObject({
         level: "error",
-        method: "GET",
-        route: "/api/files/read",
+        method: "POST",
+        route: "/api/edit/candidate",
       });
       expect(line).not.toContain("sk-ant-test-secret");
+      expect(claudeMock.complete).not.toHaveBeenCalled();
     } finally {
       spy.mockRestore();
       if (previousKey === undefined) delete process.env.ANTHROPIC_API_KEY;
@@ -1772,37 +1778,42 @@ describe("edit proposal API", () => {
     }
   });
 
-  it("guards file read/write against traversal while allowing in-root paths", async () => {
-    const outsideRead = await getJson<{ error: string }>(
-      "/api/files/read?path=/etc/passwd"
-    );
-    expect(outsideRead.res.status).toBe(403);
-    expect(outsideRead.body.error).toContain("範囲外");
-
-    const outsideWrite = await postJson<{ error: string }>("/api/files/write", {
-      path: join(root, "..", "uim-outside.txt"),
-      content: "outside",
+  it("guards candidate/apply against traversal while allowing in-root paths", async () => {
+    const outsideAbs = await postJson<{ error: string }>("/api/edit/candidate", {
+      file: "/etc/passwd",
+      instruction: "Change it.",
     });
-    expect(outsideWrite.res.status).toBe(403);
-    expect(outsideWrite.body.error).toContain("範囲外");
+    expect(outsideAbs.res.status).toBe(403);
+    expect(outsideAbs.body.error).toContain("範囲外");
+
+    const outsideRel = await postJson<{ error: string }>("/api/edit/candidate", {
+      file: join(root, "..", "uim-outside.txt"),
+      instruction: "Change it.",
+    });
+    expect(outsideRel.res.status).toBe(403);
+    expect(outsideRel.body.error).toContain("範囲外");
+    expect(claudeMock.complete).not.toHaveBeenCalled();
 
     const inRootFile = join(root, "src", "read-write.txt");
-    const write = await postJson<{ ok: true }>("/api/files/write", {
-      path: inRootFile,
-      content: "inside",
+    writeFileSync(inRootFile, "before", "utf8");
+    claudeMock.complete.mockResolvedValueOnce("inside");
+    const candidate = await postJson<ProposalBody>("/api/edit/candidate", {
+      file: inRootFile,
+      instruction: "Change it.",
     });
-    expect(write.res.status).toBe(200);
-    expect(write.body.ok).toBe(true);
+    expect(candidate.res.status).toBe(200);
+    expect(candidate.body.ok).toBe(true);
 
-    const read = await getJson<{ path: string; content: string }>(
-      `/api/files/read?path=${encodeURIComponent(inRootFile)}`
-    );
-    expect(read.res.status).toBe(200);
-    expect(read.body.content).toBe("inside");
+    const applied = await postJson<{ ok: true }>("/api/edit/apply", {
+      proposalId: candidate.body.proposalId,
+    });
+    expect(applied.res.status).toBe(200);
+    expect(readFileSync(inRootFile, "utf8")).toBe("inside");
   });
 
-  it("rejects reads and writes that escape the root through a symlink", async () => {
+  it("rejects candidates and applies that escape the root through a symlink", async () => {
     const outside = mkdtempSync(join(tmpdir(), "uim-symlink-outside-"));
+    const swapped = join(root, "src", "swapped.txt");
     try {
       writeFileSync(join(outside, "outside-target.txt"), "outside", "utf8");
       try {
@@ -1814,44 +1825,57 @@ describe("edit proposal API", () => {
         throw err;
       }
 
-      const readViaFileLink = await getJson<{ error: string }>(
-        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-file.txt"))}`
-      );
-      expect(readViaFileLink.res.status).toBe(403);
-
-      const readViaDirLink = await getJson<{ error: string }>(
-        `/api/files/read?path=${encodeURIComponent(join(root, "src", "escape-dir", "outside-target.txt"))}`
-      );
-      expect(readViaDirLink.res.status).toBe(403);
-
-      const writeViaDirLink = await postJson<{ error: string }>("/api/files/write", {
-        path: join(root, "src", "escape-dir", "planted.txt"),
-        content: "planted",
+      const viaFileLink = await postJson<{ error: string }>("/api/edit/candidate", {
+        file: join(root, "src", "escape-file.txt"),
+        instruction: "Change it.",
       });
-      expect(writeViaDirLink.res.status).toBe(403);
+      expect(viaFileLink.res.status).toBe(403);
+
+      const viaDirLink = await postJson<{ error: string }>("/api/edit/candidate", {
+        file: join(root, "src", "escape-dir", "outside-target.txt"),
+        instruction: "Change it.",
+      });
+      expect(viaDirLink.res.status).toBe(403);
+
+      const newViaDirLink = await postJson<{ error: string }>("/api/edit/candidate", {
+        file: join(root, "src", "escape-dir", "planted.txt"),
+        instruction: "Change it.",
+      });
+      expect(newViaDirLink.res.status).toBe(403);
       expect(existsSync(join(outside, "planted.txt"))).toBe(false);
+      expect(claudeMock.complete).not.toHaveBeenCalled();
 
-      const writeViaFileLink = await postJson<{ error: string }>("/api/files/write", {
-        path: join(root, "src", "escape-file.txt"),
-        content: "overwritten",
+      // 候補作成後に対象を root 外への symlink に差し替えても、apply は書き込まない。
+      writeFileSync(swapped, "outside", "utf8");
+      claudeMock.complete.mockResolvedValueOnce("overwritten");
+      const candidate = await postJson<ProposalBody>("/api/edit/candidate", {
+        file: swapped,
+        instruction: "Change it.",
       });
-      expect(writeViaFileLink.res.status).toBe(403);
+      expect(candidate.res.status).toBe(200);
+      unlinkSync(swapped);
+      symlinkSync(join(outside, "outside-target.txt"), swapped);
+      const applied = await postJson<{ error: string }>("/api/edit/apply", {
+        proposalId: candidate.body.proposalId,
+      });
+      expect(applied.res.status).toBe(403);
       expect(readFileSync(join(outside, "outside-target.txt"), "utf8")).toBe("outside");
+      expect(readdirSync(outside).filter((n) => n.includes(".tmp-"))).toEqual([]);
     } finally {
       rmSync(join(root, "src", "escape-dir"), { force: true });
       rmSync(join(root, "src", "escape-file.txt"), { force: true });
+      rmSync(swapped, { force: true });
       rmSync(outside, { recursive: true, force: true });
     }
   });
 
-  it("keeps the original file when atomic file replacement fails", async () => {
-    const target = join(root, "src", "atomic-write.txt");
-    writeFileSync(target, "original", "utf8");
+  it("keeps the original file when atomic file replacement fails during apply", async () => {
+    const proposal = await requestProposal();
     const actualRename = fsPromisesMock.actual.rename;
     const actualUnlink = fsPromisesMock.actual.unlink;
     const unlinked: string[] = [];
     fsPromisesMock.rename.mockImplementation(async (...args: any[]) => {
-      if (String(args[1]) === target) throw new Error("rename failed");
+      if (String(args[1]) === filePath) throw new Error("rename failed");
       return actualRename(...args);
     });
     fsPromisesMock.unlink.mockImplementation(async (...args: any[]) => {
@@ -1860,16 +1884,16 @@ describe("edit proposal API", () => {
     });
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      const result = await postJson<{ error: string }>("/api/files/write", {
-        path: target,
-        content: "changed",
+      const result = await postJson<{ error: string }>("/api/edit/apply", {
+        proposalId: proposal.proposalId,
       });
 
       expect(result.res.status).toBe(500);
       expect(result.body.error).toContain("rename failed");
-      expect(readFileSync(target, "utf8")).toBe("original");
+      expect(readFileSync(filePath, "utf8")).toBe(originalContent);
       expect(unlinked).toHaveLength(1);
       expect(existsSync(unlinked[0])).toBe(false);
+      expect(__stores.undoStack).toHaveLength(0);
     } finally {
       errorSpy.mockRestore();
     }
@@ -2161,8 +2185,62 @@ describe("internal error details", () => {
 
 describe("file write hardening", () => {
   const posix = process.platform !== "win32";
+  // umask を変えられない環境(worker thread 等)では umask 依存のケースだけ skip する。
+  const canSetUmask = (() => {
+    if (!posix) return false;
+    try {
+      process.umask(process.umask(0o022));
+      return true;
+    } catch {
+      return false;
+    }
+  })();
 
-  it.skipIf(!posix)("creates the temp file for a new file with 0600 before setting the final mode", async () => {
+  async function withUmask<T>(mask: number, fn: () => Promise<T>): Promise<T> {
+    const old = process.umask(mask);
+    try {
+      return await fn();
+    } finally {
+      process.umask(old);
+    }
+  }
+
+  function tempLeftovers(dir: string): string[] {
+    return readdirSync(dir).filter((n) => n.includes(".tmp-") || n.includes(".uim-umask-"));
+  }
+
+  // HTTP 経路は新規ファイルを作らない(任意パス書き込み API は削除済み)ため、atomicWrite を直接呼んで担保する。
+  it.skipIf(!canSetUmask).each([
+    [0o022, 0o644],
+    [0o077, 0o600],
+  ])("atomicWrite creates a new file with 0666 & ~umask (umask %o -> %o)", async (mask, expected) => {
+    const dir = join(root, "src");
+    const target = join(dir, `brand-new-${mask.toString(8)}.txt`);
+    await withUmask(mask, () => atomicWrite(target, "new", root));
+    expect(readFileSync(target, "utf8")).toBe("new");
+    expect(statSync(target).mode & 0o777).toBe(expected);
+    expect(tempLeftovers(dir)).toEqual([]);
+  });
+
+  it("atomicWrite creates a new file without leaving temp files", async () => {
+    const dir = join(root, "src");
+    const target = join(dir, "brand-new.txt");
+    await atomicWrite(target, "new", root);
+    expect(readFileSync(target, "utf8")).toBe("new");
+    expect(tempLeftovers(dir)).toEqual([]);
+  });
+
+  it("atomicWrite throws for a directory target and leaves it untouched", async () => {
+    const dir = join(root, "src");
+    const target = join(dir, "a-directory");
+    mkdirSync(target);
+    const before = readdirSync(dir).sort();
+    await expect(atomicWrite(target, "new", root)).rejects.toThrow();
+    expect(statSync(target).isDirectory()).toBe(true);
+    expect(readdirSync(dir).sort()).toEqual(before);
+  });
+
+  it.skipIf(!posix)("atomicWrite creates the temp file for a new file with 0600 before setting the final mode", async () => {
     const actualWriteFile = fsPromisesMock.actual.writeFile;
     const tempModes: number[] = [];
     fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
@@ -2173,16 +2251,12 @@ describe("file write hardening", () => {
       return result;
     });
     const target = join(root, "src", "brand-new.txt");
-    const write = await postJson<{ ok: true }>("/api/files/write", {
-      path: target,
-      content: "new",
-    });
-    expect(write.res.status).toBe(200);
+    await atomicWrite(target, "new", root);
     expect(tempModes).toEqual([0o600]);
     expect(readFileSync(target, "utf8")).toBe("new");
   });
 
-  it.skipIf(!posix)("re-checks the resolved target after waiting for the file lock", async () => {
+  it.skipIf(!posix)("atomicWrite re-checks the resolved target after a concurrent write to the same file through an alias", async () => {
     mkdirSync(join(root, "real"), { recursive: true });
     mkdirSync(join(root, ".git"), { recursive: true });
     const safe = join(root, "real", "ok.txt");
@@ -2192,35 +2266,124 @@ describe("file write hardening", () => {
     const alias = join(root, "src", "alias.txt");
     symlinkSync("../real/ok.txt", alias);
 
+    // atomicWrite 自体はロックを持たない(apply は withFileLock で包む)。ここでは両方の一時ファイル
+    // 書き込みを止めて「2 本目が 1 本目の完了を待っている」状態を作り、その間に別名を差し替える。
     const actualWriteFile = fsPromisesMock.actual.writeFile;
-    const firstWriteStarted = deferred();
-    const releaseFirstWrite = deferred();
-    let blocked = false;
+    const firstStarted = deferred();
+    const secondStarted = deferred();
+    const release = deferred();
+    let started = 0;
     fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
-      if (!blocked && String(args[0]).includes(".tmp-")) {
-        blocked = true;
-        firstWriteStarted.resolve();
-        await releaseFirstWrite.promise;
+      if (String(args[0]).includes(".tmp-")) {
+        started += 1;
+        (started === 1 ? firstStarted : secondStarted).resolve();
+        await release.promise;
       }
       return actualWriteFile(...args);
     });
 
-    // 1 本目が実体のロックを握っている間に、2 本目(symlink 経由)が検査を通過してロック待ちになる。
-    const first = postJson("/api/files/write", { path: safe, content: "FIRST" });
-    await firstWriteStarted.promise;
-    const second = postJson<{ error: string }>("/api/files/write", {
-      path: alias,
-      content: "SECOND",
-    });
-    await delay(25);
+    const first = atomicWrite(safe, "FIRST", root);
+    await firstStarted.promise;
+    const second = atomicWrite(alias, "SECOND", root);
+    await secondStarted.promise;
     unlinkSync(alias);
     symlinkSync("../.git/description", alias);
-    releaseFirstWrite.resolve();
+    release.resolve();
 
-    const [firstResult, secondResult] = await Promise.all([first, second]);
-    expect(firstResult.res.status).toBe(200);
-    expect(secondResult.res.status).toBe(403);
+    const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+    expect(firstResult.status).toBe("fulfilled");
+    expect(secondResult.status).toBe("rejected");
+    expect((secondResult as PromiseRejectedResult).reason).toBeInstanceOf(WriteTargetRejectedError);
     expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readFileSync(safe, "utf8")).toBe("FIRST");
     expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    expect(readdirSync(join(root, "real")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
+
+  it.skipIf(!posix)("a writer waiting on the file lock re-checks the target after acquiring it", async () => {
+    mkdirSync(join(root, "real"), { recursive: true });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    const safe = join(root, "real", "ok.txt");
+    const protectedFile = join(root, ".git", "description");
+    writeFileSync(safe, "SAFE", "utf8");
+    writeFileSync(protectedFile, "GIT_DESCRIPTION", "utf8");
+    const alias = join(root, "src", "alias.txt");
+    symlinkSync("../real/ok.txt", alias);
+
+    // 1 本目が実体のロックを持っている間に、別名経由の 2 本目が同じ鍵(実体パス)で待つ。
+    const holding = deferred();
+    const releaseFirst = deferred();
+    const first = withFileLock(safe, async () => {
+      holding.resolve();
+      await releaseFirst.promise;
+      await atomicWrite(safe, "FIRST", root);
+    });
+    await holding.promise;
+    let secondEntered = false;
+    const second = withFileLock(alias, async () => {
+      secondEntered = true;
+      await atomicWrite(alias, "SECOND", root);
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(secondEntered).toBe(false); // 2 本目は確かにロック待ち
+    unlinkSync(alias);
+    symlinkSync("../.git/description", alias);
+    releaseFirst.resolve();
+
+    const [firstResult, secondResult] = await Promise.allSettled([first, second]);
+    expect(firstResult.status).toBe("fulfilled");
+    expect(secondResult.status).toBe("rejected");
+    expect((secondResult as PromiseRejectedResult).reason).toBeInstanceOf(WriteTargetRejectedError);
+    expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readFileSync(safe, "utf8")).toBe("FIRST");
+    expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    expect(readdirSync(join(root, "real")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
+
+  it.skipIf(!posix)("apply re-checks the resolved target when a symlink is swapped mid-write", async () => {
+    mkdirSync(join(root, "real"), { recursive: true });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    const safe = join(root, "real", "ok.txt");
+    const protectedFile = join(root, ".git", "description");
+    writeFileSync(safe, "SAFE", "utf8");
+    writeFileSync(protectedFile, "GIT_DESCRIPTION", "utf8");
+    const alias = join(root, "src", "alias.txt");
+    symlinkSync("../real/ok.txt", alias);
+
+    claudeMock.complete.mockResolvedValueOnce("SECOND");
+    const candidate = await postJson<ProposalBody>("/api/edit/candidate", {
+      file: alias,
+      instruction: "Change it.",
+    });
+    expect(candidate.res.status).toBe(200);
+
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const writeStarted = deferred();
+    const releaseWrite = deferred();
+    let blocked = false;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (!blocked && String(args[0]).includes(".tmp-")) {
+        blocked = true;
+        writeStarted.resolve();
+        await releaseWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    // apply が検査・ロック取得を終えて一時ファイルを書いている間に、alias を保護パスへ差し替える。
+    const applying = postJson<{ error: string }>("/api/edit/apply", {
+      proposalId: candidate.body.proposalId,
+    });
+    await writeStarted.promise;
+    unlinkSync(alias);
+    symlinkSync("../.git/description", alias);
+    releaseWrite.resolve();
+
+    const result = await applying;
+    expect(result.res.status).toBe(403);
+    expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readFileSync(safe, "utf8")).toBe("SAFE");
+    expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+    expect(readdirSync(join(root, "real")).filter((n) => n.includes(".tmp-"))).toEqual([]);
   });
 });

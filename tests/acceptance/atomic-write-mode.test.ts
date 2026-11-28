@@ -106,20 +106,42 @@ const modeOf = (p: string): number => statSync(p).mode & 0o777;
 const oct = (n: number): string => n.toString(8).padStart(4, "0");
 const tmpLeftovers = (dir: string): string[] => readdirSync(dir).filter((n) => n.includes(".tmp-"));
 
+const INSTRUCTION = "Change the label.";
+
+async function candidate(file: string, after: string): Promise<{ status: number; json: any }> {
+  claudeMock.complete.mockResolvedValueOnce(after);
+  return post("/api/edit/candidate", { file, instruction: INSTRUCTION });
+}
+
+const entries = (dir: string): string[] => readdirSync(dir).sort();
+
 describe("件4 atomicWrite mode", () => {
   itPosixUmask(
-    "AC-4-1 files_write_preserves_existing_mode_independent_of_umask (POSIX のみ・umask 変更可のみ)",
+    "AC-4-1 apply_undo_redo_preserve_existing_mode_independent_of_umask (POSIX のみ・umask 変更可のみ)",
     async () => {
       const f = join(root, "src/f.txt");
       for (const m of [0o600, 0o640, 0o644, 0o755]) {
         for (const u of [0o022, 0o000, 0o077]) {
+          const label = `mode=${oct(m)} umask=${oct(u)}`;
+          const after = `after-${oct(m)}-${oct(u)}`;
           writeFileSync(f, "before", "utf8");
           chmodSync(f, m);
-          const r = await withUmask(u, () => post("/api/files/write", { path: f, content: `after-${oct(m)}-${oct(u)}` }));
-          const label = `mode=${oct(m)} umask=${oct(u)}`;
-          expect(r.status, `${label} status`).toBe(200);
-          expect(readFileSync(f, "utf8"), `${label} content`).toBe(`after-${oct(m)}-${oct(u)}`);
-          expect(oct(modeOf(f)), `${label} mode`).toBe(oct(m));
+          __stores.undoStack.splice(0);
+          __stores.redoStack.splice(0);
+          const c = await candidate(f, after);
+          expect(c.status, `${label} candidate`).toBe(200);
+          const ap = await withUmask(u, () => post("/api/edit/apply", { proposalId: c.json.proposalId }));
+          expect(ap.status, `${label} apply`).toBe(200);
+          expect(readFileSync(f, "utf8"), `${label} apply content`).toBe(after);
+          expect(oct(modeOf(f)), `${label} apply mode`).toBe(oct(m));
+          const un = await withUmask(u, () => post("/api/edit/undo", {}));
+          expect(un.status, `${label} undo`).toBe(200);
+          expect(readFileSync(f, "utf8"), `${label} undo content`).toBe("before");
+          expect(oct(modeOf(f)), `${label} undo mode`).toBe(oct(m));
+          const re = await withUmask(u, () => post("/api/edit/redo", {}));
+          expect(re.status, `${label} redo`).toBe(200);
+          expect(readFileSync(f, "utf8"), `${label} redo content`).toBe(after);
+          expect(oct(modeOf(f)), `${label} redo mode`).toBe(oct(m));
         }
       }
     }
@@ -153,7 +175,7 @@ describe("件4 atomicWrite mode", () => {
     }
   });
 
-  itPosix("AC-4-3 write_through_symlink_keeps_link_and_target_mode (POSIX のみ)", async () => {
+  itPosix("AC-4-3 apply_undo_redo_through_symlink_keep_link_and_target_mode (POSIX のみ)", async () => {
     mkdirSync(join(root, "real"), { recursive: true });
     const target = join(root, "real/target.txt");
     const alias = join(root, "src/alias.txt");
@@ -161,53 +183,98 @@ describe("件4 atomicWrite mode", () => {
     chmodSync(target, 0o600);
     symlinkSync("../real/target.txt", alias);
 
-    const r = await post("/api/files/write", { path: alias, content: "target-after" });
-    expect(r.status).toBe(200);
-    expect(lstatSync(alias).isSymbolicLink(), "alias が symlink のまま").toBe(true);
-    expect(readFileSync(target, "utf8")).toBe("target-after");
-    expect(oct(modeOf(target)), "target の mode").toBe("0600");
+    const check = (label: string, content: string) => {
+      expect(lstatSync(alias).isSymbolicLink(), `${label}: alias が symlink のまま`).toBe(true);
+      expect(readFileSync(target, "utf8"), `${label}: target 内容`).toBe(content);
+      expect(oct(modeOf(target)), `${label}: target の mode`).toBe("0600");
+    };
+    const c = await candidate(alias, "target-after");
+    expect(c.status, "candidate").toBe(200);
+    const ap = await post("/api/edit/apply", { proposalId: c.json.proposalId });
+    expect(ap.status, "apply").toBe(200);
+    check("apply", "target-after");
+    const un = await post("/api/edit/undo", {});
+    expect(un.status, "undo").toBe(200);
+    check("undo", "target-before");
+    const re = await post("/api/edit/redo", {});
+    expect(re.status, "redo").toBe(200);
+    check("redo", "target-after");
   });
 
   itPosixUmask(
-    "AC-4-4 new_file_uses_umask_default_and_no_temp_files_remain (POSIX のみ・umask 変更可のみ)",
+    "AC-4-4 apply_undo_redo_leave_no_temp_files_and_directory_target_fails_cleanly (POSIX のみ・umask 変更可のみ)",
     async () => {
-      // (a) 未存在ファイル: 0666 & ~umask
-      for (const [u, expected] of [
-        [0o022, "0644"],
-        [0o077, "0600"],
-      ] as const) {
-        const f = join(root, "src", `new-${oct(u)}.txt`);
-        const r = await withUmask(u, () => post("/api/files/write", { path: f, content: "fresh" }));
-        expect(r.status, `new file umask=${oct(u)}`).toBe(200);
-        expect(readFileSync(f, "utf8")).toBe("fresh");
-        expect(oct(modeOf(f)), `new file mode umask=${oct(u)}`).toBe(expected);
-      }
-      expect(tmpLeftovers(join(root, "src")), "(a) 後の .tmp- 残骸").toEqual([]);
+      const dir = join(root, "src");
+      const f = join(dir, "f.txt");
+      const isOk = (n: number) => n >= 200 && n < 300;
 
-      // (b) 既存ディレクトリを path に指定
-      mkdirSync(join(root, "src/dir"), { recursive: true });
-      const r = await post("/api/files/write", { path: join(root, "src/dir"), content: "x" });
-      expect(r.status >= 200 && r.status < 300, `dir への write が ${r.status}`).toBe(false);
-      expect(statSync(join(root, "src/dir")).isDirectory(), "src/dir がディレクトリのまま").toBe(true);
-      expect(tmpLeftovers(join(root, "src")), "(b) 後の .tmp- 残骸").toEqual([]);
+      // (a) apply→undo→redo の後、src/ のエントリ集合が操作前と同一
+      for (const u of [0o022, 0o077]) {
+        const label = `umask=${oct(u)}`;
+        writeFileSync(f, "before", "utf8");
+        __stores.undoStack.splice(0);
+        __stores.redoStack.splice(0);
+        const base = entries(dir);
+        const c = await candidate(f, "after");
+        expect(c.status, `${label} candidate`).toBe(200);
+        expect((await withUmask(u, () => post("/api/edit/apply", { proposalId: c.json.proposalId }))).status, `${label} apply`).toBe(200);
+        expect((await withUmask(u, () => post("/api/edit/undo", {}))).status, `${label} undo`).toBe(200);
+        expect((await withUmask(u, () => post("/api/edit/redo", {}))).status, `${label} redo`).toBe(200);
+        expect(entries(dir), `${label} エントリ集合`).toEqual(base);
+        expect(tmpLeftovers(dir), `${label} .tmp- 残骸`).toEqual([]);
+      }
+
+      // (b) candidate 後に対象をディレクトリへ差し替え → apply は失敗
+      writeFileSync(f, "before", "utf8");
+      __stores.undoStack.splice(0);
+      __stores.redoStack.splice(0);
+      const c1 = await candidate(f, "after");
+      expect(c1.status, "(b) candidate").toBe(200);
+      rmSync(f);
+      mkdirSync(f);
+      const base1 = entries(dir);
+      const a1 = await post("/api/edit/apply", { proposalId: c1.json.proposalId });
+      expect(isOk(a1.status), `(b) dir への apply が ${a1.status}`).toBe(false);
+      expect(statSync(f).isDirectory(), "(b) ディレクトリのまま").toBe(true);
+      expect(entries(dir), "(b) エントリ集合").toEqual(base1);
+      rmSync(f, { recursive: true });
+
+      // (c) apply 成功後に対象をディレクトリへ差し替え → undo は失敗
+      writeFileSync(f, "before", "utf8");
+      __stores.undoStack.splice(0);
+      __stores.redoStack.splice(0);
+      const c2 = await candidate(f, "after");
+      expect(c2.status, "(c) candidate").toBe(200);
+      expect((await post("/api/edit/apply", { proposalId: c2.json.proposalId })).status, "(c) apply").toBe(200);
+      rmSync(f);
+      mkdirSync(f);
+      const base2 = entries(dir);
+      const u2 = await post("/api/edit/undo", {});
+      expect(isOk(u2.status), `(c) dir への undo が ${u2.status}`).toBe(false);
+      expect(statSync(f).isDirectory(), "(c) ディレクトリのまま").toBe(true);
+      expect(entries(dir), "(c) エントリ集合").toEqual(base2);
     }
   );
 
   // win32 のみ: Windows は mode 保持対象外。読み取り専用は失敗・不変・残骸なし。Linux では skip。
-  itWin32("AC-4-5 windows_write_succeeds_and_readonly_file_fails_cleanly (win32 only)", async () => {
+  itWin32("AC-4-5 windows_apply_succeeds_and_readonly_file_fails_cleanly (win32 only)", async () => {
     const dir = join(root, "src");
     const ok = join(dir, "plain.txt");
     writeFileSync(ok, "before", "utf8");
-    const a = await post("/api/files/write", { path: ok, content: "after" });
-    expect(a.status).toBe(200);
+    const c = await candidate(ok, "after");
+    expect(c.status, "candidate plain").toBe(200);
+    const a = await post("/api/edit/apply", { proposalId: c.json.proposalId });
+    expect(a.status, "apply plain").toBe(200);
     expect(readFileSync(ok, "utf8")).toBe("after");
 
     const ro = join(dir, "readonly.txt");
     writeFileSync(ro, "locked", "utf8");
+    const cr = await candidate(ro, "changed");
+    expect(cr.status, "candidate readonly").toBe(200);
     chmodSync(ro, 0o444);
     try {
-      const b = await post("/api/files/write", { path: ro, content: "changed" });
-      expect(b.status >= 200 && b.status < 300, `readonly write が ${b.status}`).toBe(false);
+      const b = await post("/api/edit/apply", { proposalId: cr.json.proposalId });
+      expect(b.status >= 200 && b.status < 300, `readonly apply が ${b.status}`).toBe(false);
       expect(readFileSync(ro, "utf8")).toBe("locked");
     } finally {
       chmodSync(ro, 0o666);

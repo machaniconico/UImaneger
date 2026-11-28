@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  symlinkSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -106,6 +107,112 @@ describe("prepareBefore / cleanup", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it("serves before from a child directory named like '..demo' inside the git repo", async (ctx) => {
+    if (!gitAvailable()) {
+      console.log("[skip] git binary is not available; cannot test worktree mode");
+      ctx.skip();
+      return;
+    }
+    const repo = mkdtempSync(join(tmpdir(), "uim-wt-dotdot-"));
+    try {
+      writeFileSync(join(repo, "index.html"), "<h1>REPO ROOT</h1>");
+      mkdirSync(join(repo, "..demo"));
+      writeFileSync(join(repo, "..demo", "index.html"), "<h1>DEMO</h1>");
+      if (!gitInitAndCommit(repo)) {
+        console.log("[skip] git commit failed in this environment; cannot test worktree mode");
+        ctx.skip();
+        return;
+      }
+
+      const h = prepareBefore(join(repo, "..demo"));
+      try {
+        expect(h.mode).toBe("worktree");
+        expect(h.dir).not.toBe(h.worktreeRoot);
+        expect(readFileSync(join(h.dir, "index.html"), "utf8")).toBe("<h1>DEMO</h1>");
+      } finally {
+        cleanup(h);
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.skipIf(process.platform === "win32")(
+    "serves before from the subdirectory when the project is opened through a symlinked path",
+    async (ctx) => {
+      if (!gitAvailable()) {
+        ctx.skip();
+        return;
+      }
+      // macOS の /var → /private/var と同じ状況: git は実体パスを返し、開いたパスは symlink 経由
+      const base = mkdtempSync(join(tmpdir(), "uim-wt-link-"));
+      const repo = join(base, "real-repo");
+      try {
+        mkdirSync(join(repo, "app"), { recursive: true });
+        writeFileSync(join(repo, "index.html"), "<h1>REPO ROOT</h1>");
+        writeFileSync(join(repo, "app", "index.html"), "<h1>APP</h1>");
+        if (!gitInitAndCommit(repo)) {
+          ctx.skip();
+          return;
+        }
+        symlinkSync(repo, join(base, "link-repo"));
+        const h = prepareBefore(join(base, "link-repo", "app"));
+        try {
+          expect(h.mode).toBe("worktree");
+          expect(h.dir).not.toBe(h.worktreeRoot);
+          expect(readFileSync(join(h.dir, "index.html"), "utf8")).toBe("<h1>APP</h1>");
+        } finally {
+          cleanup(h);
+        }
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+    20_000
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "does not serve outside the worktree when HEAD has the opened subdirectory as a symlink",
+    async (ctx) => {
+      if (!gitAvailable()) {
+        ctx.skip();
+        return;
+      }
+      const base = mkdtempSync(join(tmpdir(), "uim-wt-escape-"));
+      const repo = join(base, "repo");
+      const outside = join(base, "outside");
+      try {
+        mkdirSync(repo);
+        mkdirSync(outside);
+        writeFileSync(join(outside, "index.html"), "<h1>OUTSIDE</h1>");
+        writeFileSync(join(repo, "index.html"), "<h1>REPO ROOT</h1>");
+        // HEAD では app → 外部ディレクトリの symlink
+        symlinkSync(outside, join(repo, "app"));
+        if (!gitInitAndCommit(repo)) {
+          ctx.skip();
+          return;
+        }
+        // 作業ツリーでは app を通常のディレクトリに置き換える(未コミット)
+        rmSync(join(repo, "app"));
+        mkdirSync(join(repo, "app"));
+        writeFileSync(join(repo, "app", "index.html"), "<h1>APP</h1>");
+
+        const h = prepareBefore(join(repo, "app"));
+        try {
+          expect(h.mode).not.toBe("worktree");
+          if (h.dir) {
+            expect(readFileSync(join(h.dir, "index.html"), "utf8")).not.toBe("<h1>OUTSIDE</h1>");
+          }
+        } finally {
+          cleanup(h);
+        }
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    },
+    20_000
+  );
 
   it("degrades to snapshot or none (no throw) when the dir is not a git repo", () => {
     const root = mkdtempSync(join(tmpdir(), "uim-nogit-"));

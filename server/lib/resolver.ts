@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { resolve, relative, isAbsolute, join } from "node:path";
+import { resolve, relative, isAbsolute, join, sep } from "node:path";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -249,7 +249,7 @@ function isHiddenOrNodeModules(name: string): boolean {
 
 function withinRoot(root: string, file: string): boolean {
   const rel = relative(root, file);
-  return !rel.startsWith("..") && !isAbsolute(rel);
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 // =========================================================================

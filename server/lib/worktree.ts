@@ -20,12 +20,13 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, relative } from "node:path";
+import { join, resolve, relative, isAbsolute, sep } from "node:path";
 import { buildChildEnv } from "./child-env.ts";
 
 export type GitMode = "worktree" | "snapshot" | "none";
@@ -173,10 +174,20 @@ export function prepareBefore(root: string): BeforeHandle {
         // worktree は git ルート全体を checkout する。対象がサブディレクトリの
         // 場合は before 配信ディレクトリをそのオフセット分ずらす。
         const top = runGit(absRoot, ["rev-parse", "--show-toplevel"]);
-        const gitRoot = top.ok ? resolve(top.out) : absRoot;
-        const rel = relative(gitRoot, absRoot);
-        const beforeDir =
-          rel && !rel.startsWith("..") ? join(wtDir, rel) : wtDir;
+        // toplevel が分からなければオフセットを決められない(ルート扱いにすると worktree 全体を配信する)
+        if (!top.ok) throw new Error("git rev-parse --show-toplevel failed");
+        const gitRoot = resolve(top.out);
+        // git は実体パスを返す(macOS の /var → /private/var、Windows の 8.3 短縮名 RUNNER~1 の展開)。
+        // 字面のまま比べると relative が ".." 始まりになり、サブディレクトリでも worktree 全体を配信してしまう。
+        // 解決できない・範囲外なら worktree を諦めて snapshot に落とす(広い範囲を配信しない)。
+        const isOutside = (r: string) =>
+          r === ".." || r.startsWith(`..${sep}`) || isAbsolute(r);
+        const rel = relative(realpathSync.native(gitRoot), realpathSync.native(absRoot));
+        if (isOutside(rel)) throw new Error("project is not inside its git toplevel");
+        const beforeDir = rel ? join(wtDir, rel) : wtDir;
+        // HEAD 側で途中のディレクトリが symlink(例: app → /outside)だと worktree の外を配信してしまう
+        const relInWt = relative(realpathSync.native(wtDir), realpathSync.native(beforeDir));
+        if (isOutside(relInWt)) throw new Error("before dir escapes the worktree");
         writeWorktreeSourceMarker(wtDir, gitRoot);
         // 依存解決のため node_modules を symlink:
         //  - git ルート側 (モノレポ/hoisted 依存) を worktree ルートへ
