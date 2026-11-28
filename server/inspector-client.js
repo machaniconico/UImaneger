@@ -492,9 +492,7 @@
     if (index < 0) index = delta < 0 ? 0 : -1;
     var nextIndex = (index + delta + candidates.length) % candidates.length;
     var next = candidates[nextIndex];
-    setCurrentEl(next);
-    revealKeyboardCandidate(next);
-    scheduleOverlayFollow();
+    focusCandidate(next);
   }
 
   function selectElement(el) {
@@ -551,26 +549,54 @@
     return n;
   }
 
-  function firstChildCandidate(el) {
-    var n = el.firstElementChild;
+  function firstVisibleChild(parent) {
+    var n = parent.firstElementChild;
     while (n && !isTreeNode(n)) n = n.nextElementSibling;
     return n;
   }
 
+  // open shadowRoot があればその最初の可視子へ、なければ通常の子へ降りる
+  function firstChildCandidate(el) {
+    if (el.shadowRoot) {
+      var inner = firstVisibleChild(el.shadowRoot);
+      if (inner) return inner;
+    }
+    return firstVisibleChild(el);
+  }
+
+  // shadowRoot の最上位からはホストへ上がる
+  function parentOf(n) {
+    if (n.parentElement) return n.parentElement;
+    var root = n.getRootNode ? n.getRootNode() : null;
+    return root && root.host ? root.host : null;
+  }
+
   function parentCandidate(el) {
-    var n = el.parentElement;
-    while (n && !isTreeNode(n)) n = n.parentElement;
+    var n = parentOf(el);
+    while (n && !isTreeNode(n)) n = parentOf(n);
     return n;
   }
 
+  function deepActiveElement() {
+    var a = document.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) {
+      a = a.shadowRoot.activeElement;
+    }
+    return a;
+  }
+
   function initialCandidate() {
-    var active = document.activeElement;
+    var active = deepActiveElement();
     if (active && active !== document.body && isTreeNode(active)) return active;
     return document.body ? firstChildCandidate(document.body) : null;
   }
 
   function describeCandidate(el) {
-    var text = textWithBoundaries(el).trim().replace(/\s+/g, " ");
+    var text = textWithBoundaries(el)
+      .replace(/\s+/g, " ")
+      // 制御文字・双方向制御文字は読み上げ領域に混ぜない
+      .replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
+      .trim();
     return { tag: el.nodeName.toLowerCase(), text: text.slice(0, 60) };
   }
 
@@ -598,18 +624,25 @@
 
   function onKeyDown(e) {
     if (!enabled) return;
-    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    // IME 変換中・修飾キー付き(Shift+矢印の文字選択など)はページ本来の操作
+    if (e.isComposing || e.keyCode === 229) return;
+    if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
 
     var key = e.key;
-    var editing = isEditableTarget(e.target) || isEditableTarget(document.activeElement);
+    var realTarget = e.target;
+    try {
+      var path = typeof e.composedPath === "function" ? e.composedPath() : [];
+      if (path.length && path[0] && path[0].nodeType === 1) realTarget = path[0];
+    } catch (err) {}
+    var editing = isEditableTarget(realTarget) || isEditableTarget(deepActiveElement());
     var handled = false;
     if (key === "Escape") {
       handled = true;
       setCurrentEl(null);
       hideOverlay();
       postToParent({ type: "uim:cancel" });
-    } else if (editing && key !== "Enter") {
-      // 入力欄ではタイピング・カーソル移動を奪わない
+    } else if (editing) {
+      // 入力欄ではタイピング・カーソル移動・確定キーを奪わない
       return;
     } else if (
       key === "ArrowUp" ||
@@ -631,7 +664,7 @@
       }
     } else if (key === "Tab") {
       handled = true;
-      moveKeyboardSelection(e.shiftKey ? -1 : 1);
+      moveKeyboardSelection(1);
     } else if (key === "Enter" || key === " " || key === "Spacebar") {
       handled = true;
       if (currentEl && currentEl.isConnected) selectElement(currentEl);

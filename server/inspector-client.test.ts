@@ -485,4 +485,107 @@ describe("inspector keyboard tree navigation", () => {
     for (const k of ["ArrowDown", "Enter", "Escape"]) dispatchKey(ctx.win, ctx.doc, k);
     expect(ctx.messages).toEqual([]);
   });
+
+  it("[3] 入力欄では Enter・Space・矢印を奪わず、Esc だけ処理する", () => {
+    const ctx = setup(`<textarea id="ta"></textarea><input id="in" /><select id="sel"><option>a</option></select><button id="b">B</button>`);
+    enable(ctx);
+    for (const id of ["ta", "in", "sel"]) {
+      const el = ctx.doc.getElementById(id) as HTMLElement;
+      el.focus();
+      ctx.messages.length = 0;
+      for (const k of ["Enter", " ", "ArrowDown", "ArrowLeft", "Tab"]) {
+        const ev = new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true });
+        el.dispatchEvent(ev);
+        expect(ev.defaultPrevented, `${id} ${k}`).toBe(false);
+      }
+      expect(ctx.messages).toEqual([]);
+    }
+  });
+
+  it("[3] IME 変換中は Esc も含め一切奪わない", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    ctx.messages.length = 0;
+    for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+      for (const k of ["Escape", "Enter", "ArrowDown"]) {
+        const ev = new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init });
+        ctx.doc.body.dispatchEvent(ev);
+        expect(ev.defaultPrevented, `${JSON.stringify(init)} ${k}`).toBe(false);
+      }
+    }
+    expect(ctx.messages).toEqual([]);
+  });
+
+  it("[3] Shift/Ctrl/Alt/Meta 付きのキーは奪わない", () => {
+    const ctx = setup(TREE);
+    enable(ctx);
+    ctx.messages.length = 0;
+    for (const m of ["shiftKey", "ctrlKey", "altKey", "metaKey"]) {
+      for (const k of ["ArrowDown", "ArrowRight", "Enter", "Tab", "Escape"]) {
+        const ev = dispatchKey(ctx.win, ctx.doc, k, { [m]: true });
+        expect(ev.defaultPrevented, `${m} ${k}`).toBe(false);
+      }
+    }
+    expect(ctx.messages).toEqual([]);
+  });
+
+  describe("open Shadow DOM", () => {
+    function shadowSetup() {
+      const ctx = setup(`<div id="host"></div><p id="after">after</p>`);
+      const host = ctx.doc.getElementById("host") as HTMLElement;
+      const root = host.attachShadow({ mode: "open" });
+      root.innerHTML = `<section id="inner"><input id="shin" /></section><span id="inner2">s</span>`;
+      Array.from(root.querySelectorAll("*")).forEach(stubVisibleRect);
+      return { ctx, host, root };
+    }
+
+    it("[4] ↓ でホストから shadowRoot 内の最初の可視子へ降り、↑ でホストへ戻る", () => {
+      const { ctx } = shadowSetup();
+      enable(ctx); // 初期候補 = host
+      dispatchKey(ctx.win, ctx.doc, "ArrowDown");
+      dispatchKey(ctx.win, ctx.doc, "Enter");
+      expect(lastSelect(ctx)?.payload.id).toBe("inner");
+      dispatchKey(ctx.win, ctx.doc, "ArrowUp");
+      dispatchKey(ctx.win, ctx.doc, "Enter");
+      expect(lastSelect(ctx)?.payload.id).toBe("host");
+    });
+
+    it("[4] shadow 内 input にフォーカス中は ←/→ を奪わない", () => {
+      const { ctx, root } = shadowSetup();
+      enable(ctx);
+      const input = root.getElementById("shin") as HTMLElement;
+      input.focus();
+      ctx.messages.length = 0;
+      for (const k of ["ArrowLeft", "ArrowRight", "Enter"]) {
+        const ev = new KeyboardEvent("keydown", { key: k, bubbles: true, composed: true, cancelable: true });
+        input.dispatchEvent(ev);
+        expect(ev.defaultPrevented, k).toBe(false);
+      }
+      expect(ctx.messages).toEqual([]);
+    });
+  });
+
+  it("[5] Tab で候補が変わっても uim:hover-candidate を送る", () => {
+    const ctx = setup(`<button id="a">A</button><button id="b">B</button><button id="c">C</button>`);
+    enable(ctx);
+    ctx.messages.length = 0;
+    expect(dispatchKey(ctx.win, ctx.doc, "Tab").defaultPrevented).toBe(true);
+    expect(ctx.messages).toEqual([
+      { message: { type: "uim:hover-candidate", tag: "button", text: "B" }, targetOrigin: PARENT },
+    ]);
+    dispatchKey(ctx.win, ctx.doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("b");
+  });
+
+  it("[7] 候補テキストから双方向制御文字・制御文字を除去して送る", () => {
+    const ctx = setup(`<h1 id="t">a\u202Eb\u2066c\u200Fd\u0007e\u009Ff</h1>`);
+    enable(ctx);
+    ctx.messages.length = 0;
+    ctx.doc.getElementById("t")!.focus();
+    // 初期候補は h1(唯一の body 子)。再度 ↑↓ で通知を発生させる
+    dispatchKey(ctx.win, ctx.doc, "ArrowUp");
+    dispatchKey(ctx.win, ctx.doc, "Tab");
+    const m = ctx.messages.find((x) => (x.message as { type: string }).type === "uim:hover-candidate");
+    expect(m?.message).toEqual({ type: "uim:hover-candidate", tag: "h1", text: "abcdef" });
+  });
 });

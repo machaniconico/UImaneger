@@ -153,6 +153,7 @@ describe("BeforePreview", () => {
       window.dispatchEvent(
         new MessageEvent("message", {
           origin: "http://localhost:5174",
+          source: (screen.getByTitle("編集前プレビュー") as HTMLIFrameElement).contentWindow,
           data: { type: "uim:hover-candidate", tag: "h1", text: "サンプルアプリ" },
         })
       );
@@ -169,6 +170,7 @@ describe("BeforePreview", () => {
       window.dispatchEvent(
         new MessageEvent("message", {
           origin: "http://evil.test",
+          source: (screen.getByTitle("編集前プレビュー") as HTMLIFrameElement).contentWindow,
           data: { type: "uim:hover-candidate", tag: "h1", text: "x" },
         })
       );

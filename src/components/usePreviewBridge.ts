@@ -16,9 +16,11 @@ interface Options {
 }
 
 /** 選択確定/取消後に Chat の指示入力欄へフォーカスを戻す。入力欄が有効になるのを短く待つ。 */
-function restoreFocusToChat() {
+function restoreFocusToChat(): () => void {
   let tries = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
   const attempt = () => {
+    timer = null;
     const ta = document.querySelector<HTMLTextAreaElement>(
       'textarea[aria-label="編集指示"]'
     );
@@ -27,7 +29,7 @@ function restoreFocusToChat() {
       return;
     }
     if (++tries < 8) {
-      setTimeout(attempt, 50);
+      timer = setTimeout(attempt, 50);
       return;
     }
     // 要素未選択のまま取り消した場合は「要素を選択」ボタンへ戻す
@@ -35,7 +37,19 @@ function restoreFocusToChat() {
       .querySelector<HTMLElement>("[data-uim-select-button]")
       ?.focus();
   };
-  setTimeout(attempt, 0);
+  timer = setTimeout(attempt, 0);
+  return () => {
+    if (timer != null) clearTimeout(timer);
+    timer = null;
+  };
+}
+
+/** 候補テキストから制御文字・双方向制御文字を除く(読み上げ領域・表示の汚染防止) */
+function stripUnsafeText(v: string): string {
+  return v.replace(
+    /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g,
+    ""
+  );
 }
 
 /**
@@ -55,8 +69,25 @@ export function usePreviewBridge({
 
   // 選択モードに入った瞬間にキーボード操作を続けられるよう iframe へフォーカスを移す
   const wasSelectMode = useRef(false);
+  const selectModeRef = useRef(selectMode);
+  selectModeRef.current = selectMode;
+  const cancelRestoreRef = useRef<(() => void) | null>(null);
+  const startRestore = () => {
+    cancelRestoreRef.current?.();
+    cancelRestoreRef.current = restoreFocusToChat();
+  };
+  useEffect(
+    () => () => {
+      cancelRestoreRef.current?.();
+      cancelRestoreRef.current = null;
+    },
+    []
+  );
   useEffect(() => {
     if (selectMode && !wasSelectMode.current) {
+      // 新しい選択開始: 前回の取消・確定に伴うフォーカス復帰を取り消す
+      cancelRestoreRef.current?.();
+      cancelRestoreRef.current = null;
       const iframe = iframeRef.current;
       iframe?.focus();
       iframe?.contentWindow?.focus();
@@ -76,22 +107,26 @@ export function usePreviewBridge({
     function handler(e: MessageEvent) {
       // origin 不一致(および origin 不明)のメッセージは無視
       if (!expectedOrigin || e.origin !== expectedOrigin) return;
-      // さらに source が期待 iframe と一致するか検証 (iframe 未マウント時は origin のみで判定)
-      const iframe = iframeRef.current;
-      if (iframe && e.source && e.source !== iframe.contentWindow) return;
+      // source が現在の iframe.contentWindow と厳密一致するものだけ受理(未マウント・null は拒否)
+      const frameWindow = iframeRef.current?.contentWindow;
+      if (!frameWindow || e.source !== frameWindow) return;
       const d = e.data || {};
       if (d.type === "uim:select" && d.payload) {
         onSelect?.(d.payload as DomDescriptor);
-        restoreFocusToChat();
-      } else if (d.type === "uim:cancel") {
+        startRestore();
+      } else if (d.type === "uim:cancel" && selectModeRef.current) {
         onCancel?.();
-        restoreFocusToChat();
+        startRestore();
       } else if (
         d.type === "uim:hover-candidate" &&
+        selectModeRef.current &&
         typeof d.tag === "string" &&
         typeof d.text === "string"
       ) {
-        onCandidate?.({ tag: d.tag.slice(0, 32), text: d.text.slice(0, 80) });
+        onCandidate?.({
+          tag: stripUnsafeText(d.tag).slice(0, 32),
+          text: stripUnsafeText(d.text).slice(0, 80),
+        });
       }
     }
     window.addEventListener("message", handler);
