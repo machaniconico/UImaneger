@@ -522,6 +522,8 @@ describe("inspector keyboard tree navigation", () => {
     ctx.messages.length = 0;
     for (const m of ["shiftKey", "ctrlKey", "altKey", "metaKey"]) {
       for (const k of ["ArrowDown", "ArrowRight", "Enter", "Tab", "Escape"]) {
+        // Shift+Tab は逆順移動として扱う(別テスト)
+        if (m === "shiftKey" && k === "Tab") continue;
         const ev = dispatchKey(ctx.win, ctx.doc, k, { [m]: true });
         expect(ev.defaultPrevented, `${m} ${k}`).toBe(false);
       }
@@ -575,6 +577,43 @@ describe("inspector keyboard tree navigation", () => {
     ]);
     dispatchKey(ctx.win, ctx.doc, "Enter");
     expect(lastSelect(ctx)?.payload.id).toBe("b");
+  });
+
+  it("Shift+Tab で前の候補に戻り、Shift と他の修飾キーの組み合わせは奪わない", () => {
+    const ctx = setup(`<button id="a">A</button><button id="b">B</button><button id="c">C</button>`);
+    enable(ctx);
+    dispatchKey(ctx.win, ctx.doc, "Tab");
+    dispatchKey(ctx.win, ctx.doc, "Tab");
+    ctx.messages.length = 0;
+    expect(dispatchKey(ctx.win, ctx.doc, "Tab", { shiftKey: true }).defaultPrevented).toBe(true);
+    expect(ctx.messages).toEqual([
+      { message: { type: "uim:hover-candidate", tag: "button", text: "B" }, targetOrigin: PARENT },
+    ]);
+    expect(dispatchKey(ctx.win, ctx.doc, "Tab", { shiftKey: true, ctrlKey: true }).defaultPrevented).toBe(false);
+    dispatchKey(ctx.win, ctx.doc, "Enter");
+    expect(lastSelect(ctx)?.payload.id).toBe("b");
+  });
+
+  it("候補テキストの改行・タブは単語区切りとして空白 1 つにする", () => {
+    const ctx = setup(`<h1 id="t">foo\nbar\tbaz</h1>`);
+    enable(ctx);
+    ctx.messages.length = 0;
+    ctx.doc.getElementById("t")!.focus();
+    dispatchKey(ctx.win, ctx.doc, "ArrowUp");
+    dispatchKey(ctx.win, ctx.doc, "Tab");
+    const m = ctx.messages.find((x) => (x.message as { type: string }).type === "uim:hover-candidate");
+    expect(m?.message).toEqual({ type: "uim:hover-candidate", tag: "h1", text: "foo bar baz" });
+  });
+
+  it("候補テキストから ALM・ゼロ幅文字・BOM も除去する", () => {
+    const ctx = setup(`<h1 id="t">a\u061Cb\u200Bc\u2060d\uFEFFe</h1>`);
+    enable(ctx);
+    ctx.messages.length = 0;
+    ctx.doc.getElementById("t")!.focus();
+    dispatchKey(ctx.win, ctx.doc, "ArrowUp");
+    dispatchKey(ctx.win, ctx.doc, "Tab");
+    const m = ctx.messages.find((x) => (x.message as { type: string }).type === "uim:hover-candidate");
+    expect(m?.message).toEqual({ type: "uim:hover-candidate", tag: "h1", text: "abcde" });
   });
 
   it("[7] 候補テキストから双方向制御文字・制御文字を除去して送る", () => {

@@ -47,7 +47,9 @@ function restoreFocusToChat(): () => void {
 /** 候補テキストから制御文字・双方向制御文字を除く(読み上げ領域・表示の汚染防止) */
 function stripUnsafeText(v: string): string {
   return v.replace(
-    /[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g,
+    // 制御文字、ALM(U+061C)、ゼロ幅・方向マーク(U+200B-200F)、埋め込み/上書き(U+202A-202E)、
+    // 不可視演算子・方向分離(U+2060-206F)、BOM(U+FEFF)
+    /[\u0000-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g,
     ""
   );
 }
@@ -111,7 +113,8 @@ export function usePreviewBridge({
       const frameWindow = iframeRef.current?.contentWindow;
       if (!frameWindow || e.source !== frameWindow) return;
       const d = e.data || {};
-      if (d.type === "uim:select" && d.payload) {
+      // 選択モードを抜けた後に遅れて届いた選択は確定しない
+      if (d.type === "uim:select" && d.payload && selectModeRef.current) {
         onSelect?.(d.payload as DomDescriptor);
         startRestore();
       } else if (d.type === "uim:cancel" && selectModeRef.current) {

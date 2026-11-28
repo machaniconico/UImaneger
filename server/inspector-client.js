@@ -593,9 +593,9 @@
 
   function describeCandidate(el) {
     var text = textWithBoundaries(el)
+      // 制御文字・双方向制御文字・不可視文字は読み上げ領域に混ぜない(\s は U+FEFF にも一致するので空白の正規化より先に除く。改行・タブは単語区切りなので残して空白に正規化する)
+      .replace(/[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/g, "")
       .replace(/\s+/g, " ")
-      // 制御文字・双方向制御文字は読み上げ領域に混ぜない
-      .replace(/[\u0000-\u001F\u007F-\u009F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
       .trim();
     return { tag: el.nodeName.toLowerCase(), text: text.slice(0, 60) };
   }
@@ -626,7 +626,9 @@
     if (!enabled) return;
     // IME 変換中・修飾キー付き(Shift+矢印の文字選択など)はページ本来の操作
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+    // Shift+Tab(逆順移動)だけは例外。それ以外の修飾キー付き(Shift+矢印の文字選択など)は奪わない
+    var shiftTab = e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey;
+    if (!shiftTab && (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey)) return;
 
     var key = e.key;
     var realTarget = e.target;
@@ -664,7 +666,7 @@
       }
     } else if (key === "Tab") {
       handled = true;
-      moveKeyboardSelection(1);
+      moveKeyboardSelection(shiftTab ? -1 : 1);
     } else if (key === "Enter" || key === " " || key === "Spacebar") {
       handled = true;
       if (currentEl && currentEl.isConnected) selectElement(currentEl);

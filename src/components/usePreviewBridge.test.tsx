@@ -287,6 +287,18 @@ describe("usePreviewBridge", () => {
       textarea.remove();
     });
 
+    it("選択モードを抜けた後に遅れて届いた uim:select は確定しない", () => {
+      const onSelect = vi.fn();
+      const { iframe, rerender } = mountWithIframe({ selectMode: true }, { onSelect });
+      rerender({ selectMode: false });
+      dispatchMessage(
+        EXPECTED_ORIGIN,
+        { type: "uim:select", payload: { tag: "h1", classes: [], attrs: {}, domPath: "html>body>h1" } },
+        iframe.contentWindow
+      );
+      expect(onSelect).not.toHaveBeenCalled();
+    });
+
     it("[6] 未選択 Esc 後に再選択すると古いフォーカス復帰タイマーは解除される", () => {
       vi.useFakeTimers();
       const btn = document.createElement("button");
@@ -336,10 +348,10 @@ describe("usePreviewBridge", () => {
       const { iframe } = mountWithIframe({ selectMode: true }, { onCandidate });
       dispatchMessage(
         EXPECTED_ORIGIN,
-        { type: "uim:hover-candidate", tag: "h1\u202E", text: "a\u202Eb\u2066c\u200Fd\u0007e\u009Ff" },
+        { type: "uim:hover-candidate", tag: "h1\u202E", text: "a\u202Eb\u2066c\u200Fd\u0007e\u009Ff\u061Cg\u200Bh\uFEFFi" },
         iframe.contentWindow
       );
-      expect(onCandidate).toHaveBeenCalledWith({ tag: "h1", text: "abcdef" });
+      expect(onCandidate).toHaveBeenCalledWith({ tag: "h1", text: "abcdefghi" });
     });
   });
 });
