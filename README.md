@@ -80,6 +80,8 @@ Clone URL は HTTPS、SSH URL、scp-like `git@host:path` のみ受け付けま�
 - 開発サーバ、git、依存インストールなどの子プロセスには、`ANTHROPIC_*`、`UIM_*` と `.env` から読み込んだキーを渡しません。
 - 任意の起動コマンドは、サーバ自体もループバック bind の場合にだけ許可します。
 - Clone したプロジェクトの install では lifecycle script と pnpm の `.pnpmfile.cjs` を無効化します。ただし Yarn 2 以降の `yarnPath`・plugin は install 時に読み込まれ、clone 後は検出した開発サーバも自動起動するため、そのプロジェクトのコードが現在ユーザー権限で実行されます。信頼できるリポジトリだけを開いてください。
+- `.git`・`node_modules`・隠しファイル(先頭が `.` の名前。`.env` を含む)は編集・ファイル API の対象外です(symlink 経由も含め 403)。Static モードの配信でも返しません。
+- プレビューを iframe に埋め込めるのは UI の origin だけです(開発時は `UIM_CLIENT_PORT`、本番は `UIM_SERVER_PORT`)。
 - 編集時は対象ファイル全体、指示、DOM の補助情報が Anthropic API へ送信されます。秘密、個人情報、契約上送信できないコードを対象にしないでください。
 - 想定する脅威、対策、受容したリスクは [THREAT_MODEL.md](./compliance/THREAT_MODEL.md) にまとめています。脆弱性の報告方法は [SECURITY.md](./SECURITY.md) を参照してください。
 - `UIM_HOST` による LAN 公開はサポート対象外です。認証やTLSなしで外部公開しないでください。

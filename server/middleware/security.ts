@@ -44,6 +44,17 @@ export function allowedApiOrigins(options: {
   return loopbackOrigins(ports);
 }
 
+/**
+ * プレビューを iframe に埋め込める親(UI)の origin。UI を配る側のポートだけを許可する
+ * (dev は Vite の clientPort、production は serverPort)。任意ポートや *.localhost は含めない。
+ */
+export function previewParentOrigins(options: {
+  serverPort: number;
+  clientPort: number | null;
+}): string[] {
+  return loopbackOrigins([options.clientPort ?? options.serverPort]);
+}
+
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const ALLOWED_FETCH_SITES = new Set(["same-origin", "none"]);
 

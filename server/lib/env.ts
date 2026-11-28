@@ -18,6 +18,18 @@ function loadDotEnv() {
 
 loadDotEnv();
 
+/**
+ * 本番配信モードか。`--production` 引数は OS を問わず npm script から指定できるようにするため
+ * (NODE_ENV=... の前置は Windows の cmd で使えない)。app.ts とプロキシで同じ判定を使う。
+ */
+export function isProduction(
+  options: { production?: boolean } = {},
+  argv: readonly string[] = process.argv,
+  nodeEnv: string | undefined = process.env.NODE_ENV
+): boolean {
+  return options.production ?? (nodeEnv === "production" || argv.includes("--production"));
+}
+
 export const env = {
   anthropicKey: process.env.ANTHROPIC_API_KEY || "",
   editModel: process.env.UIM_EDIT_MODEL || "claude-opus-4-8",

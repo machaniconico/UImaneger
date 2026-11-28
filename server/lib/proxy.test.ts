@@ -8,6 +8,8 @@ import net from "node:net";
 import { gzipSync } from "node:zlib";
 import { findFreePort, isListening, sleep } from "./runner.ts";
 import { startProxy, type ProxyHandle } from "./proxy.ts";
+import { previewParentOrigins } from "../middleware/security.ts";
+import { env } from "./env.ts";
 
 // --- helpers (自己完結) ---
 
@@ -374,9 +376,9 @@ describeIfLoopback("proxy upstream response errors", () => {
 });
 
 describeIfLoopback("proxy transport fidelity", () => {
-  it("sets frame-ancestors to localhost-family origins only", async () => {
+  it("sets frame-ancestors to the UI origins only", async () => {
     const expectedCsp =
-      "frame-ancestors 'self' http://localhost:* http://*.localhost:* http://127.0.0.1:* http://[::1]:*";
+      "frame-ancestors 'self' http://localhost:5173 http://127.0.0.1:5173 http://[::1]:5173";
     const upstream = http.createServer((_req, res) => {
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
@@ -391,11 +393,14 @@ describeIfLoopback("proxy transport fidelity", () => {
 
     let handle: ProxyHandle | null = null;
     try {
-      handle = await startProxy(upstreamPort, proxyPort);
+      handle = await startProxy(upstreamPort, proxyPort, "127.0.0.1", {
+        parentOrigins: previewParentOrigins({ serverPort: 5174, clientPort: 5173 }),
+      });
       const response = await requestViaProxy(proxyPort);
 
       expect(response.headers["x-frame-options"]).toBeUndefined();
       expect(response.headers["content-security-policy"]).toContain(expectedCsp);
+      expect(response.headers["content-security-policy"]).not.toContain("*");
       expect(response.headers["content-security-policy"]).toContain(
         "default-src 'self'"
       );
@@ -442,6 +447,44 @@ describeIfLoopback("proxy transport fidelity", () => {
       expect(policies[0]).toContain("default-src 'self'");
       expect(policies[0]).toContain("script-src 'self'");
       expect(policies[1]).toContain("img-src 'self'");
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("only rewrites frame-ancestors for JavaScript responses", async () => {
+    const defaultSource = "default-src https://cdn.example";
+    const scriptSources = "script-src 'none'; script-src-elem https://cdn.example";
+    const upstream = http.createServer((req, res) => {
+      // nosemgrep: ajinabraham.njsscan.headers.header_injection.generic_header_injection -- req.url は CSP の選択にだけ使い、ヘッダ値はテスト内の固定文字列
+      res.writeHead(200, {
+        "content-type": "application/javascript",
+        "content-security-policy":
+          req.url === "/worker.js"
+            ? defaultSource
+            : `${scriptSources}; frame-ancestors 'none'`,
+      });
+      res.end("/* script */");
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+    const parentOrigin = "http://localhost:5173";
+    const frameAncestors = `frame-ancestors 'self' ${parentOrigin}`;
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort, "127.0.0.1", {
+        parentOrigins: [parentOrigin],
+      });
+      const worker = await requestViaProxy(proxyPort, "/worker.js");
+      const script = await requestViaProxy(proxyPort, "/script.js");
+      expect(worker.headers["content-security-policy"]).toBe(
+        `${defaultSource}; ${frameAncestors}`
+      );
+      expect(script.headers["content-security-policy"]).toBe(
+        `${scriptSources}; ${frameAncestors}`
+      );
     } finally {
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});
@@ -562,7 +605,7 @@ describeIfLoopback("proxy transport fidelity", () => {
     }
   });
 
-  it("keeps XHTML byte-identical while allowing localhost iframe previews", async () => {
+  it("keeps XHTML byte-identical while allowing UI iframe previews", async () => {
     const xhtml = Buffer.from(
       '<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><body>xhtml</body></html>',
       "utf8"
@@ -586,9 +629,11 @@ describeIfLoopback("proxy transport fidelity", () => {
       expect(response.body.equals(xhtml)).toBe(true);
       expect(response.body.toString("utf8")).not.toContain("data-uim-inspector");
       expect(response.headers["x-frame-options"]).toBeUndefined();
+      // options 省略時は env の UI origin(dev は clientPort)だけを許可する。
       expect(response.headers["content-security-policy"]).toContain(
-        "http://localhost:*"
+        `http://localhost:${env.clientPort}`
       );
+      expect(response.headers["content-security-policy"]).not.toContain("*");
     } finally {
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});
@@ -639,6 +684,42 @@ describeIfLoopback("proxy transport fidelity", () => {
 
       expect(response.headers["content-encoding"]).toBe("gzip");
       expect(response.body.equals(encoded)).toBe(true);
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+      await closeServer(upstream).catch(() => {});
+    }
+  });
+
+  it("adds frame-ancestors to responses that cannot be identified as HTML", async () => {
+    const encoded = gzipSync("<!doctype html><html><body>compressed</body></html>");
+    const upstream = http.createServer((req, res) => {
+      if (req.url === "/image.png") {
+        res.writeHead(200, { "content-type": "image/png" });
+        res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        return;
+      }
+      // Content-Type なし・gzip の HTML(sniff できない)
+      res.writeHead(200, {
+        "content-encoding": "gzip",
+        "content-length": String(encoded.byteLength),
+      });
+      res.end(encoded);
+    });
+    const upstreamPort = await listenOnFreePort(upstream, "127.0.0.1");
+    const proxyPort = await findFreePort(upstreamPort + 1);
+    const expected =
+      "frame-ancestors 'self' http://localhost:5173 http://127.0.0.1:5173 http://[::1]:5173";
+
+    let handle: ProxyHandle | null = null;
+    try {
+      handle = await startProxy(upstreamPort, proxyPort, "127.0.0.1", {
+        parentOrigins: previewParentOrigins({ serverPort: 5174, clientPort: 5173 }),
+      });
+      for (const path of ["/", "/image.png"]) {
+        const response = await requestViaProxy(proxyPort, path);
+        expect(response.headers["content-security-policy"], path).toContain(expected);
+        expect(response.body.toString("latin1"), path).not.toContain("data-uim-inspector");
+      }
     } finally {
       if (handle) await handle.close().catch(() => {});
       await closeServer(upstream).catch(() => {});

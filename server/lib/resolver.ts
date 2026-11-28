@@ -1,12 +1,13 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { resolve, relative, isAbsolute, join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { DomDescriptor, ResolveResult } from "./types.ts";
 import { complete, hasKey, stripCodeFence } from "./claude.ts";
 import { buildChildEnv } from "./child-env.ts";
+import { isProtectedPath } from "./path-policy.ts";
 
 const pExecFile = promisify(execFile);
 
@@ -116,8 +117,10 @@ async function nodeGrep(
     for (const ent of entries) {
       if (out.length >= max || filesScanned >= NODE_GREP_FILE_CAP) return;
       const full = join(dir, ent.name);
+      // 隠し名・node_modules はファイルも辿らない(path-policy と同じ規則)。
+      if (isHiddenOrNodeModules(ent.name)) continue;
       if (ent.isDirectory()) {
-        if (IGNORE_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
+        if (IGNORE_DIRS.has(ent.name)) continue;
         await walk(full);
       } else if (ent.isFile()) {
         if (!TEXT_EXT.test(ent.name)) continue;
@@ -184,8 +187,10 @@ async function readNodeGrepFiles(root: string): Promise<NodeGrepFile[]> {
     for (const ent of entries) {
       if (filesScanned >= NODE_GREP_FILE_CAP || totalBytesCapReached) return;
       const full = join(dir, ent.name);
+      // 隠し名・node_modules はファイルも辿らない(path-policy と同じ規則)。
+      if (isHiddenOrNodeModules(ent.name)) continue;
       if (ent.isDirectory()) {
-        if (IGNORE_DIRS.has(ent.name) || ent.name.startsWith(".")) continue;
+        if (IGNORE_DIRS.has(ent.name)) continue;
         await walk(full);
       } else if (ent.isFile()) {
         if (!TEXT_EXT.test(ent.name)) continue;
@@ -236,6 +241,10 @@ function searchNodeGrepFiles(
 
 function countNodeGrepFiles(files: NodeGrepFile[], term: string): number {
   return searchNodeGrepFiles(files, term).length;
+}
+
+function isHiddenOrNodeModules(name: string): boolean {
+  return name.startsWith(".") || name.toLowerCase() === "node_modules";
 }
 
 function withinRoot(root: string, file: string): boolean {
@@ -722,7 +731,21 @@ function sourceFileCandidates(root: string, fileName: string): string[] {
 
 function findSourceFile(root: string, fileName: string): string | null {
   for (const candidate of sourceFileCandidates(root, fileName)) {
-    if (existsSync(candidate) && withinRoot(root, candidate)) return candidate;
+    // 保護パス(.git・node_modules・隠しファイル)、実体が root 外、通常ファイル以外(FIFO 等)
+    // を指すヒントは、読む前に候補から外して層 B へ。
+    if (
+      !existsSync(candidate) ||
+      !withinRoot(root, candidate) ||
+      isProtectedPath(root, candidate)
+    )
+      continue;
+    try {
+      const real = realpathSync(candidate);
+      if (!withinRoot(realpathSync(root), real) || !statSync(real).isFile()) continue;
+    } catch {
+      continue;
+    }
+    return candidate;
   }
   return null;
 }
@@ -985,7 +1008,10 @@ export async function resolveSource(
   }
 
   // --- 層B: 汎用クラス除外スコアリング + フォールバック ---
-  const { candidates } = await collectCandidates(root, d);
+  // 候補全体に保護判定をかけてから preview を作り、LLM に渡す。
+  const candidates = (await collectCandidates(root, d)).candidates.filter(
+    (c) => !isProtectedPath(root, c.file)
+  );
 
   if (candidates.length === 0 && downgradedSource) {
     return {

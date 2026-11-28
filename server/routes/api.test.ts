@@ -7,9 +7,13 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -324,7 +328,10 @@ beforeEach(async () => {
   __stores.historyLog.splice(0);
   __stores.inFlight.clear();
 
-  root = mkdtempSync(join(tmpdir(), "uim-api-"));
+  // tmpdir が symlink の環境(macOS の /var → /private/var)や 8.3 短縮名の環境(Windows の RUNNER~1)でも、
+  // atomicWrite が書く実体パス(realpathSync.native)とテストの filePath(fs モックの比較対象)が一致するよう、
+  // root は製品と同じ .native で解決した実体パスで作る。JS 版の realpathSync は 8.3 名を展開しない。
+  root = realpathSync.native(mkdtempSync(join(tmpdir(), "uim-api-")));
   mkdirSync(join(root, "src"), { recursive: true });
   filePath = join(root, "src", "App.tsx");
   writeFileSync(filePath, originalContent, "utf8");
@@ -1949,6 +1956,36 @@ describe("git API", () => {
     expect(result.body.error).toBe("コミットする変更がありません");
   }, 15_000);
 
+  it("commits a root merge whose result matches HEAD", async (ctx) => {
+    if (!gitAvailable() || !initGitRepo(root)) {
+      ctx.skip();
+      return;
+    }
+    const originalHead = String(runGit(["rev-parse", "HEAD"]).stdout).trim();
+    const branch = String(runGit(["branch", "--show-current"]).stdout).trim();
+    for (const args of [
+      ["checkout", "-b", "topic"],
+      ["commit", "--allow-empty", "-m", "Topic change"],
+      ["checkout", branch],
+      ["merge", "--no-commit", "--no-ff", "-s", "ours", "topic"],
+    ]) {
+      const git = runGit(args);
+      expect(git.status, String(git.stderr)).toBe(0);
+    }
+    const topicHead = String(runGit(["rev-parse", "MERGE_HEAD"]).stdout).trim();
+    expect(topicHead).toMatch(/^[0-9a-f]+$/);
+    expect(runGit(["diff", "--cached", "--quiet"]).status).toBe(0);
+
+    const result = await postJson<{ ok: true }>("/api/git/commit", {
+      message: "Complete merge",
+    });
+
+    expect(result.res.status).toBe(200);
+    expect(result.body.ok).toBe(true);
+    const parents = runGit(["show", "-s", "--format=%P", "HEAD"]);
+    expect(String(parents.stdout).trim()).toBe(`${originalHead} ${topicHead}`);
+  }, 15_000);
+
   it("commits working-tree changes after staging them", async (ctx) => {
     if (!gitAvailable() || !initGitRepo(root)) {
       ctx.skip();
@@ -2120,4 +2157,70 @@ describe("internal error details", () => {
       }
     }
   );
+});
+
+describe("file write hardening", () => {
+  const posix = process.platform !== "win32";
+
+  it.skipIf(!posix)("creates the temp file for a new file with 0600 before setting the final mode", async () => {
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const tempModes: number[] = [];
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      const result = await actualWriteFile(...args);
+      if (String(args[0]).includes(".tmp-")) {
+        tempModes.push(statSync(String(args[0])).mode & 0o777);
+      }
+      return result;
+    });
+    const target = join(root, "src", "brand-new.txt");
+    const write = await postJson<{ ok: true }>("/api/files/write", {
+      path: target,
+      content: "new",
+    });
+    expect(write.res.status).toBe(200);
+    expect(tempModes).toEqual([0o600]);
+    expect(readFileSync(target, "utf8")).toBe("new");
+  });
+
+  it.skipIf(!posix)("re-checks the resolved target after waiting for the file lock", async () => {
+    mkdirSync(join(root, "real"), { recursive: true });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    const safe = join(root, "real", "ok.txt");
+    const protectedFile = join(root, ".git", "description");
+    writeFileSync(safe, "SAFE", "utf8");
+    writeFileSync(protectedFile, "GIT_DESCRIPTION", "utf8");
+    const alias = join(root, "src", "alias.txt");
+    symlinkSync("../real/ok.txt", alias);
+
+    const actualWriteFile = fsPromisesMock.actual.writeFile;
+    const firstWriteStarted = deferred();
+    const releaseFirstWrite = deferred();
+    let blocked = false;
+    fsPromisesMock.writeFile.mockImplementation(async (...args: any[]) => {
+      if (!blocked && String(args[0]).includes(".tmp-")) {
+        blocked = true;
+        firstWriteStarted.resolve();
+        await releaseFirstWrite.promise;
+      }
+      return actualWriteFile(...args);
+    });
+
+    // 1 本目が実体のロックを握っている間に、2 本目(symlink 経由)が検査を通過してロック待ちになる。
+    const first = postJson("/api/files/write", { path: safe, content: "FIRST" });
+    await firstWriteStarted.promise;
+    const second = postJson<{ error: string }>("/api/files/write", {
+      path: alias,
+      content: "SECOND",
+    });
+    await delay(25);
+    unlinkSync(alias);
+    symlinkSync("../.git/description", alias);
+    releaseFirstWrite.resolve();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult.res.status).toBe(200);
+    expect(secondResult.res.status).toBe(403);
+    expect(readFileSync(protectedFile, "utf8")).toBe("GIT_DESCRIPTION");
+    expect(readdirSync(join(root, ".git")).filter((n) => n.includes(".tmp-"))).toEqual([]);
+  });
 });

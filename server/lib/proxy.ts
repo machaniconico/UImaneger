@@ -4,13 +4,18 @@ import { StringDecoder } from "node:string_decoder";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { isAllowedHost, loopbackOrigins } from "../middleware/security.ts";
+import {
+  isAllowedHost,
+  loopbackOrigins,
+  previewParentOrigins,
+} from "../middleware/security.ts";
+import { env, isProduction } from "./env.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const INSPECTOR_PATH = join(__dirname, "..", "inspector-client.js");
 const INSPECTOR_ROUTE = "/__uim/inspector.js";
-const FRAME_ANCESTORS_CSP =
-  "frame-ancestors 'self' http://localhost:* http://*.localhost:* http://127.0.0.1:* http://[::1]:*";
+// inspector-client.js 内の許可 origin 埋め込み位置(配信時に JSON 配列へ置き換える)。
+const PARENT_ORIGINS_PLACEHOLDER = "/*__UIM_PARENT_ORIGINS__*/ []";
 const HTML_SNIFF_BYTES = 1024;
 
 let inspectorScript: string | null | undefined;
@@ -23,6 +28,13 @@ function getInspectorScript(): string | null {
     }
   }
   return inspectorScript || null;
+}
+
+/** 許可する親 origin を本文に埋め込んだ inspector。埋め込み位置が無ければ配信しない。 */
+function inspectorScriptFor(parentOrigins: readonly string[]): string | null {
+  const script = getInspectorScript();
+  if (!script || !script.includes(PARENT_ORIGINS_PLACEHOLDER)) return null;
+  return script.replace(PARENT_ORIGINS_PLACEHOLDER, () => JSON.stringify(parentOrigins));
 }
 
 function inspectorTag(): string {
@@ -127,7 +139,11 @@ function addSelfSource(directive: string): string {
   return [name, ...sources].join(" ");
 }
 
-function rewriteCspPolicy(policy: string): string {
+function rewriteCspPolicy(
+  policy: string,
+  frameAncestors: string,
+  allowInspector: boolean
+): string {
   const directives = policy
     .split(";")
     .map((part) => part.trim())
@@ -140,8 +156,9 @@ function rewriteCspPolicy(policy: string): string {
     const name = directive.split(/\s+/, 1)[0].toLowerCase();
     if (name === "frame-ancestors") {
       hasFrameAncestors = true;
-      return FRAME_ANCESTORS_CSP;
+      return frameAncestors;
     }
+    if (!allowInspector) return directive;
     if (name === "script-src" || name === "script-src-elem") {
       hasScriptDirective = true;
       return addSelfSource(directive);
@@ -150,17 +167,26 @@ function rewriteCspPolicy(policy: string): string {
     return directive;
   });
 
-  if (!hasFrameAncestors) rewritten.push(FRAME_ANCESTORS_CSP);
+  if (!hasFrameAncestors) rewritten.push(frameAncestors);
   if (!hasScriptDirective && hasDefaultSource) rewritten.push("script-src 'self'");
   return rewritten.join("; ");
 }
 
 function rewriteCspHeader(
-  value: http.OutgoingHttpHeader | undefined
+  value: http.OutgoingHttpHeader | undefined,
+  frameAncestors: string,
+  allowInspector: boolean
 ): string | string[] {
-  if (Array.isArray(value)) return value.map(rewriteCspPolicy);
-  if (typeof value === "string") return rewriteCspPolicy(value);
-  return FRAME_ANCESTORS_CSP;
+  const rewrite = (policy: string): string =>
+    allowInspector
+      ? rewriteCspPolicy(policy, frameAncestors, true)
+      : policy
+          .split(",")
+          .map((part) => rewriteCspPolicy(part, frameAncestors, false))
+          .join(", ");
+  if (Array.isArray(value)) return value.map(rewrite);
+  if (typeof value === "string") return rewrite(value);
+  return frameAncestors;
 }
 
 function setOutgoingHeader(
@@ -333,11 +359,21 @@ export interface ProxyHandle {
 export function startProxy(
   targetPort: number,
   proxyPort: number,
-  targetHostname: "127.0.0.1" | "::1" = "127.0.0.1"
+  targetHostname: "127.0.0.1" | "::1" = "127.0.0.1",
+  options: { parentOrigins?: readonly string[] } = {}
 ): Promise<ProxyHandle> {
   const targetHost = `${targetHostname === "::1" ? "[::1]" : targetHostname}:${targetPort}`;
   const sockets = new Set<Duplex>();
   const allowedOrigins = new Set(loopbackOrigins([proxyPort]));
+  // プレビューを埋め込める親は UI の origin だけ。CSP frame-ancestors と inspector の両方に入れる。
+  const parentOrigins = [
+    ...(options.parentOrigins ??
+      previewParentOrigins({
+        serverPort: env.serverPort,
+        clientPort: isProduction() ? null : env.clientPort,
+      })),
+  ];
+  const frameAncestors = ["frame-ancestors", "'self'", ...parentOrigins].join(" ");
 
   // DNS rebinding / 他 origin からの読み取り対策。upstream へ接続する前に判定する。
   // Sec-Fetch-Site は見ない(UI からの iframe 表示は cross-site ナビゲーションになるため)。
@@ -388,13 +424,14 @@ export function startProxy(
 
     const responseHeaders = (isHtml: boolean): http.OutgoingHttpHeaders => {
       const next: http.OutgoingHttpHeaders = { ...headers };
-      if (!isHtml) return next;
-      // HTML 文書だけフレーム許可を補正する。既存 CSP の他ディレクティブは維持する。
-      delete next["x-frame-options"];
+      // HTML と判定できない応答(Content-Type なしの圧縮応答など)や非 HTML も、埋め込める
+      // 親を UI の origin に限り、inspector 用のスクリプト許可は HTML だけに付ける。
+      // x-frame-options を外すのは埋め込み対象の HTML・XHTML 文書だけ。
+      if (isHtml || declaredDocument) delete next["x-frame-options"];
       setOutgoingHeader(
         next,
         "content-security-policy",
-        rewriteCspHeader(next["content-security-policy"])
+        rewriteCspHeader(next["content-security-policy"], frameAncestors, isHtml)
       );
       return next;
     };
@@ -490,7 +527,7 @@ export function startProxy(
       statusCode === 304 ||
       (statusCode >= 100 && statusCode < 200);
     if (bodyless || encoded) {
-      res.writeHead(statusCode, responseHeaders(declaredDocument));
+      res.writeHead(statusCode, responseHeaders(declaredHtml));
       proxyRes.pipe(res);
       return;
     }
@@ -501,7 +538,7 @@ export function startProxy(
     }
 
     if (!mustSniff) {
-      res.writeHead(statusCode, responseHeaders(declaredDocument));
+      res.writeHead(statusCode, responseHeaders(declaredHtml));
       proxyRes.pipe(res);
       return;
     }
@@ -566,7 +603,7 @@ export function startProxy(
       // 不正な URL は upstream に委ねる。
     }
     if (requestPath === INSPECTOR_ROUTE) {
-      const script = getInspectorScript();
+      const script = inspectorScriptFor(parentOrigins);
       if (!script) {
         res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
         res.end("Inspector script is unavailable");

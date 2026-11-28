@@ -1,5 +1,7 @@
 import { afterEach, describe, it, expect } from "vitest";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { symlinkSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -536,5 +538,33 @@ describe("resolveSource Layer-B integration", () => {
     expect(candidates[1]?.matched.map((m) => [m.term, m.kind, m.hits])).toEqual([
       ["CheckoutSaveCta", "classSpecific", 2],
     ]);
+  });
+});
+
+describe("resolveSource layer A safety", () => {
+  const posix = process.platform !== "win32";
+
+  it.skipIf(!posix)("does not use a source hint whose real path is outside the root", async () => {
+    const root = await fixture({ "src/App.tsx": "export const App = () => <div />;\n" });
+    const outside = await fixture({ "secret.tsx": "OUTSIDE_SECRET\n" });
+    symlinkSync(join(outside, "secret.tsx"), join(root, "src", "link.tsx"));
+    const result = await resolveSource(
+      root,
+      mkD({ source: { fileName: join(root, "src", "link.tsx"), lineNumber: 1 } })
+    );
+    expect(result.file).not.toBe(join(root, "src", "link.tsx"));
+    expect(result.confidence).not.toBe("high");
+  });
+
+  it.skipIf(!posix)("does not read a source hint that is not a regular file (FIFO)", async () => {
+    const root = await fixture({ "src/App.tsx": "export const App = () => <div />;\n" });
+    const fifo = join(root, "src", "pipe.tsx");
+    if (spawnSync("mkfifo", [fifo]).status !== 0) return;
+    const result = await Promise.race([
+      resolveSource(root, mkD({ source: { fileName: fifo, lineNumber: 1 } })),
+      new Promise<"timeout">((r) => setTimeout(() => r("timeout"), 2000)),
+    ]);
+    expect(result).not.toBe("timeout");
+    if (result !== "timeout") expect(result.file).not.toBe(fifo);
   });
 });

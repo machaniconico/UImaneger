@@ -41,6 +41,18 @@ interface Session {
 
 let session: Session | null = null;
 
+// プレビューを埋め込める親 origin。createApp が自身のポートから設定する
+// (未設定ならプロキシが env と本番判定から導出する)。
+let previewParentOriginList: readonly string[] | undefined;
+
+export function setPreviewParentOrigins(origins: readonly string[]): void {
+  previewParentOriginList = [...origins];
+}
+
+export function getPreviewParentOrigins(): readonly string[] | undefined {
+  return previewParentOriginList;
+}
+
 // --- S3: セッションライフサイクルを直列化する promise-chain mutex ---
 // openProject/startProject/stopProject はこのロック経由で1本ずつ実行される。
 // 世代カウンタ/kill-on-supersede は使わず、単純な直列化で競合を排除する。
@@ -166,7 +178,8 @@ async function _startProject(): Promise<ProjectInfo> {
   session.proxyAfter = await startProxy(
     targetAfter.port,
     afterProxyPort,
-    targetAfter.host
+    targetAfter.host,
+    { parentOrigins: previewParentOriginList }
   );
   session.proxy = session.proxyAfter; // legacy alias
 
@@ -179,7 +192,8 @@ async function _startProject(): Promise<ProjectInfo> {
       session.proxyBefore = await startProxy(
         session.targetBefore.port,
         beforeProxyPort,
-        session.targetBefore.host
+        session.targetBefore.host,
+        { parentOrigins: previewParentOriginList }
       );
     } catch (e) {
       console.warn("[UImaneger] before proxy 起動失敗:", e);

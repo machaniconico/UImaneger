@@ -4,7 +4,16 @@ import { streamSSE } from "hono/streaming";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, writeFile, mkdir, rename, unlink } from "node:fs/promises";
+import {
+  readFile,
+  mkdir,
+  rename,
+  unlink,
+  writeFile,
+  open,
+  chmod,
+  stat,
+} from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { resolve, join, relative, isAbsolute, basename, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +31,12 @@ import {
   TruncatedError,
 } from "../lib/claude.ts";
 import { resolveSource } from "../lib/resolver.ts";
+import {
+  isInsideRoot,
+  isProtectedPath,
+  PROTECTED_PATH_ERROR,
+  realpathOrNearest,
+} from "../lib/path-policy.ts";
 import { createUnifiedDiff } from "../lib/diff.ts";
 import {
   getInfo,
@@ -201,6 +216,7 @@ export function redactLocalPaths(
 }
 
 function serverError(c: Context, e: unknown, relFile?: string) {
+  if (e instanceof WriteTargetRejectedError) return c.json({ error: e.message }, 403);
   return c.json(serverErrorPayload(c, e, relFile), 500);
 }
 
@@ -308,7 +324,9 @@ async function withFileLock<T>(
   file: string,
   fn: () => Promise<T>
 ): Promise<T> {
-  const key = resolve(file);
+  // 鍵は実体パス。symlink と実体への同時書き込みも同じ鍵で直列化する。
+  const abs = resolve(file);
+  const key = realpathOrNearest(abs) ?? abs;
   const previous = fileLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((r) => {
@@ -478,9 +496,12 @@ function normalizeCommitMessage(
   return { ok: true, message: normalized };
 }
 
-async function hasStagedGitChanges(root: string): Promise<boolean> {
+async function hasStagedGitChanges(
+  root: string,
+  pathspec: readonly string[]
+): Promise<boolean> {
   try {
-    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code"], {
+    await pExecFile("git", ["diff", "--cached", "--quiet", "--exit-code", ...pathspec], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -493,14 +514,69 @@ async function hasStagedGitChanges(root: string): Promise<boolean> {
   }
 }
 
+/** 書き込み先が検査後に保護パスやプロジェクト外へ変わった時に atomicWrite が投げる。 */
+export class WriteTargetRejectedError extends Error {
+  constructor() {
+    super("書き込み先が検査後に変わったため中止しました");
+    this.name = "WriteTargetRejectedError";
+  }
+}
+
+/** 新規ファイルの既定 mode(0o666 & ~umask)。process.umask() の読み取りは非推奨なので、
+ * 同じディレクトリに 0o666 で空ファイルを作って OS が適用した mode を読む。 */
+async function defaultFileMode(dir: string): Promise<number> {
+  const probe = join(dir, `.uim-umask-${randomUUID()}`);
+  const handle = await open(probe, "wx", 0o666);
+  try {
+    return (await handle.stat()).mode & 0o777;
+  } finally {
+    await handle.close();
+    await unlink(probe).catch(() => {});
+  }
+}
+
+/**
+ * 一時ファイルに書いてから rename で置き換える。symlink はリンクを保ってリンク先(実体)を
+ * 更新し、既存ファイルの権限(mode & 0o777)は umask に依存せず引き継ぐ。一時ファイルは
+ * 新規・既存とも排他作成・0600 で作って内容を書き、最終 mode(新規は 0o666 & ~umask)に
+ * 合わせてから rename する。Windows では mode を扱わない。
+ * root を渡すと、書き込み前と rename 直前に実体を解決し直し、検査時と違う・root 外・
+ * 保護パスなら WriteTargetRejectedError で中止する(検査後の symlink 差し替え対策)。
+ */
 export async function atomicWrite(
   path: string,
-  content: string | Uint8Array
+  content: string | Uint8Array,
+  root?: string
 ): Promise<void> {
-  const tmp = `${path}.tmp-${randomUUID()}`;
+  const abs = resolve(path);
+  const target = realpathOrNearest(abs) ?? abs;
+  const assertTarget = () => {
+    if (root === undefined) return;
+    if (
+      realpathOrNearest(abs) !== target ||
+      !inRoot(root, target) ||
+      isProtectedPath(root, target)
+    ) {
+      throw new WriteTargetRejectedError();
+    }
+  };
+  assertTarget();
+  let mode: number | null = null;
   try {
-    await writeFile(tmp, content, "utf8");
-    await rename(tmp, path);
+    const st = await stat(target);
+    if (!st.isFile()) throw new Error("通常ファイルではないため書き込めません");
+    mode = st.mode & 0o777;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const posix = process.platform !== "win32";
+  if (mode === null && posix) mode = await defaultFileMode(dirname(target));
+  const tmp = `${target}.tmp-${randomUUID()}`;
+  try {
+    await writeFile(tmp, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    if (mode !== null && posix) await chmod(tmp, mode);
+    assertTarget();
+    await rename(tmp, target);
   } catch (e) {
     await unlink(tmp).catch(() => {});
     throw e;
@@ -621,26 +697,7 @@ function pushHistory(entry: HistoryEntry): void {
  */
 function inRoot(root: string, file: string): boolean {
   if (typeof root !== "string" || typeof file !== "string") return false;
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(root);
-  } catch {
-    return false;
-  }
-  const abs = resolve(file);
-  let realFile: string;
-  try {
-    realFile = realpathSync(abs);
-  } catch {
-    try {
-      const realParent = realpathSync(dirname(abs));
-      realFile = join(realParent, basename(abs));
-    } catch {
-      return false;
-    }
-  }
-  const rel = relative(realRoot, realFile);
-  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  return isInsideRoot(root, file);
 }
 
 /**
@@ -944,6 +1001,7 @@ api.get("/files/read", async (c) => {
   const path = c.req.query("path") || "";
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
+  if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
   try {
     const content = await readFile(resolve(path), "utf8");
     return c.json({ path: resolve(path), content });
@@ -961,8 +1019,9 @@ api.post("/files/write", async (c) => {
   if (typeof path !== "string" || typeof content !== "string")
     return c.json({ error: "path と content は文字列である必要があります。" }, 400);
   if (!inRoot(root, path)) return c.json({ error: "範囲外のパス" }, 403);
+  if (isProtectedPath(root, path)) return c.json({ error: PROTECTED_PATH_ERROR }, 403);
   try {
-    await withFileLock(path, () => atomicWrite(resolve(path), content));
+    await withFileLock(path, () => atomicWrite(resolve(path), content, root));
     return c.json({ ok: true });
   } catch (e) {
     return serverError(c, e);
@@ -1032,6 +1091,8 @@ async function runEditFlow(
   }
   if (!inRoot(root, resolved.file))
     return { status: 403, body: { error: "解決先がプロジェクト範囲外" } };
+  if (isProtectedPath(root, resolved.file))
+    return { status: 403, body: { error: PROTECTED_PATH_ERROR } };
 
   if (resolved.confidence === "low") {
     return {
@@ -1326,6 +1387,8 @@ api.post("/edit/candidate", async (c) => {
   }
   if (!inRoot(root, file))
     return c.json({ error: "範囲外のパス" }, 403);
+  if (isProtectedPath(root, file))
+    return c.json({ error: PROTECTED_PATH_ERROR }, 403);
 
   const abs = resolve(file);
   if (!existsSync(abs))
@@ -1383,6 +1446,8 @@ api.post("/edit/apply", async (c) => {
       );
     if (!inRoot(root, p.file))
       return c.json({ error: "解決先がプロジェクト範囲外" }, 403);
+    if (isProtectedPath(root, p.file))
+      return c.json({ error: PROTECTED_PATH_ERROR }, 403);
     if (inFlight.has(proposalId))
       return c.json({ error: "この提案は現在処理中です。" }, 409);
     inFlight.add(proposalId);
@@ -1404,7 +1469,7 @@ api.post("/edit/apply", async (c) => {
         }
         const before = beforeBytes.toString("utf8");
         const appliedContent = withBom(p.proposed, p.hadBom);
-        await atomicWrite(p.file, appliedContent);
+        await atomicWrite(p.file, appliedContent, root);
         if (!isCurrentProject(root, epoch)) {
           return c.json(
             { error: "プロジェクトが切り替わったため中断しました" },
@@ -1477,6 +1542,8 @@ api.post("/edit/undo", async (c) => {
       return c.json({ error: "この提案は現在処理中です。" }, 409);
     if (!inRoot(root, entry.file))
       return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+    if (isProtectedPath(root, entry.file))
+      return c.json({ error: PROTECTED_PATH_ERROR }, 403);
     inFlight.add(entry.proposalId);
     try {
       return await withFileLock(entry.file, async () => {
@@ -1498,7 +1565,7 @@ api.post("/edit/undo", async (c) => {
             409
           );
         }
-        await atomicWrite(entry.file, entry.previousContent);
+        await atomicWrite(entry.file, entry.previousContent, root);
         if (!isCurrentProject(root, epoch)) {
           return c.json(
             { error: "プロジェクトが切り替わったため中断しました" },
@@ -1546,6 +1613,8 @@ api.post("/edit/redo", async (c) => {
       return c.json({ error: "この提案は現在処理中です。" }, 409);
     if (!inRoot(root, entry.file))
       return c.json({ error: "対象がプロジェクト範囲外" }, 403);
+    if (isProtectedPath(root, entry.file))
+      return c.json({ error: PROTECTED_PATH_ERROR }, 403);
     inFlight.add(entry.proposalId);
     try {
       return await withFileLock(entry.file, async () => {
@@ -1567,7 +1636,7 @@ api.post("/edit/redo", async (c) => {
             409
           );
         }
-        await atomicWrite(entry.file, entry.appliedContent);
+        await atomicWrite(entry.file, entry.appliedContent, root);
         if (!isCurrentProject(root, epoch)) {
           return c.json(
             { error: "プロジェクトが切り替わったため中断しました" },
@@ -1643,11 +1712,53 @@ ${content}
 }
 
 // --- git (MVP minimal) ---
+// root が親リポジトリのサブディレクトリの場合は、status・add・ステージ判定・commit をすべて
+// pathspec `-- .`(cwd=root)でプロジェクト内に限る。root がリポジトリ直下なら pathspec は
+// 付けない(pathspec 付きの commit はマージの完了コミットを作れないため)。
+async function gitPathspec(root: string): Promise<readonly string[]> {
+  const { stdout } = await pExecFile("git", ["rev-parse", "--show-prefix"], {
+    cwd: root,
+    env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
+    timeout: GIT_OPERATION_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return stdout.trim() === "" ? [] : ["--", "."];
+}
+
+// マージ・cherry-pick・revert・rebase の途中であることを示す git ディレクトリ内の名前。
+const GIT_IN_PROGRESS_MARKERS = [
+  "MERGE_HEAD",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "rebase-merge",
+  "rebase-apply",
+];
+
+async function gitOperationInProgress(
+  root: string,
+  markers: readonly string[] = GIT_IN_PROGRESS_MARKERS
+): Promise<boolean> {
+  const { stdout } = await pExecFile(
+    "git",
+    ["rev-parse", ...markers.flatMap((name) => ["--git-path", name])],
+    {
+      cwd: root,
+      env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
+      timeout: GIT_OPERATION_TIMEOUT_MS,
+      windowsHide: true,
+    }
+  );
+  return stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .some((p) => existsSync(resolve(root, p)));
+}
 api.get("/git/status", async (c) => {
   const root = getRoot();
   if (!root) return c.json({ error: "プロジェクト未オープン" }, 400);
   try {
-    const { stdout } = await pExecFile("git", ["status", "--porcelain"], {
+    const pathspec = await gitPathspec(root);
+    const { stdout } = await pExecFile("git", ["status", "--porcelain", ...pathspec], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
@@ -1668,18 +1779,33 @@ api.post("/git/commit", async (c) => {
   const commitMessage = normalizeCommitMessage(message);
   if (!commitMessage.ok) return c.json({ error: commitMessage.error }, 400);
   try {
-    await pExecFile("git", ["add", "-A"], {
+    const pathspec = await gitPathspec(root);
+    // サブディレクトリから pathspec 付きでコミットするとマージ等を完了できず、範囲外の
+    // 解決結果も扱えないため、git add の前に止める(副作用なし)。
+    if (pathspec.length > 0 && (await gitOperationInProgress(root))) {
+      return c.json(
+        {
+          error:
+            "親リポジトリでマージ(または cherry-pick・revert・rebase)が進行中のため、サブディレクトリからはコミットできません。リポジトリ直下で完了してください。",
+        },
+        409
+      );
+    }
+    await pExecFile("git", ["add", "-A", ...pathspec], {
       cwd: root,
       env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
       timeout: GIT_OPERATION_TIMEOUT_MS,
       windowsHide: true,
     });
-    if (!(await hasStagedGitChanges(root))) {
-      return c.json({ error: "コミットする変更がありません" }, 409);
+    if (!(await hasStagedGitChanges(root, pathspec))) {
+      // マージ結果が HEAD と同じ場合も、リポジトリ直下ならマージを完了できる。
+      const isRootMerge =
+        pathspec.length === 0 && (await gitOperationInProgress(root, ["MERGE_HEAD"]));
+      if (!isRootMerge) return c.json({ error: "コミットする変更がありません" }, 409);
     }
     await pExecFile(
       "git",
-      ["commit", "--no-gpg-sign", "-m", commitMessage.message],
+      ["commit", "--no-gpg-sign", "-m", commitMessage.message, ...pathspec],
       {
         cwd: root,
         env: buildChildEnv({ GIT_TERMINAL_PROMPT: "0" }),
